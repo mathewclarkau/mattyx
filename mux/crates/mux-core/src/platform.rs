@@ -431,11 +431,37 @@ fn file_mode(_meta: &std::fs::Metadata) -> Option<u32> {
 /// while the canonical `mattyx` dir is absent; no migration is
 /// performed. See [`honor_cmux_era_dir`].
 pub fn session_snapshot_path(session: &str) -> PathBuf {
+    state_dir().join("sessions").join(format!("{session}.json"))
+}
+
+/// The per-user mattyx state dir (holding `sessions/`, `session-backups/`,
+/// ...), honoring the XDG override order and cmux-era rename compat.
+fn state_dir() -> PathBuf {
     let base = env_path("XDG_STATE_HOME")
         .or_else(|| home_dir().map(|home| home.join(".local").join("state")))
         .unwrap_or_else(std::env::temp_dir);
-    let dir = honor_cmux_era_dir(base.join("mattyx"));
-    dir.join("sessions").join(format!("{session}.json"))
+    honor_cmux_era_dir(base.join("mattyx"))
+}
+
+/// Issue #95: directory holding rename-aside backups of unloadable session
+/// snapshots. It sits *beside* `sessions/` in the same state dir, so a
+/// corrupt current snapshot and its recovery copies share the #87
+/// 0700/0600 discipline. Never the snapshot itself.
+pub fn session_backup_dir() -> PathBuf {
+    state_dir().join("session-backups")
+}
+
+/// Issue #95: the backup dir for an explicit snapshot path — the
+/// `session-backups/` sibling of the snapshot's own `sessions/` parent.
+/// `persist.rs` uses this rather than [`session_backup_dir`] so the
+/// rename-aside can be exercised against a scratch path with no global
+/// env/state dependency. Falls back to the canonical dir when the path
+/// has no grandparent (e.g. a bare filename).
+pub fn session_backup_dir_for(snapshot_path: &Path) -> PathBuf {
+    match snapshot_path.parent().and_then(Path::parent) {
+        Some(state_dir) => state_dir.join("session-backups"),
+        None => session_backup_dir(),
+    }
 }
 
 /// User config directory, honoring the XDG override order. The config

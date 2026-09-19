@@ -2608,6 +2608,10 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
             }))
         }
         Command::Subscribe => {
+            // Issue #95: a subscribing client is an attached client; the
+            // session is live from here, so an empty tree at shutdown means
+            // the user really emptied it (and the snapshot may be removed).
+            mux.mark_client_attached();
             let events = mux.subscribe();
             let writer = writer.clone();
             std::thread::Builder::new().name("mux-events-out".into()).spawn(move || {
@@ -2668,6 +2672,8 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
             Ok(json!({}))
         }
         Command::AttachSurface { surface: surface_id } => {
+            // Issue #95: a direct surface attach is an attached client too.
+            mux.mark_client_attached();
             let surface = get_surface(mux, surface_id)?;
             if surface.kind() == SurfaceKind::Browser {
                 let (state, frames) = surface.attach_frames()?;

@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -190,6 +190,17 @@ pub struct Mux {
     /// from `mux-tui`'s `run_server` after `config::load()`.
     /// `None` means the default `<repo>/../<repo>.<branch>/`.
     worktree_pattern: Mutex<Option<String>>,
+    /// Issue #95: did a client ever attach this run? Set by `subscribe`
+    /// and `attach-surface` on the control socket (the two attach
+    /// handshakes a frontend uses). Together with `workspace_opened` this
+    /// defines a session that is safe to treat as *intentionally* empty at
+    /// shutdown — see [`Self::never_attached`].
+    client_attached: AtomicBool,
+    /// Issue #95: was a workspace ever created this run (including by
+    /// restore)? A daemon that started, restored/created nothing, and
+    /// never saw a client must not let its empty state delete a
+    /// pre-existing non-empty snapshot.
+    workspace_opened: AtomicBool,
 }
 
 impl Mux {
@@ -218,6 +229,8 @@ impl Mux {
             agent_detection: Mutex::new(DetectionSettings::default()),
             custom_agent_patterns: Mutex::new(Vec::new()),
             worktree_pattern: Mutex::new(None),
+            client_attached: AtomicBool::new(false),
+            workspace_opened: AtomicBool::new(false),
         })
     }
 
@@ -448,19 +461,56 @@ impl Mux {
         crate::platform::session_snapshot_path(&self.session_name())
     }
 
+    /// Issue #95: a session that never saw a client AND never opened a
+    /// workspace this run is *not* an intentionally-emptied session — it is
+    /// a daemon that started and stopped, perhaps having restored nothing,
+    /// or restored and then been torn down before anyone attached. Its
+    /// empty in-memory tree says nothing about the saved snapshot, so the
+    /// shutdown guard must leave that file alone rather than delete it.
+    ///
+    /// By contrast a session that WAS attached (subscribe/attach-surface)
+    /// or had a workspace opened (including by restore) is live: if its
+    /// tree is empty at shutdown, the user/agent really did close
+    /// everything, and the snapshot should be removed so old panes do not
+    /// resurrect.
+    fn never_attached(&self) -> bool {
+        !self.client_attached.load(Ordering::Acquire)
+            && !self.workspace_opened.load(Ordering::Acquire)
+    }
+
+    /// Issue #95: record that a client attached to this session over the
+    /// control socket (`subscribe`/`attach-surface`). Once true it stays
+    /// true for the process lifetime.
+    pub(crate) fn mark_client_attached(&self) {
+        self.client_attached.store(true, Ordering::Release);
+    }
+
     fn write_snapshot(&self) {
+        self.write_snapshot_to(&self.snapshot_path());
+    }
+
+    /// Issue #95: [`Self::write_snapshot`] against an explicit path, so the
+    /// empty-session shutdown guard is testable without touching the real
+    /// per-user state dir.
+    fn write_snapshot_to(&self, path: &Path) {
         let snapshot = self.with_state(crate::persist::capture);
-        let path = self.snapshot_path();
         let result = if snapshot.is_empty() {
-            // An intentionally-emptied session shouldn't resurrect old
-            // panes next time it starts.
-            match std::fs::remove_file(&path) {
+            if self.never_attached() {
+                // Do NOT delete a pre-existing snapshot: nothing this run
+                // gives us the right to. A daemon that started, restored
+                // nothing (or had no config), and shut down before any
+                // client attached leaves the saved session intact.
+                return;
+            }
+            // An intentionally-emptied LIVE session shouldn't resurrect
+            // old panes next time it starts.
+            match std::fs::remove_file(path) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(e),
             }
         } else {
-            snapshot.save(&path)
+            snapshot.save(path)
         };
         if let Err(e) = result {
             self.emit(MuxEvent::Status(format!("session snapshot write failed: {e}")));
@@ -1064,6 +1114,10 @@ reattaching to remote session {session_id} on {host} \
         surface: Arc<Surface>,
         name: Option<String>,
     ) -> Arc<Surface> {
+        // Issue #95: opening a workspace (new, remote, or a restore) makes
+        // this a live session, so an empty tree at shutdown means the user
+        // really emptied it.
+        self.workspace_opened.store(true, Ordering::Release);
         let (pane_id, pane) = self.make_pane(surface.id);
         let screen_id = self.next_id();
         let ws_id = self.next_id();
@@ -2845,6 +2899,120 @@ mod tests {
                 assert_eq!(s.surfaces.len(), 0);
             });
         }
+    }
+
+    // ---- Issue #95: snapshot preservation (rename-aside + shutdown guard) ----
+
+    static SNAP_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// A scratch state dir laid out like the real one: `<dir>/sessions/`.
+    /// No tempfile dev-dep; the per-process counter keeps parallel runs
+    /// from colliding.
+    fn snapshot_scratch(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let n = SNAP_DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "mtyx_mux_snapshot_{}_{}_{}",
+            std::process::id(),
+            n,
+            label
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).expect("create sessions dir");
+        (dir, sessions.join("main.json"))
+    }
+
+    /// A truncated `sessions/main.json` is renamed aside on the next
+    /// restore, never deleted, and the session still starts fresh (no
+    /// workspaces restored).
+    #[test]
+    fn truncated_state_is_preserved_not_deleted() {
+        let (dir, path) = snapshot_scratch("truncated");
+        let torn = b"{\"workspaces\": [{\"name\": \"work\"";
+        std::fs::write(&path, torn).unwrap();
+
+        let mux = test_mux();
+        mux.restore_session_decided(crate::platform::SnapshotTrustDecision::Accept, &path);
+
+        assert!(!path.exists(), "corrupt snapshot must be moved aside, not left to be overwritten");
+        mux.with_state(|s| {
+            assert_eq!(s.workspaces.len(), 0, "session must start fresh");
+            assert_eq!(s.surfaces.len(), 0);
+        });
+
+        let backups: Vec<_> = std::fs::read_dir(dir.join("session-backups"))
+            .expect("backup dir exists")
+            .flatten()
+            .collect();
+        assert_eq!(backups.len(), 1, "one recovery copy expected");
+        let name = backups[0].file_name().to_string_lossy().into_owned();
+        assert!(name.starts_with("main.") && name.ends_with(".json"), "got {name}");
+        assert_eq!(
+            std::fs::read(backups[0].path()).unwrap(),
+            torn,
+            "the torn bytes must be preserved byte-for-byte"
+        );
+    }
+
+    /// Simulated `kill -9` mid-write (a partially written canonical
+    /// snapshot): the next load backs those exact bytes up, so nothing is
+    /// silently lost, and reports nothing to restore.
+    #[test]
+    fn kill9_mid_write_recovers_from_backup() {
+        let (dir, path) = snapshot_scratch("kill9");
+        let partial = b"{\"workspaces\": [{\"screens\": [{\"layout\": {\"Sp";
+        std::fs::write(&path, partial).unwrap();
+
+        assert!(
+            crate::persist::SessionSnapshot::load(&path).is_none(),
+            "a torn write must not be parsed as a session"
+        );
+        assert!(!path.exists());
+
+        let backups: Vec<_> = std::fs::read_dir(dir.join("session-backups"))
+            .expect("backup dir exists")
+            .flatten()
+            .collect();
+        assert_eq!(backups.len(), 1, "the torn write is recoverable from exactly one copy");
+        assert_eq!(
+            std::fs::read(backups[0].path()).unwrap(),
+            partial,
+            "recovery copy holds the exact pre-crash bytes"
+        );
+    }
+
+    /// A fresh daemon that restores nothing, never attaches, and shuts down
+    /// must leave a pre-existing non-empty snapshot intact — it is not an
+    /// intentionally-emptied session.
+    #[test]
+    fn shutdown_does_not_overwrite_nonempty_with_empty() {
+        let (_dir, path) = snapshot_scratch("shutdown_guard");
+        let saved = b"{\"workspaces\":[{\"name\":\"work\"}],\"active_workspace\":0}";
+        std::fs::write(&path, saved).unwrap();
+
+        let mux = test_mux();
+        // No client attached, no workspace opened: the never-attached case.
+        mux.write_snapshot_to(&path);
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            saved,
+            "a never-attached daemon must not delete or truncate the saved snapshot"
+        );
+    }
+
+    /// The complement: an intentionally-emptied LIVE session (a client
+    /// attached, then everything closed) still deletes the snapshot, so old
+    /// panes do not resurrect.
+    #[test]
+    fn attached_emptied_session_still_removes_snapshot() {
+        let (_dir, path) = snapshot_scratch("shutdown_attached_empty");
+        std::fs::write(&path, b"{\"workspaces\":[{\"name\":\"work\"}]}").unwrap();
+
+        let mux = test_mux();
+        mux.mark_client_attached();
+        mux.write_snapshot_to(&path);
+        assert!(!path.exists(), "an attached, emptied session should drop its snapshot");
     }
 
     fn seed_split_ratio_tree(mux: &Mux) -> (PaneId, PaneId, PaneId) {
