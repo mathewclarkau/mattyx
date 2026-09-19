@@ -2024,6 +2024,53 @@ reattaching to remote session {session_id} on {host} \
         SurfaceReadiness { prompt_seen, child }
     }
 
+    /// Issue #93: the surface's *effective* lifecycle state for the
+    /// blocked-send gate, resolved under the existing authority rules.
+    ///
+    /// Precedence mirrors [`Surface::set_agent_report`]: an explicit
+    /// `socket`/`hook` report is authoritative, and a screen-derived
+    /// (`Detected`) classification only counts when no report exists
+    /// yet. A live screen classification is computed on demand so a
+    /// pane parked at an approval dialog is caught even without a hook
+    /// — the #96 classifier is conservative (never returns `Blocked`
+    /// from ambiguous or shell-only text).
+    ///
+    /// Returns `(state, source_label, seq)` where `seq` is the
+    /// per-surface state-change sequence of the report backing `state`
+    /// (`0` for a purely screen-derived state, which has no stored
+    /// sequence).
+    pub fn effective_agent_state(
+        &self,
+        surface: &Arc<Surface>,
+    ) -> (crate::AgentState, &'static str, u64) {
+        // An explicit report (any tier) wins outright: `Blocked` from a
+        // hook/socket/detected report is authoritative, and a non-blocked
+        // report keeps the pane ungated per the plan's authority rules.
+        if let Some(report) = surface.agent_report() {
+            return (report.state, report.source.as_str(), report.state_seq);
+        }
+        // No report at all: fall back to a fresh (mutation-free) screen
+        // classification. This mirrors `detect_on_surface`'s screen half
+        // but does not cache or publish anything.
+        let settings = self.agent_detection();
+        if !settings.enabled || surface.kind() != crate::SurfaceKind::Pty {
+            return (crate::AgentState::Unknown, "none", 0);
+        }
+        let Ok(patterns) = self.agent_pattern_list() else {
+            return (crate::AgentState::Unknown, "none", 0);
+        };
+        let Ok(screen) = surface.try_with_terminal(|t| t.plain_text()) else {
+            return (crate::AgentState::Unknown, "none", 0);
+        };
+        let Ok(screen) = screen else {
+            return (crate::AgentState::Unknown, "none", 0);
+        };
+        let detection =
+            crate::agent_detect::detect(&[], &screen, &patterns, settings.min_confidence);
+        let state = crate::agent_state_classify::classify_agent_state(&detection.agent, &screen);
+        (state, "detected", 0)
+    }
+
     /// Run ambient detection on one surface (issue #78 AC1): collect
     /// process + screen evidence, score it against the registry, cache
     /// the result on the surface, and emit `TreeChanged` so frontends

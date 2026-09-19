@@ -32,7 +32,8 @@ pub(crate) struct GlobalArgs {
 /// error or swallowing the next flag as a value (issue #100). Valued
 /// forms (`--group 1`, `--group 0`) still work. `confirm`/`no-confirm`
 /// (issue #88) join the same convention.
-const BARE_BOOL_FLAGS: &[&str] = &["group", "confirm", "no-confirm"];
+const BARE_BOOL_FLAGS: &[&str] =
+    &["group", "confirm", "no-confirm", "force", "wait", "require-transition"];
 
 /// Verbs that accept one bare positional argument alongside their flags
 /// (issue #84: `mtyx screenshot --surface <id> <file>`), mapped onto the
@@ -88,7 +89,9 @@ const VERBS: &[VerbSpec] = &[
     VerbSpec {
         name: "send",
         // Issue #88: --confirm (the default) / --no-confirm and
-        // --timeout-ms for receipted input.
+        // --timeout-ms for receipted input. Issue #93: --force bypasses
+        // the blocked-send gate; --wait/--wait-timeout-ms require an
+        // observed transition into working/blocked.
         allowed: &[
             "surface",
             "text",
@@ -98,6 +101,9 @@ const VERBS: &[VerbSpec] = &[
             "confirm",
             "no-confirm",
             "timeout-ms",
+            "force",
+            "wait",
+            "wait-timeout-ms",
         ],
         build: build_send,
         print: print_empty,
@@ -432,7 +438,10 @@ const VERBS: &[VerbSpec] = &[
         // The response can take up to --timeout ms, so run_command
         // overrides this verb's socket read timeout.
         name: "wait-agent-status",
-        allowed: &["target", "status", "timeout"],
+        // Issue #93: --require-transition demands an observed state change
+        // at/after the call, not merely a cached state that already
+        // matches.
+        allowed: &["target", "status", "timeout", "require-transition"],
         build: build_wait_agent_status,
         print: print_read_screen,
         stream: false,
@@ -865,16 +874,20 @@ fn run_command(args: CliArgs) -> i32 {
             .unwrap_or(mux_core::server::DEFAULT_WAIT_READY_MS);
         let _ = stream.set_read_timeout(Some(Duration::from_millis(wait_ms.saturating_add(5_000))));
     } else if args.verb.name == "send"
-        && request.get("confirm").and_then(Value::as_bool) == Some(true)
+        && (request.get("confirm").and_then(Value::as_bool) == Some(true)
+            || request.get("wait_activity_ms").is_some())
     {
-        // Issue #88: a confirmed send's reply legitimately arrives after
-        // up to `--timeout-ms` (plus the identify pre-flight below), so
-        // budget the socket read like wait-agent-status does.
+        // Issue #88/#93: a confirmed or `--wait` send's reply legitimately
+        // arrives after up to `--timeout-ms` (receipt) PLUS
+        // `--wait-timeout-ms` (observed activity), plus the identify
+        // pre-flight below, so budget the socket read accordingly.
         let ack_ms = request
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(mux_core::server::DEFAULT_INPUT_ACK_TIMEOUT_MS);
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(ack_ms.saturating_add(5_000))));
+        let wait_ms = request.get("wait_activity_ms").and_then(Value::as_u64).unwrap_or(0);
+        let budget = ack_ms.saturating_add(wait_ms).saturating_add(5_000);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(budget)));
     } else {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     }
@@ -1018,9 +1031,21 @@ fn print_response(
 ) -> i32 {
     if value.get("ok").and_then(Value::as_bool) != Some(true) {
         let error = value.get("error").and_then(Value::as_str).unwrap_or("unknown error");
+        // Issue #93: a blocked-send refusal is a distinct, expected
+        // condition an orchestrator branches on, so it gets its own exit
+        // code (3) rather than the generic server-error 1. The code is
+        // carried on the wire by `ServerError` (see `Response.code`);
+        // fall back to string-matching the `<code>: ` prefix for older
+        // daemons that dropped the field.
+        let code = value.get("code").and_then(Value::as_str);
+        let exit = if code == Some("agent_blocked") || error.starts_with("agent_blocked:") {
+            3
+        } else {
+            1
+        };
         // Issue #98: a server-reported error under `--json` is the
         // envelope, not a bare stderr string (non-JSON output unchanged).
-        return cli_error(json_output, 1, error);
+        return cli_error(json_output, exit, error);
     }
     let data = value.get("data").unwrap_or(&Value::Null);
     // Issue #85: `wait-ready` exits nonzero when the pane is not ready,
@@ -1078,6 +1103,11 @@ fn build_close_workspace(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(value)
 }
 
+/// Issue #93: default `send --wait` observed-activity budget (30 s) when
+/// `--wait-timeout-ms` is absent. Long enough for an agent to start
+/// working after receiving a prompt, short enough not to hang forever.
+const DEFAULT_SEND_WAIT_MS: u64 = 30_000;
+
 fn build_send(flags: &FlagMap) -> Result<Value, UsageError> {
     let mut value = json!({ "surface": flags.required_u64("surface")? });
     if let Some(text) = flags.optional("text") {
@@ -1125,6 +1155,33 @@ fn build_send(flags: &FlagMap) -> Result<Value, UsageError> {
             }
             value["timeout_ms"] = json!(timeout_ms);
         }
+    }
+    // Issue #93: `--force` bypasses the blocked-send gate (raw pre-#93
+    // behaviour). Boolean flag; may be spelled `--force` or `--force=true`.
+    if let Some(force) = flags.optional_bool("force") {
+        value["force"] = json!(force);
+    }
+    // Issue #93: `--wait` requests observed-transition success — the
+    // command returns only after the target agent is seen to enter
+    // working/blocked at/after this send. `--wait-timeout-ms` bounds it
+    // (default 30 s if absent). `--wait` must have a value form too
+    // (`--wait=false` disables), so a bare `--wait` reads as true.
+    if let Some(wait) = flags.optional_bool("wait") {
+        if wait {
+            let timeout_ms = match flags.optional("wait-timeout-ms") {
+                Some(raw) => parse_u64("wait-timeout-ms", &raw)?,
+                None => DEFAULT_SEND_WAIT_MS,
+            };
+            value["wait_activity_ms"] = json!(timeout_ms);
+        } else if flags.optional("wait-timeout-ms").is_some() {
+            return Err(UsageError(
+                "--wait-timeout-ms requires --wait (nothing to wait for otherwise)".into(),
+            ));
+        }
+    } else if flags.optional("wait-timeout-ms").is_some() {
+        return Err(UsageError(
+            "--wait-timeout-ms requires --wait (nothing to wait for otherwise)".into(),
+        ));
     }
     if value.get("text").is_none() && value.get("bytes").is_none() {
         let mut text = String::new();
@@ -1579,12 +1636,23 @@ fn build_wait_agent_status(flags: &FlagMap) -> Result<Value, UsageError> {
             "--status must be one of idle, working, blocked, done, unknown (got {status:?})"
         )));
     }
-    Ok(json!({
+    let mut value = json!({
         "target": flags.required("target")?,
         "state": status,
         "timeout_ms": parse_u64("timeout", &flags.required("timeout")?)?,
-    }))
+    });
+    // Issue #93: `--require-transition` demands an OBSERVED change into
+    // the target state at/after this call, rather than accepting a cached
+    // state that already matched (see `Command::WaitAgentStatus`).
+    if let Some(require) = flags.optional_bool("require-transition") {
+        value["require_transition"] = json!(require);
+    }
+    Ok(value)
 }
+
+/// Issue #93: `wait-agent-status --require-transition` is applied by the
+/// builder below; declared here so the flag spelling lives in one place.
+const _WAIT_AGENT_TRANSITION_DOC: &str = "--require-transition";
 
 fn build_kill_session(flags: &FlagMap) -> Result<Value, UsageError> {
     let mut value = json!({});

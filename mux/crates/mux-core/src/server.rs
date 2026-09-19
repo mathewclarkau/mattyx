@@ -374,6 +374,21 @@ enum Command {
         /// rejected (a confirmed send must wait at least 1 ms).
         #[serde(default)]
         timeout_ms: Option<u64>,
+        /// Issue #93: bypass the blocked-send gate. Absent/false means a
+        /// surface whose effective agent state is `Blocked` refuses the
+        /// send with the structured `agent_blocked` error and NO bytes
+        /// are written; `true` restores the pre-#93 raw behaviour.
+        #[serde(default)]
+        force: Option<bool>,
+        /// Issue #93: observed-transition success. When set, the reply is
+        /// sent only after the target agent is observed to transition
+        /// (a strictly-newer `state_seq`) into `working`/`blocked` at/after
+        /// this call's start, or `wait_activity_ms` elapses. `None` keeps
+        /// the fire-and-forget reply. A `send` that lands while the pane
+        /// is already `working` but produces no new report still times out
+        /// — the transition must be *observed*, not merely implied.
+        #[serde(default)]
+        wait_activity_ms: Option<u64>,
     },
     ReadScreen {
         surface: SurfaceId,
@@ -777,10 +792,17 @@ enum Command {
     /// `timeout_ms: 0` is a single immediate check. Capped server-side
     /// at [`MAX_AGENT_WAIT_MS`] so a leaked waiter can't park on its
     /// connection thread forever.
+    ///
+    /// Issue #93 adds `require_transition`: when true, a cached state
+    /// matching `state` whose `state_seq` predates the call does NOT
+    /// satisfy the wait — only an observed transition at/after the call
+    /// does. Absent/false keeps the pre-#93 immediate-match behaviour.
     WaitAgentStatus {
         target: String,
         state: String,
         timeout_ms: u64,
+        #[serde(default)]
+        require_transition: Option<bool>,
     },
     /// Issue #85: block until a surface is *ready* — its screen shows a
     /// recognised prompt (or an agent) AND its PTY has a running
@@ -1294,6 +1316,74 @@ fn validate_wait_ready_timeout(timeout_ms: Option<u64>) -> anyhow::Result<u64> {
     Ok(timeout_ms)
 }
 
+/// Issue #93: resolve + cap a `send --wait` observed-activity timeout. `0`
+/// is a legal single immediate check (mirrors `wait-agent-status`); the
+/// absent case never reaches here (the field being present is what turns
+/// the wait on), so `0` here means exactly one observation attempt.
+/// Anything over [`MAX_AGENT_WAIT_MS`] is rejected before any wait, so a
+/// leaked waiter cannot park a connection thread forever.
+fn validate_wait_activity_timeout(timeout_ms: u64) -> anyhow::Result<u64> {
+    if timeout_ms > MAX_AGENT_WAIT_MS {
+        anyhow::bail!("timeout {timeout_ms}ms exceeds the {MAX_AGENT_WAIT_MS}ms cap");
+    }
+    Ok(timeout_ms)
+}
+
+/// Issue #93: block until the surface's agent is observed to transition
+/// (its `state_seq` strictly exceeds `started_seq`) into `working` or
+/// `blocked`, or `timeout` elapses.
+///
+/// Returns the observed state on success, or `None` on timeout. A cached
+/// report whose sequence predates `started_seq` (e.g. the agent was
+/// already `working` before the caller's send) does NOT satisfy this —
+/// success requires an *observed* transition at/after the call's start,
+/// which is the whole point of `--wait`.
+///
+/// A pane whose surface exited mid-wait errors immediately (it can never
+/// produce the transition), mirroring `wait-agent-status`'s review F2.
+fn wait_for_agent_activity(
+    mux: &Arc<Mux>,
+    surface: &Arc<crate::Surface>,
+    started_seq: u64,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Option<crate::AgentState>> {
+    let surface_id = surface.id;
+    // Subscribe BEFORE the immediate check so a report landing between
+    // the two is still observed (the channel is unbounded).
+    let events = mux.subscribe();
+    let immediate = surface.agent_report().filter(|report| {
+        report.state_seq > started_seq
+            && matches!(report.state, crate::AgentState::Working | crate::AgentState::Blocked)
+    });
+    if let Some(report) = immediate {
+        return Ok(Some(report.state));
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        match events.recv_timeout(remaining) {
+            Ok(MuxEvent::AgentStateChanged { surface: s, report, .. })
+                if s == surface_id
+                    && report.state_seq > started_seq
+                    && matches!(
+                        report.state,
+                        crate::AgentState::Working | crate::AgentState::Blocked
+                    ) =>
+            {
+                return Ok(Some(report.state));
+            }
+            Ok(MuxEvent::SurfaceExited(s)) if s == surface_id => {
+                anyhow::bail!("surface {surface_id} exited while waiting for agent activity");
+            }
+            Ok(_) => continue,
+            Err(_) => return Ok(None),
+        }
+    }
+}
+
 /// Issue #85 response payload, sent both when ready and on timeout
 /// (`ready` distinguishes them). `child` is `null` until a process-tree
 /// child is observed; `prompt_seen` reports the screen half on its own
@@ -1375,6 +1465,8 @@ fn agent_report_json(surface: SurfaceId, report: &crate::AgentReport) -> Value {
         "agent": report.agent,
         "message": report.message,
         "updated_at_ms": report.updated_at_ms,
+        // Issue #93: monotonic per-surface state-change sequence.
+        "state_seq": report.state_seq,
     })
 }
 
@@ -1574,9 +1666,50 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
         })),
         Command::ListWorkspaces => Ok(mux.with_state(workspaces_json)),
         Command::GetResolvedConfig => Ok(mux.resolved_chrome().unwrap_or_else(|| json!({}))),
-        Command::Send { surface, text, bytes, send_cr, shell, confirm, timeout_ms } => {
+        Command::Send {
+            surface,
+            text,
+            bytes,
+            send_cr,
+            shell,
+            confirm,
+            timeout_ms,
+            force,
+            wait_activity_ms,
+        } => {
             let surface = get_surface(mux, surface)?;
             require_pty(&surface)?;
+            // Issue #93: blocked-send gate. Refuse to write ANY bytes into
+            // a pane whose effective agent state is `Blocked` (any source
+            // tier — see `Mux::effective_agent_state`), so an orchestrator
+            // cannot blow through an approval dialog. `force` restores the
+            // pre-#93 raw behaviour. `Unknown` is deliberately NOT gated:
+            // a plain shell pane has no report and classifies `Unknown`,
+            // and gating it would break every existing `send` caller (the
+            // plan's "unknown" gating is not workable against the live
+            // code — see the issue report).
+            //
+            // Spawn-readiness (issue #85) is the sibling half of this
+            // lifecycle contract: `wait-ready` (see `Command::WaitReady`)
+            // is the post-spawn health signal an orchestrator gates on
+            // BEFORE its first send, so the gate below is only ever
+            // reached once the pane is known to be up.
+            let started_seq = surface.agent_state_seq();
+            if !force.unwrap_or(false) {
+                let (state, source, _) = mux.effective_agent_state(&surface);
+                if state == crate::AgentState::Blocked {
+                    return Err(ServerError::new(
+                        "agent_blocked",
+                        format!(
+                            "surface {} is blocked by an agent approval/dialog \
+                             (effective state via {source}); no input was sent. \
+                             Resolve the prompt in the pane, or pass --force to send anyway.",
+                            surface.id
+                        ),
+                    )
+                    .into());
+                }
+            }
             // Issue #35: shell-aware sanitisation of `text` (raw bytes
             // via `bytes` are always written verbatim). `raw` (the
             // default) keeps the pre-#35 passthrough behaviour.
@@ -1619,10 +1752,10 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
                 }
                 let timeout =
                     std::time::Duration::from_millis(validate_input_ack_timeout(timeout_ms)?);
-                return match surface.write_bytes_confirmed(&payload, timeout) {
-                    Ok(()) => Ok(json!({ "confirmed": true })),
+                match surface.write_bytes_confirmed(&payload, timeout) {
+                    Ok(()) => {}
                     Err(crate::ConfirmedSendError::AckTimeout { waited_ms }) => {
-                        Err(ServerError::new(
+                        return Err(ServerError::new(
                             "input_ack_timeout",
                             format!(
                                 "no input receipt (surface output or child-drain) within \
@@ -1633,7 +1766,7 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
                         .into())
                     }
                     Err(crate::ConfirmedSendError::QueueTimeout { waited_ms }) => {
-                        Err(ServerError::new(
+                        return Err(ServerError::new(
                             "input_ack_timeout",
                             format!(
                                 "confirmed-input queue for this surface did not reach this \
@@ -1643,13 +1776,36 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
                         )
                         .into())
                     }
-                    Err(crate::ConfirmedSendError::Io(err)) => Err(err.into()),
+                    Err(crate::ConfirmedSendError::Io(err)) => return Err(err.into()),
                 };
+            } else {
+                // Unconfirmed (pre-#88) path: same byte sequence to the
+                // pty, no receipt wait, no size cap.
+                surface.write_bytes(&payload)?;
             }
-            // Unconfirmed (pre-#88) path: same byte sequence to the pty,
-            // no gate, no receipt wait, no size cap.
-            surface.write_bytes(&payload)?;
-            Ok(json!({}))
+            // Issue #93: observed-transition success. Only report success
+            // after the target agent is seen to enter working/blocked at
+            // or after this send — a pre-existing cached working/blocked
+            // state (sequenced before `started_seq`) does NOT satisfy the
+            // wait.
+            match wait_activity_ms {
+                Some(ms) => {
+                    let timeout = validate_wait_activity_timeout(ms)?;
+                    let observed = wait_for_agent_activity(
+                        mux,
+                        &surface,
+                        started_seq,
+                        std::time::Duration::from_millis(timeout),
+                    )?;
+                    Ok(json!({
+                        "confirmed": confirm.unwrap_or(false),
+                        "activity_observed": observed.is_some(),
+                        "state": observed.map(|state| state.as_str()),
+                    }))
+                }
+                None if confirm.unwrap_or(false) => Ok(json!({ "confirmed": true })),
+                None => Ok(json!({})),
+            }
         }
         Command::ReadScreen { surface } => {
             let surface = get_surface(mux, surface)?;
@@ -2097,18 +2253,28 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
             surface.write_bytes(&bytes)?;
             Ok(json!({ "surface": surface_id }))
         }
-        Command::WaitAgentStatus { target, state, timeout_ms } => {
+        Command::WaitAgentStatus { target, state, timeout_ms, require_transition } => {
             let wanted = validate_wait_request(&state, timeout_ms)?;
             let surface_id = mux.resolve_agent_target(&target)?;
             let surface = get_surface(mux, surface_id)?;
             require_pty(&surface)?;
+            // Issue #93: when `require_transition` is set, the wait must
+            // observe a strictly-newer report (a state change at/after
+            // this call), not merely find the cached state already equal
+            // to the target. Snapshot the sequence BEFORE subscribing so
+            // a report racing in is still counted.
+            let require_transition = require_transition.unwrap_or(false);
+            let started_seq = surface.agent_state_seq();
+            let accepts = |report: &crate::AgentReport| {
+                report.state == wanted && (!require_transition || report.state_seq > started_seq)
+            };
             // Subscribe BEFORE the immediate check so a report landing
             // between the two is still observed by the loop below (the
             // channel is unbounded, so `emit` never blocks the reporter).
             let events = mux.subscribe();
             let started = std::time::Instant::now();
             if let Some(report) = surface.agent_report() {
-                if report.state == wanted {
+                if accepts(&report) {
                     return Ok(wait_agent_status_json(
                         &surface,
                         surface_id,
@@ -2128,7 +2294,7 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
                 }
                 match events.recv_timeout(remaining) {
                     Ok(MuxEvent::AgentStateChanged { surface: s, report, .. })
-                        if s == surface_id && report.state == wanted =>
+                        if s == surface_id && accepts(&report) =>
                     {
                         return Ok(wait_agent_status_json(
                             &surface,
@@ -2346,6 +2512,7 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
                             "agent": report.agent,
                             "message": report.message,
                             "updated_at_ms": report.updated_at_ms,
+                            "state_seq": report.state_seq,
                         }),
                         MuxEvent::OscNotification { surface, title, body } => json!({
                             "event": "osc-notification",

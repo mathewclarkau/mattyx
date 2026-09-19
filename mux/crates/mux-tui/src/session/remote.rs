@@ -404,11 +404,22 @@ impl RemoteSession {
                 // message ride the same event. Absent on older servers.
                 let agent = value.get("agent").and_then(|v| v.as_str()).map(str::to_string);
                 let message = value.get("message").and_then(|v| v.as_str()).map(str::to_string);
+                // Issue #93: the observed-transition sequence rides the
+                // event too; 0 when an older server omits it.
+                let state_seq = value.get("state_seq").and_then(|v| v.as_u64()).unwrap_or(0);
                 self.tree_stale.store(true, Ordering::Release);
                 self.emit(MuxEvent::AgentStateChanged {
                     surface: id,
                     previous,
-                    report: AgentReport { state, source, session, agent, message, updated_at_ms },
+                    report: AgentReport {
+                        state,
+                        source,
+                        session,
+                        agent,
+                        message,
+                        updated_at_ms,
+                        state_seq,
+                    },
                 });
             }
             Some("osc-notification") => {

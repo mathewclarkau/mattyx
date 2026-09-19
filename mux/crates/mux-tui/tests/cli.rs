@@ -910,6 +910,51 @@ fn wait_agent_status_returns_immediately_when_state_matches() {
 }
 
 #[test]
+fn send_blocked_refuses_with_exit_3_and_no_input() {
+    // Issue #93: a blocked pane refuses `send` with the structured
+    // `agent_blocked` error and CLI exit 3, and writes nothing; `--force`
+    // bypasses the gate (exit 0).
+    let server = HeadlessServer::start("send-blocked");
+    let workspace = cli(&server, &["new-workspace", "--name", "blocked-send"]);
+    assert_success(&workspace);
+    let surface = String::from_utf8(workspace.stdout).unwrap().trim().parse::<u64>().unwrap();
+    let surface_str = surface.to_string();
+
+    let report = cli(
+        &server,
+        &["report-agent", "--surface", &surface_str, "--state", "blocked", "--source", "hook"],
+    );
+    assert_success(&report);
+
+    let send = cli(&server, &["--json", "send", "--surface", &surface_str, "--text", "hi"]);
+    assert_eq!(
+        send.status.code(),
+        Some(3),
+        "blocked send must exit 3; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&send.stdout),
+        String::from_utf8_lossy(&send.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&send.stdout).unwrap();
+    assert_eq!(value["ok"], serde_json::json!(false), "envelope: {value}");
+    assert_eq!(value["error"]["code"], serde_json::json!(3), "exit code in envelope: {value}");
+    assert!(
+        value["error"]["message"].as_str().unwrap_or("").contains("agent_blocked"),
+        "message must name the code: {value}"
+    );
+
+    // --force bypasses the gate and the byte lands.
+    let forced = cli(
+        &server,
+        &["--json", "send", "--surface", &surface_str, "--text", "hi", "--force", "--no-confirm"],
+    );
+    assert_success(&forced);
+    // A successful `send` prints only the (empty) data payload under
+    // `--json`; the exit status is the contract.
+    let forced_value: serde_json::Value = serde_json::from_slice(&forced.stdout).unwrap();
+    assert!(forced_value.is_object(), "forced send payload: {forced_value}");
+}
+
+#[test]
 fn wait_agent_status_blocks_until_report() {
     // Issue #75 AC5: the wait blocks on the server until a later report
     // flips the agent into the target state (this is the orchestrator's

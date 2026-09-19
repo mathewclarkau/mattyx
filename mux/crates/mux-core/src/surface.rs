@@ -243,6 +243,12 @@ pub struct AgentReport {
     /// applied report; absent means cleared.
     pub message: Option<String>,
     pub updated_at_ms: u64,
+    /// Issue #93: monotonic per-surface state-change sequence. Bumped on
+    /// every APPLIED report (rejected lower-authority reports leave it
+    /// unchanged), so a waiter can require an *observed transition*
+    /// strictly after it started rather than merely observing that the
+    /// cached state already equals the target. Never decreases.
+    pub state_seq: u64,
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -366,6 +372,11 @@ pub struct PtySurface {
     /// capture time (`layout_doc::capture_tab`).
     spawn_env: Vec<(String, String)>,
     agent: Mutex<Option<AgentReport>>,
+    /// Issue #93: monotonic state-change sequence, bumped whenever an
+    /// agent report is APPLIED (see [`Surface::set_agent_report`]). Read
+    /// without the `agent` lock so a waiter can snapshot "the seq at call
+    /// start" cheaply; only ever increases.
+    state_seq: std::sync::atomic::AtomicU64,
     size: Mutex<(u16, u16)>,
     /// Live output subscribers (attach streams). Guarded by the terminal
     /// lock ordering: the reader thread broadcasts while holding the
@@ -586,6 +597,7 @@ impl Surface {
             spawn_command: opts.command.clone().filter(|argv| !argv.is_empty()),
             spawn_env: opts.extra_env.clone(),
             agent: Mutex::new(None),
+            state_seq: std::sync::atomic::AtomicU64::new(0),
             size: Mutex::new((opts.cols, opts.rows)),
             taps: Mutex::new(Vec::new()),
         }));
@@ -942,6 +954,19 @@ impl Surface {
         self.as_pty().and_then(|pty| pty.agent.lock().unwrap().clone())
     }
 
+    /// Issue #93: the surface's current agent-state sequence, bumped on
+    /// every APPLIED report. Snapshot this before a send/wait and require
+    /// the resulting report's [`AgentReport::state_seq`] to be strictly
+    /// greater, so a waiter proves an *observed transition* rather than
+    /// merely reading a cached state that predates its own call. Returns
+    /// `0` for a surface that has never had a report (and for non-PTY
+    /// surfaces, which never carry agent state).
+    pub fn agent_state_seq(&self) -> u64 {
+        self.as_pty()
+            .map(|pty| pty.state_seq.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
     /// Applies a new agent-state report under the authority rules from
     /// `spec/commands.md`: a hook report always applies; a socket report
     /// is rejected while the current source is a hook report. Returns the
@@ -966,8 +991,21 @@ impl Surface {
         let accept = current.as_ref().map_or(true, |existing| source >= existing.source);
         if accept {
             let agent = agent.or_else(|| current.as_ref().and_then(|r| r.agent.clone()));
-            let report =
-                AgentReport { state, source, session, agent, message, updated_at_ms: now_ms() };
+            // Issue #93: every applied report advances the sequence, so a
+            // waiter can require a strictly-newer report. `fetch_add`
+            // returns the prior value, so the report's seq is prior + 1
+            // and always strictly greater than a snapshot taken before
+            // this call.
+            let state_seq = pty.state_seq.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+            let report = AgentReport {
+                state,
+                source,
+                session,
+                agent,
+                message,
+                updated_at_ms: now_ms(),
+                state_seq,
+            };
             *current = Some(report.clone());
             Some((report, true))
         } else {
