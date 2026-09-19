@@ -317,6 +317,112 @@ pub const fn transport_supports_peer_creds() -> bool {
     cfg!(target_os = "linux")
 }
 
+/// Issue #87: the effective uid of this process, used as the reference
+/// for the restored-snapshot ownership check. `None` on hosts with no
+/// uid concept (Windows).
+#[cfg(unix)]
+pub fn euid() -> Option<u32> {
+    Some(unsafe { libc::geteuid() })
+}
+
+#[cfg(not(unix))]
+pub fn euid() -> Option<u32> {
+    None
+}
+
+/// Issue #87: the owning uid of a file, when the platform can report
+/// one. `None` on non-unix hosts.
+#[cfg(unix)]
+pub fn file_uid(meta: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.uid())
+}
+
+#[cfg(not(unix))]
+pub fn file_uid(_meta: &std::fs::Metadata) -> Option<u32> {
+    None
+}
+
+/// Issue #87: outcome of the trust decision for a persisted session
+/// snapshot at the restore boundary. Pure data so the decision is
+/// unit-testable (including the foreign-owner case, which needs no
+/// second uid) and `Mux::restore_session` merely executes a verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotTrustDecision {
+    /// The snapshot is owned by this euid and is not group/other
+    /// accessible. Restore from it.
+    Accept,
+    /// No snapshot exists (`ENOENT`). This is the ordinary first-run
+    /// case, not a failure: restore nothing, launch nothing, stay quiet.
+    Absent,
+    /// The file is owned by a DIFFERENT uid. Refuse and launch nothing.
+    RejectForeignOwner { uid: u32 },
+    /// `stat` failed for a reason other than "not found" (and, on unix,
+    /// the euid itself could not be resolved). A credential lookup error
+    /// is NEVER a match: refuse and launch nothing.
+    RejectLookupError,
+    /// The file's permission bits are more permissive than 0600 (some
+    /// group or other bit is set). Refuse — do NOT chmod-and-proceed;
+    /// this is default-deny for a possible tamper/info-leak.
+    RejectWorldReadable { mode: u32 },
+}
+
+/// Issue #87: decide whether a persisted snapshot may be replayed, given
+/// only its `stat` result and this process's euid. Pure, so the whole
+/// matrix is testable without a second uid or a real file.
+///
+/// Default-deny policy:
+/// - a missing file is `Absent` (nothing to do), never an error;
+/// - any other `stat` failure is `RejectLookupError`;
+/// - a file not owned by this euid is `RejectForeignOwner`;
+/// - mode bits outside 0600 are `RejectWorldReadable`;
+/// - only an owned, 0600-or-stricter file is `Accept`.
+///
+/// On non-unix hosts there is no uid/mode to check (`file_uid` returns
+/// `None`); the filesystem-permissions boundary is the documented
+/// interim there, so an existing file is accepted.
+pub fn snapshot_trust_decision(
+    meta: std::io::Result<std::fs::Metadata>,
+    process_euid: Option<u32>,
+) -> SnapshotTrustDecision {
+    let meta = match meta {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SnapshotTrustDecision::Absent,
+        Err(_) => return SnapshotTrustDecision::RejectLookupError,
+    };
+    match (file_uid(&meta), process_euid, file_mode(&meta)) {
+        // Windows/other: no uid to enforce. An existing file is trusted
+        // (documented fallback) — keep the old behaviour there.
+        (None, _, _) => SnapshotTrustDecision::Accept,
+        // Contradictory: a uid-bearing file with no process euid to
+        // compare against. Fail closed.
+        (Some(_), None, _) => SnapshotTrustDecision::RejectLookupError,
+        (Some(uid), Some(mine), _mode) if uid != mine => {
+            SnapshotTrustDecision::RejectForeignOwner { uid }
+        }
+        // Owned by us: now the permission check. `mode` is a mask of the
+        // permission bits; any group/other bit is "more permissive than
+        // 0600". A non-unix file reports mode 0o600 (see `file_mode`).
+        (Some(_), Some(_), Some(mode)) if mode & 0o077 != 0 => {
+            SnapshotTrustDecision::RejectWorldReadable { mode }
+        }
+        _ => SnapshotTrustDecision::Accept,
+    }
+}
+
+/// Issue #87: the permission bits of a file as a `u32`, or `None` on
+/// non-unix hosts.
+#[cfg(unix)]
+fn file_mode(meta: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(meta.permissions().mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn file_mode(_meta: &std::fs::Metadata) -> Option<u32> {
+    None
+}
+
 /// Where a session's persisted tree snapshot lives, honoring the XDG
 /// override order. Not a runtime dir (`$XDG_RUNTIME_DIR` is wiped on
 /// logout/reboot — exactly when this needs to survive).
@@ -837,5 +943,87 @@ mod tests {
             peer_auth_decision(Ok(0xbeef), Some(1000), false),
             PeerAuthDecision::Unsupported
         );
+    }
+
+    // ---- Issue #87: restored-daemon snapshot trust matrix ----
+
+    fn meta_for(mode: u32) -> std::fs::Metadata {
+        let dir = scratch_dir("snapshot_meta");
+        let path = dir.join("snap.json");
+        std::fs::write(&path, b"{}").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        std::fs::metadata(&path).unwrap()
+    }
+
+    #[test]
+    fn snapshot_trust_accepts_owned_0600_file() {
+        let meta = meta_for(0o600);
+        assert_eq!(
+            snapshot_trust_decision(Ok(meta), file_uid(&meta_for(0o600))),
+            SnapshotTrustDecision::Accept
+        );
+    }
+
+    #[test]
+    fn snapshot_trust_absent_is_not_an_error() {
+        // The ordinary first-run case: no snapshot at all.
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        assert_eq!(snapshot_trust_decision(Err(err), Some(1000)), SnapshotTrustDecision::Absent);
+    }
+
+    #[test]
+    fn snapshot_trust_lookup_error_is_rejected() {
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "boom");
+        assert_eq!(
+            snapshot_trust_decision(Err(err), Some(1000)),
+            SnapshotTrustDecision::RejectLookupError
+        );
+        // A uid-bearing file with no process euid to compare fails closed.
+        let meta = meta_for(0o600);
+        assert_eq!(
+            snapshot_trust_decision(Ok(meta), None),
+            SnapshotTrustDecision::RejectLookupError
+        );
+    }
+
+    #[test]
+    fn snapshot_trust_rejects_foreign_owner() {
+        // Simulated via the decision function: the real uid of the file
+        // is irrelevant, only the mismatch matters.
+        let meta = meta_for(0o600);
+        let owner = file_uid(&meta).unwrap();
+        assert_eq!(
+            snapshot_trust_decision(Ok(meta), Some(owner.wrapping_add(1))),
+            SnapshotTrustDecision::RejectForeignOwner { uid: owner }
+        );
+    }
+
+    #[test]
+    fn snapshot_trust_rejects_group_and_other_bits() {
+        for mode in [0o640, 0o644, 0o660, 0o666, 0o777] {
+            let meta = meta_for(mode);
+            let owner = file_uid(&meta).unwrap();
+            assert_eq!(
+                snapshot_trust_decision(Ok(meta), Some(owner)),
+                SnapshotTrustDecision::RejectWorldReadable { mode },
+                "mode {mode:o} must be refused"
+            );
+        }
+        // 0600 and stricter pass; 0700 has no group/other bits, so it
+        // leaks nothing to another user and is accepted.
+        for mode in [0o600, 0o400, 0o700] {
+            let meta = meta_for(mode);
+            let owner = file_uid(&meta).unwrap();
+            assert_eq!(
+                snapshot_trust_decision(Ok(meta), Some(owner)),
+                SnapshotTrustDecision::Accept
+            );
+        }
     }
 }

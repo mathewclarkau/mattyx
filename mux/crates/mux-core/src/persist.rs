@@ -126,20 +126,37 @@ impl SessionSnapshot {
     }
 
     pub fn load(path: &std::path::Path) -> Option<Self> {
+        // Issue #87: mirror the runtime-dir discipline on the sessions
+        // dir at load time too, so a pre-existing (or concurrently
+        // recreated) dir is tightened before we read a snapshot out of
+        // it. Best-effort: an unwritable dir should not make an existing
+        // snapshot unreadable.
+        if let Some(dir) = path.parent() {
+            let _ = crate::platform::restrict_directory(dir);
+        }
         let contents = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&contents).ok()
     }
 
     /// Writes atomically (write-to-temp then rename) so a crash or a
     /// concurrent read never observes a truncated file.
+    ///
+    /// Issue #87: snapshots name cwds, workspaces and remote SSH hosts,
+    /// so the `sessions/` dir is `restrict_directory`d (0700) and the
+    /// temp file `restrict_file`d (0600) before the rename lands it at
+    /// the canonical name — the same discipline the runtime dir already
+    /// uses. The rename preserves the temp file's mode, so the final
+    /// snapshot is 0600 too.
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
+            crate::platform::restrict_directory(dir)?;
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json)?;
+        crate::platform::restrict_file(&tmp)?;
         std::fs::rename(&tmp, path)
     }
 }

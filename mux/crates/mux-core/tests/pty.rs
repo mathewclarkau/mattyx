@@ -890,6 +890,74 @@ fn session_persists_layout_and_cwd_across_simulated_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Issue #87: a snapshot written by `save` must be 0600 and its
+/// `sessions/` dir 0700, whatever the ambient umask.
+#[test]
+#[cfg(unix)]
+fn snapshot_file_is_0600_and_dir_is_0700() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = PERSIST_ENV_LOCK.lock().unwrap();
+    let dir = std::env::temp_dir().join(format!("mux-persist-perms-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("XDG_STATE_HOME", &dir);
+
+    let session = unique_session("persist-perms");
+    {
+        let mux = Mux::new(session.clone(), shell_opts("sleep 30"));
+        mux.enable_persistence();
+        mux.new_workspace(Some("perms-ws".to_string()), None).unwrap();
+        mux.shutdown(); // writes a final, guaranteed snapshot
+    }
+
+    let path = mux_core::platform::session_snapshot_path(&session);
+    assert!(path.exists(), "snapshot missing at {}", path.display());
+    let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(file_mode, 0o600, "snapshot file must be 0600, got {file_mode:o}");
+    let dir_mode = std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(dir_mode, 0o700, "sessions dir must be 0700, got {dir_mode:o}");
+
+    std::env::remove_var("XDG_STATE_HOME");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #87: a snapshot whose mode was loosened to 0777 must be refused
+/// whole — the restore launches nothing, leaving an empty tree.
+#[test]
+#[cfg(unix)]
+fn restored_daemon_rejects_world_readable_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = PERSIST_ENV_LOCK.lock().unwrap();
+    let dir = std::env::temp_dir().join(format!("mux-persist-0777-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("XDG_STATE_HOME", &dir);
+
+    let session = unique_session("persist-0777");
+    {
+        let mux = Mux::new(session.clone(), shell_opts("sleep 30"));
+        mux.enable_persistence();
+        mux.new_workspace(Some("world-readable-ws".to_string()), None).unwrap();
+        mux.shutdown();
+    }
+
+    let path = mux_core::platform::session_snapshot_path(&session);
+    assert!(path.exists());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let mux2 = Mux::new(session.clone(), shell_opts("sleep 30"));
+    mux2.restore_session();
+    mux2.with_state(|s| {
+        assert_eq!(s.workspaces.len(), 0, "0777 snapshot must not be restored");
+    });
+
+    mux2.shutdown();
+    std::env::remove_var("XDG_STATE_HOME");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Issue #28 acceptance: spawning a background `sleep` under a pane shell,
 /// then shutting down the mux, leaves zero leftover processes from that tree.
 #[test]

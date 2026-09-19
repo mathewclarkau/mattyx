@@ -473,8 +473,62 @@ impl Mux {
     /// its recorded cwd (see `persist.rs` for why commands aren't
     /// restored). Call once, right after [`Self::new`], before any other
     /// mutation — it assumes an empty tree.
+    ///
+    /// Issue #87: this is a trust boundary. Before anything is launched,
+    /// the snapshot is `stat`ed and the pure
+    /// [`crate::platform::snapshot_trust_decision`] rules on it. A
+    /// missing file is the ordinary first-run case (silent no-op); a
+    /// foreign owner, a lookup error, or group/other-readable mode is a
+    /// refusal that logs a structured error and launches *nothing*.
     pub fn restore_session(self: &Arc<Self>) {
-        let Some(snapshot) = crate::persist::SessionSnapshot::load(&self.snapshot_path()) else {
+        let path = self.snapshot_path();
+        let decision = crate::platform::snapshot_trust_decision(
+            std::fs::metadata(&path),
+            crate::platform::euid(),
+        );
+        self.restore_session_decided(decision, &path);
+    }
+
+    /// Executes an already-computed [`crate::platform::SnapshotTrustDecision`].
+    /// Split out from [`Self::restore_session`] so the refusal paths —
+    /// and their zero-launch guarantee — are testable without needing a
+    /// second uid or a real foreign-owned file.
+    fn restore_session_decided(
+        self: &Arc<Self>,
+        decision: crate::platform::SnapshotTrustDecision,
+        path: &std::path::Path,
+    ) {
+        use crate::platform::SnapshotTrustDecision as D;
+        match decision {
+            D::Accept => {}
+            D::Absent => return,
+            refused => {
+                let message = match &refused {
+                    D::RejectForeignOwner { uid } => format!(
+                        "refusing to restore session snapshot {}: owned by uid {uid}, not this process",
+                        path.display()
+                    ),
+                    D::RejectWorldReadable { mode } => format!(
+                        "refusing to restore session snapshot {}: permissions {:o} are more permissive than 0600",
+                        path.display(),
+                        mode & 0o7777
+                    ),
+                    D::RejectLookupError => format!(
+                        "refusing to restore session snapshot {}: ownership lookup failed",
+                        path.display()
+                    ),
+                    D::Accept | D::Absent => unreachable!("handled above"),
+                };
+                // Same reasoning as the per-workspace error below:
+                // restore_session runs before the control socket is even
+                // listening, so eprintln! is the only way a headless
+                // daemon's refusal is visible anywhere.
+                eprintln!("mtyx: {message}");
+                self.emit(MuxEvent::Status(message));
+                return;
+            }
+        }
+        let Some(snapshot) = crate::persist::SessionSnapshot::load(path) else {
             return;
         };
         let (workspaces, active_workspace) = crate::persist::workspaces(&snapshot);
@@ -2755,6 +2809,42 @@ mod tests {
         assert!(!screen_shows_shell_prompt("build finished in 3s"));
         assert!(!screen_shows_shell_prompt(""));
         assert!(!screen_shows_shell_prompt("   \n  "));
+    }
+
+    /// Issue #87: a refused snapshot decision must launch nothing. The
+    /// foreign-owner case is simulated through the pure decision function
+    /// (no second uid is available in CI): `restore_session_decided`
+    /// takes the exact refusal branch `restore_session` would, and must
+    /// leave the (empty) tree empty with zero surfaces spawned.
+    #[test]
+    fn restored_daemon_does_not_launch_on_boundary_failure() {
+        let mux = test_mux();
+        let path = std::path::PathBuf::from("/nonexistent/foreign-snapshot.json");
+        mux.restore_session_decided(
+            crate::platform::SnapshotTrustDecision::RejectForeignOwner { uid: 4242 },
+            &path,
+        );
+        mux.with_state(|s| {
+            assert_eq!(s.workspaces.len(), 0, "foreign-owned snapshot must not create a workspace");
+            assert_eq!(s.surfaces.len(), 0, "foreign-owned snapshot must spawn nothing");
+        });
+    }
+
+    /// Issue #87: the lookup-error and world-readable refusals take the
+    /// same zero-launch path.
+    #[test]
+    fn restored_daemon_refuses_on_credential_error() {
+        for decision in [
+            crate::platform::SnapshotTrustDecision::RejectLookupError,
+            crate::platform::SnapshotTrustDecision::RejectWorldReadable { mode: 0o777 },
+        ] {
+            let mux = test_mux();
+            mux.restore_session_decided(decision, &std::path::PathBuf::from("/x/snap.json"));
+            mux.with_state(|s| {
+                assert_eq!(s.workspaces.len(), 0);
+                assert_eq!(s.surfaces.len(), 0);
+            });
+        }
     }
 
     fn seed_split_ratio_tree(mux: &Mux) -> (PaneId, PaneId, PaneId) {
