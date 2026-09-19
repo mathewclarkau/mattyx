@@ -217,6 +217,134 @@ fn send_shell_flag_validates_and_accepts() {
     assert!(screen.contains("shell-flag-ok"), "screen did not contain marker; got {screen:?}");
 }
 
+// --- Confirmed (receipted) input — issue #88 ---
+
+/// Confirmed send is the CLI DEFAULT (no --confirm flag needed): against
+/// a live echoing shell the command exits 0 only after the daemon's
+/// receipt (the shell consumed and echoed the input).
+#[test]
+fn send_confirm_default_exits_zero_on_receipt() {
+    let server = HeadlessServer::start("send-confirm");
+    let workspace = cli(&server, &["new-workspace", "--name", "send-confirm"]);
+    assert_success(&workspace);
+    let surface = String::from_utf8(workspace.stdout).unwrap().trim().parse::<u64>().unwrap();
+
+    let ok = cli(
+        &server,
+        &["send", "--surface", &surface.to_string(), "--text", "echo confirm-marker\n"],
+    );
+    assert_success(&ok);
+    assert!(ok.stdout.is_empty(), "send should be quiet on success");
+    let screen = wait_for_screen(&server, surface, "confirm-marker");
+    assert!(screen.contains("confirm-marker"), "screen did not contain marker; got {screen:?}");
+}
+
+/// A confirmed send against a pane that neither echoes nor exits
+/// (tty echo off, `cat` draining to /dev/null) must exit nonzero with
+/// the structured `input_ack_timeout` error after --timeout-ms, and
+/// `--no-confirm` must keep the pre-#88 fire-and-forget behavior
+/// (immediate exit 0).
+#[test]
+fn send_confirm_ack_timeout_exits_nonzero_and_no_confirm_opts_out() {
+    let server = HeadlessServer::start("send-ack-timeout");
+    // An echo-free consumer: tty echo off, cat drains stdin to /dev/null.
+    let tab = cli(
+        &server,
+        &["new-tab", "--exec", "--", "/bin/sh", "-c", "stty -echo; exec cat > /dev/null"],
+    );
+    assert_success(&tab);
+    let surface = String::from_utf8(tab.stdout).unwrap().trim().parse::<u64>().unwrap();
+    // Let the exec'd cat land before the confirmed send, or the tty line
+    // discipline would still echo the input and produce a receipt.
+    std::thread::sleep(Duration::from_millis(1_000));
+
+    let started = Instant::now();
+    let bad = cli(
+        &server,
+        &["send", "--surface", &surface.to_string(), "--text", "silent\n", "--timeout-ms", "400"],
+    );
+    assert_eq!(
+        bad.status.code(),
+        Some(1),
+        "confirmed send must exit 1 on ACK timeout, got {bad:?}"
+    );
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    assert!(stderr.contains("input_ack_timeout"), "stderr: {stderr}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(400),
+        "exit must wait out the receipt timeout, took {:?}",
+        started.elapsed()
+    );
+
+    let escaped = cli(
+        &server,
+        &["send", "--surface", &surface.to_string(), "--text", "silent2\n", "--no-confirm"],
+    );
+    assert_success(&escaped);
+}
+
+/// Issue #88: a confirmed send against a legacy (protocol 6, no
+/// input-ACK capability) daemon is refused with the structured
+/// `legacy_host_receipt_rejected` error — never a silent downgrade to
+/// fire-and-forget. The fake daemon answers identify exactly as a v6
+/// server did (no `capabilities` record).
+#[test]
+fn send_confirm_rejected_against_legacy_daemon() {
+    let dir = unique_temp_dir("send-legacy");
+    fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("legacy.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let read_half = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let mut stream = stream;
+        writeln!(
+            stream,
+            r#"{{"id":1,"ok":true,"data":{{"app":"mtyx","version":"0.0.0","protocol":6,"session":"main","pid":1}}}}"#
+        )
+        .unwrap();
+        // Hold the connection open so the client reads our response
+        // rather than an EOF.
+        std::thread::sleep(Duration::from_millis(2_000));
+    });
+
+    let out = Command::new(bin())
+        .args(["send", "--socket"])
+        .arg(&socket)
+        .args(["--surface", "1", "--text", "hi"])
+        .env_remove("MTYX_MUX_SOCKET")
+        .env_remove("CMUX_MUX_SOCKET")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "legacy confirmed send must exit 1: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("legacy_host_receipt_rejected"), "stderr: {stderr}");
+    assert!(stderr.contains("--no-confirm"), "stderr must name the remedy: {stderr}");
+
+    // --no-confirm skips the pre-flight entirely, so against this
+    // one-shot fake daemon the send surfaces as a transport error
+    // (exit 3) — distinct from the capability rejection above.
+    let raw = Command::new(bin())
+        .args(["send", "--socket"])
+        .arg(&socket)
+        .args(["--surface", "1", "--text", "hi", "--no-confirm"])
+        .env_remove("MTYX_MUX_SOCKET")
+        .env_remove("CMUX_MUX_SOCKET")
+        .output()
+        .unwrap();
+    assert_eq!(
+        raw.status.code(),
+        Some(3),
+        "unconfirmed send must bypass the gate (transport error against the fake): {raw:?}"
+    );
+
+    server.join().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn report_agent_and_list_agents_round_trip() {
     let server = HeadlessServer::start("agents");
@@ -3620,7 +3748,11 @@ fn rename_makes_old_socket_unreachable_and_keeps_protocol() {
     let v: serde_json::Value = serde_json::from_slice(&id_new.stdout).unwrap();
     assert_eq!(v["session"].as_str(), Some("bar"));
     assert_eq!(v["pid"].as_u64(), Some(daemon_pid as u64));
-    assert_eq!(v["protocol"].as_u64(), Some(6), "rename must not bump the protocol version");
+    assert_eq!(
+        v["protocol"].as_u64(),
+        Some(mux_core::server::PROTOCOL_VERSION as u64),
+        "rename must not bump the protocol version"
+    );
 
     // Old path is gone -> connect fails with exit 3 (transport convention).
     let id_old = run_against(&old_sock, &dir, &["identify"]);
@@ -3880,7 +4012,7 @@ fn identify_reports_new_name_after_rename() {
     assert_success(&id);
     let v: serde_json::Value = serde_json::from_slice(&id.stdout).unwrap();
     assert_eq!(v["session"].as_str(), Some("bar"));
-    assert_eq!(v["protocol"].as_u64(), Some(6));
+    assert_eq!(v["protocol"].as_u64(), Some(mux_core::server::PROTOCOL_VERSION as u64));
 
     let _ = child.kill();
     let _ = child.wait();

@@ -258,6 +258,7 @@ SHORTHAND ALIASES (issue #91)
 
 SEND
   mtyx send --surface <id> --text <text> [--shell auto|fish|bash|zsh|sh|nu|raw]
+            [--no-confirm] [--timeout-ms N]
       Writes input to a PTY surface (stdin is used when neither --text nor
       --bytes is given). --shell enables shell-aware sanitisation (issue
       #35): with fish/bash/zsh/nu, a leading newline is prefixed when the
@@ -266,6 +267,13 @@ SEND
       instead of being interpreted by the shell's line editor. auto
       resolves the pane's shell from /proc on Linux. Default: raw
       (verbatim passthrough, unchanged from before).
+      Confirmed input (issue #88) is the DEFAULT: the command exits 0 only
+      after the daemon observes the input consumed (the surface echoed or
+      advanced, or the child exited) within --timeout-ms (default 5000).
+      --no-confirm restores fire-and-forget. Against a daemon without the
+      input-ACK capability (protocol < 7) a confirmed send fails with
+      legacy_host_receipt_rejected instead of silently downgrading;
+      oversized confirmed input (over 1 MiB) fails with oversized_input.
 
 LAYOUT EXPORT/APPLY (issue #76)
   mtyx layout-export --workspace <name-or-id> --output <file>.json

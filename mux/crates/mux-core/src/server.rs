@@ -42,6 +42,44 @@
 //! watchdog still points at the original path; a SIGKILL after rename is
 //! handled by the next `serve()` stale-clear / `kill-stale` (an L3
 //! follow-up can respawn the watchdog for the new path).
+//!
+//! ## Confirmed (receipted) input — `send --confirm` (issue #88)
+//!
+//! Protocol 7 adds an `input-ack` capability (negotiated via the
+//! `capabilities` record in the `identify` response) and a confirmed mode
+//! for `send`: `"confirm": true` (plus optional `"timeout_ms"`, default
+//! [`DEFAULT_INPUT_ACK_TIMEOUT_MS`], capped at [`MAX_INPUT_ACK_TIMEOUT_MS`])
+//! returns success only after the daemon OBSERVES the input consumed —
+//! the practical receipt is: bytes written to the PTY AND the surface
+//! echoed/advanced (the reader thread applied output: see
+//! `PtySurface::output_epoch`), or the child exited, within the timeout.
+//! This is a documented heuristic, NOT a byte-exact consumption proof; see
+//! `Surface::write_bytes_confirmed`.
+//!
+//! Ordering: confirmed sends serialize per-surface on a FIFO ticket, so
+//! concurrent confirmed sends to one surface resolve in submission order
+//! (`PtySurface::ack_gate`). Unconfirmed send (the wire default; the
+//! pre-#88 behavior) bypasses the gate and is unchanged.
+//!
+//! Capability gate: a client that wants confirmed send must check
+//! `identify` first ([`require_input_ack_capability`]); against a daemon
+//! lacking the capability it gets a structured
+//! `legacy_host_receipt_rejected` error, never a silent downgrade. The
+//! CLI's `send` does this automatically (`--confirm` is its DEFAULT;
+//! `--no-confirm` preserves fire-and-forget).
+//!
+//! Error codes (extra `"code"` field on error responses; the `error`
+//! string keeps a `"code: message"` prefix for string-matching callers):
+//!
+//! - `oversized_input` — confirmed send payload exceeds
+//!   [`MAX_CONFIRMED_SEND_BYTES`] (1 MiB). Rejected up front rather than
+//!   applying receipt backpressure to an unbounded write.
+//! - `input_ack_timeout` — no receipt within the timeout (or the send
+//!   never reached its FIFO turn). Bytes were written unless the message
+//!   says otherwise; delivery is unproven, not failed.
+//! - `legacy_host_receipt_rejected` — emitted by the CLIENT-side gate
+//!   when the daemon lacks `input-ack`; documented here as part of the
+//!   capability contract (this server never emits it).
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
@@ -59,7 +97,87 @@ use crate::{
     SplitDir, SurfaceId, SurfaceKind, WorkspaceId,
 };
 
-pub const PROTOCOL_VERSION: u32 = 6;
+/// Control-socket protocol version. 7 adds the `input-ack` capability
+/// (confirmed/receipted `send`, issue #88); see the module docs. Bumped
+/// from 6 (rename-session, attach `resized` replay events). Older
+/// clients keep working against this daemon: their requests deserialize
+/// unchanged (all new `send` fields are serde-defaulted) and unconfirmed
+/// send behaves exactly as before.
+pub const PROTOCOL_VERSION: u32 = 7;
+
+/// Issue #88: hard cap on a CONFIRMED send payload (bytes of `text` plus
+/// decoded `bytes`, before the optional CR / shell-sanitisation prefix).
+/// Oversized confirmed input is rejected with a structured
+/// `oversized_input` error instead of applying receipt backpressure to an
+/// unbounded write. Unconfirmed sends are NOT capped (pre-#88 behavior is
+/// unchanged).
+pub const MAX_CONFIRMED_SEND_BYTES: usize = 1024 * 1024;
+
+/// Issue #88: default `send --confirm` receipt timeout.
+pub const DEFAULT_INPUT_ACK_TIMEOUT_MS: u64 = 5_000;
+
+/// Issue #88: server-side cap on the confirmed-send receipt timeout, so a
+/// leaked waiter can't park on its connection thread forever (mirrors
+/// [`MAX_AGENT_WAIT_MS`]).
+pub const MAX_INPUT_ACK_TIMEOUT_MS: u64 = 60_000;
+
+/// Issue #88: the input-ACK capability key in the `identify` response's
+/// `capabilities` object. A daemon reporting it implements confirmed
+/// (receipted) input for `send` (see the module docs).
+pub const CAP_INPUT_ACK: &str = "input-ack";
+
+/// True when an `identify` response's `data` advertises the input-ACK
+/// capability (issue #88).
+pub fn identify_has_input_ack(identify: &Value) -> bool {
+    identify.get("capabilities").and_then(|c| c.get(CAP_INPUT_ACK)).and_then(Value::as_bool)
+        == Some(true)
+}
+
+/// Issue #88 CLIENT-side capability gate: refuse a confirmed send against
+/// a daemon that lacks input-ACK (no `capabilities` record, e.g. protocol
+/// <= 6) instead of silently downgrading to fire-and-forget. The bundled
+/// CLI calls this on an `identify` pre-flight before every confirmed
+/// `send`; the error carries the structured code
+/// `legacy_host_receipt_rejected`.
+pub fn require_input_ack_capability(identify: &Value) -> Result<(), ServerError> {
+    if identify_has_input_ack(identify) {
+        return Ok(());
+    }
+    let protocol = identify.get("protocol").and_then(Value::as_u64).unwrap_or(0);
+    Err(ServerError::new(
+        "legacy_host_receipt_rejected",
+        format!(
+            "daemon (protocol {protocol}) does not advertise the input-ACK capability,              so a confirmed-send receipt cannot be negotiated; pass --no-confirm for              fire-and-forget delivery"
+        ),
+    ))
+}
+
+/// Issue #88: structured socket error — a stable machine-readable `code`
+/// plus a human message. Serialized as an extra `"code"` field on the
+/// error response line (old clients ignore it), and the `error` string
+/// keeps a `"<code>: <message>"` prefix so string-matching callers see
+/// the code too.
+#[derive(Debug, Clone)]
+pub struct ServerError {
+    /// Stable machine-readable error kind (see the module docs for the
+    /// issue-#88 codes).
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl ServerError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        ServerError { code, message: message.into() }
+    }
+}
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ServerError {}
 
 /// Default socket path for a session.
 pub fn default_socket_path(session: &str) -> PathBuf {
@@ -242,6 +360,20 @@ enum Command {
         /// on Linux and falls back to `raw` on lookup failure or non-Linux.
         #[serde(default)]
         shell: Option<String>,
+        /// Issue #88: request a RECEIPT — the reply is sent only after the
+        /// daemon observes the input consumed (surface echo/advance or
+        /// child exit within `timeout_ms`). Requires the `input-ack`
+        /// capability (protocol 7+); absent/false keeps the pre-#88
+        /// fire-and-forget write (the wire default, so old requests and
+        /// old daemons behave exactly as before).
+        #[serde(default)]
+        confirm: Option<bool>,
+        /// Issue #88: receipt timeout in milliseconds for
+        /// `confirm: true`. Defaults to [`DEFAULT_INPUT_ACK_TIMEOUT_MS`],
+        /// capped at [`MAX_INPUT_ACK_TIMEOUT_MS`] server-side. `0` is
+        /// rejected (a confirmed send must wait at least 1 ms).
+        #[serde(default)]
+        timeout_ms: Option<u64>,
     },
     ReadScreen {
         surface: SurfaceId,
@@ -697,6 +829,11 @@ struct Response {
     data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Issue #88: stable machine-readable error code, present only when
+    /// the handler failed with a [`ServerError`] (e.g. `oversized_input`,
+    /// `input_ack_timeout`). Old clients ignore the extra field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
 }
 
 /// Line-oriented shared writer: responses and event streams interleave
@@ -765,8 +902,18 @@ fn handle_connection(mux: Arc<Mux>, stream: Box<dyn transport::Stream>) {
             Ok(req) => {
                 let id = req.id.clone();
                 match handle_command(&mux, req.cmd, &writer) {
-                    Ok(data) => Response { id, ok: true, data: Some(data), error: None },
-                    Err(e) => Response { id, ok: false, data: None, error: Some(e.to_string()) },
+                    Ok(data) => {
+                        Response { id, ok: true, data: Some(data), error: None, code: None }
+                    }
+                    // Issue #88: a structured ServerError also carries its
+                    // code on the wire (see Response::code).
+                    Err(e) => Response {
+                        code: e.downcast_ref::<ServerError>().map(|se| se.code.to_string()),
+                        id,
+                        ok: false,
+                        data: None,
+                        error: Some(e.to_string()),
+                    },
                 }
             }
             Err(e) => Response {
@@ -774,6 +921,7 @@ fn handle_connection(mux: Arc<Mux>, stream: Box<dyn transport::Stream>) {
                 ok: false,
                 data: None,
                 error: Some(format!("bad request: {e}")),
+                code: None,
             },
         };
         let Ok(value) = serde_json::to_value(&response) else { break };
@@ -1123,6 +1271,18 @@ fn validate_wait_request(state: &str, timeout_ms: u64) -> anyhow::Result<crate::
     Ok(wanted)
 }
 
+/// Issue #88: resolve + validate a confirmed send's `timeout_ms`.
+/// Absent means [`DEFAULT_INPUT_ACK_TIMEOUT_MS`]; `0` and anything over
+/// [`MAX_INPUT_ACK_TIMEOUT_MS`] are rejected before any bytes are written
+/// (extracted from the handler so the table test can pin it).
+fn validate_input_ack_timeout(timeout_ms: Option<u64>) -> anyhow::Result<u64> {
+    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_INPUT_ACK_TIMEOUT_MS);
+    if timeout_ms == 0 || timeout_ms > MAX_INPUT_ACK_TIMEOUT_MS {
+        anyhow::bail!("timeout {timeout_ms}ms must be between 1 and {MAX_INPUT_ACK_TIMEOUT_MS}ms");
+    }
+    Ok(timeout_ms)
+}
+
 /// Success payload for `wait-agent-status`: the matched report plus the
 /// surface's current plain-text snapshot (the "read payload").
 fn wait_agent_status_json(
@@ -1345,32 +1505,90 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
             "app": "mtyx",
             "version": crate::VERSION,
             "protocol": PROTOCOL_VERSION,
+            // Issue #88 capability record: a client wanting confirmed
+            // (receipted) send gates on this before sending `confirm:true`
+            // (see require_input_ack_capability).
+            "capabilities": { CAP_INPUT_ACK: true },
             "session": mux.session_name(),
             "pid": std::process::id(),
         })),
         Command::ListWorkspaces => Ok(mux.with_state(workspaces_json)),
         Command::GetResolvedConfig => Ok(mux.resolved_chrome().unwrap_or_else(|| json!({}))),
-        Command::Send { surface, text, bytes, send_cr, shell } => {
+        Command::Send { surface, text, bytes, send_cr, shell, confirm, timeout_ms } => {
             let surface = get_surface(mux, surface)?;
             require_pty(&surface)?;
             // Issue #35: shell-aware sanitisation of `text` (raw bytes
             // via `bytes` are always written verbatim). `raw` (the
             // default) keeps the pre-#35 passthrough behaviour.
             let mode = resolve_shell_mode(shell.as_deref(), surface.child_pid())?;
+            // Issue #88: build the whole payload up front (text first,
+            // then bytes — the pre-#88 wire order, each with its optional
+            // trailing CR) so a confirmed send writes ONE ordered, sized
+            // unit under the surface's input-ACK FIFO, and so a base64
+            // decode error can no longer land AFTER the text half was
+            // already applied (a latent pre-#88 wart: the bytes half was
+            // decoded after the text half was written).
+            let mut payload = Vec::new();
             if let Some(text) = text {
-                let mut bytes_buf = sanitise_text(mode, &text).into_bytes();
+                let mut text_bytes = sanitise_text(mode, &text).into_bytes();
                 if send_cr.unwrap_or(false) {
-                    bytes_buf.push(b'\r');
+                    text_bytes.push(b'\r');
                 }
-                surface.write_bytes(&bytes_buf)?;
+                payload.extend_from_slice(&text_bytes);
             }
             if let Some(b64) = bytes {
                 let mut raw = base64::engine::general_purpose::STANDARD.decode(b64)?;
                 if send_cr.unwrap_or(false) {
                     raw.push(b'\r');
                 }
-                surface.write_bytes(&raw)?;
+                payload.extend_from_slice(&raw);
             }
+            if confirm.unwrap_or(false) {
+                // Bounded input: reject before writing rather than hold
+                // receipt backpressure over an unbounded payload.
+                if payload.len() > MAX_CONFIRMED_SEND_BYTES {
+                    return Err(ServerError::new(
+                        "oversized_input",
+                        format!(
+                            "confirmed send payload is {} bytes; the cap is \
+                             {MAX_CONFIRMED_SEND_BYTES} bytes (MAX_CONFIRMED_SEND_BYTES)",
+                            payload.len()
+                        ),
+                    )
+                    .into());
+                }
+                let timeout =
+                    std::time::Duration::from_millis(validate_input_ack_timeout(timeout_ms)?);
+                return match surface.write_bytes_confirmed(&payload, timeout) {
+                    Ok(()) => Ok(json!({ "confirmed": true })),
+                    Err(crate::ConfirmedSendError::AckTimeout { waited_ms }) => {
+                        Err(ServerError::new(
+                            "input_ack_timeout",
+                            format!(
+                                "no input receipt (surface output or child-drain) within \
+                                 {waited_ms}ms; bytes were written to the pty but consumption \
+                                 was not observed"
+                            ),
+                        )
+                        .into())
+                    }
+                    Err(crate::ConfirmedSendError::QueueTimeout { waited_ms }) => {
+                        Err(ServerError::new(
+                            "input_ack_timeout",
+                            format!(
+                                "confirmed-input queue for this surface did not reach this \
+                                 send within {waited_ms}ms; nothing was written (earlier \
+                                 confirmed sends hold the queue)"
+                            ),
+                        )
+                        .into())
+                    }
+                    Err(crate::ConfirmedSendError::Io(err)) => Err(err.into()),
+                };
+            }
+            // Unconfirmed (pre-#88) path: same byte sequence to the pty,
+            // no gate, no receipt wait, no size cap.
+            surface.write_bytes(&payload)?;
             Ok(json!({}))
         }
         Command::ReadScreen { surface } => {
@@ -2208,6 +2426,55 @@ mod tests {
         assert_eq!(tail_lines(screen, 2), "row-b\nrow-c");
         assert_eq!(tail_lines(screen, 10), "cmd\nrow-a\nrow-b\nrow-c");
         assert_eq!(tail_lines("", 5), "");
+    }
+
+    /// Issue #88: confirmed-send receipt timeout validation. Absent →
+    /// the default; 0 and over-cap are rejected; 1 and the cap are legal.
+    #[test]
+    fn input_ack_timeout_validation_table() {
+        assert_eq!(validate_input_ack_timeout(None).unwrap(), DEFAULT_INPUT_ACK_TIMEOUT_MS);
+        assert_eq!(validate_input_ack_timeout(Some(1)).unwrap(), 1);
+        assert_eq!(
+            validate_input_ack_timeout(Some(MAX_INPUT_ACK_TIMEOUT_MS)).unwrap(),
+            MAX_INPUT_ACK_TIMEOUT_MS
+        );
+        assert!(validate_input_ack_timeout(Some(0)).is_err());
+        assert!(validate_input_ack_timeout(Some(MAX_INPUT_ACK_TIMEOUT_MS + 1)).is_err());
+    }
+
+    /// Issue #88: the CLIENT-side capability gate. A protocol-6 identify
+    /// (no `capabilities` record) and even a protocol-7 identify without
+    /// the record are refused with the structured
+    /// `legacy_host_receipt_rejected` code — never a silent downgrade to
+    /// fire-and-forget. A daemon advertising `input-ack` passes. (The
+    /// end-to-end identify shape is pinned in tests/input_ack.rs.)
+    #[test]
+    fn legacy_host_receipt_rejected_by_capability_gate() {
+        let legacy = json!({
+            "app": "mtyx", "version": "0.0.0", "protocol": 6,
+            "session": "main", "pid": 1,
+        });
+        let err = require_input_ack_capability(&legacy).unwrap_err();
+        assert_eq!(err.code, "legacy_host_receipt_rejected");
+        let message = err.to_string();
+        assert!(
+            message.starts_with("legacy_host_receipt_rejected: daemon (protocol 6)"),
+            "{message}"
+        );
+        assert!(message.contains("input-ACK capability"), "{message}");
+        assert!(message.contains("--no-confirm"), "{message}");
+        // The gate keys on the capability record, not the number: a v7
+        // daemon that (hypothetically) omitted the record is still
+        // refused, and a reply WITH the record passes.
+        let no_record = json!({ "app": "mtyx", "protocol": 7 });
+        assert_eq!(
+            require_input_ack_capability(&no_record).unwrap_err().code,
+            "legacy_host_receipt_rejected"
+        );
+        let capable =
+            json!({ "app": "mtyx", "protocol": 7, "capabilities": { "input-ack": true } });
+        assert!(require_input_ack_capability(&capable).is_ok());
+        assert!(identify_has_input_ack(&capable));
     }
 
     #[test]

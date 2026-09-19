@@ -30,8 +30,9 @@ pub(crate) struct GlobalArgs {
 /// Verb flags that are boolean and accept the bare form (`--group`) —
 /// a missing or flag-looking following token means `true` instead of an
 /// error or swallowing the next flag as a value (issue #100). Valued
-/// forms (`--group 1`, `--group 0`) still work.
-const BARE_BOOL_FLAGS: &[&str] = &["group"];
+/// forms (`--group 1`, `--group 0`) still work. `confirm`/`no-confirm`
+/// (issue #88) join the same convention.
+const BARE_BOOL_FLAGS: &[&str] = &["group", "confirm", "no-confirm"];
 
 /// Verbs that accept one bare positional argument alongside their flags
 /// (issue #84: `mtyx screenshot --surface <id> <file>`), mapped onto the
@@ -86,7 +87,18 @@ const VERBS: &[VerbSpec] = &[
     },
     VerbSpec {
         name: "send",
-        allowed: &["surface", "text", "bytes", "send-cr", "shell"],
+        // Issue #88: --confirm (the default) / --no-confirm and
+        // --timeout-ms for receipted input.
+        allowed: &[
+            "surface",
+            "text",
+            "bytes",
+            "send-cr",
+            "shell",
+            "confirm",
+            "no-confirm",
+            "timeout-ms",
+        ],
         build: build_send,
         print: print_empty,
         stream: false,
@@ -737,6 +749,58 @@ fn cli_error(json_output: bool, exit: i32, message: &str) -> i32 {
     exit
 }
 
+/// Issue #88: pre-flight capability negotiation for a confirmed `send`.
+/// Sends `identify` on the same connection and requires the input-ACK
+/// capability record (`mux_core::server::require_input_ack_capability`).
+/// A daemon without the capability (protocol <= 6) yields the structured
+/// `legacy_host_receipt_rejected` error — never a silent downgrade to
+/// fire-and-forget. Transport/protocol failures return exit code 3; the
+/// capability rejection is a server-level error (exit 1).
+fn input_ack_capability_gate(stream: &mut Box<dyn transport::Stream>) -> Result<(), (i32, String)> {
+    let identify = json!({"id": REQUEST_ID, "cmd": "identify"});
+    let mut line = match serde_json::to_vec(&identify) {
+        Ok(mut line) => {
+            line.push(b'\n');
+            line
+        }
+        Err(err) => return Err((2, format!("failed to encode identify pre-flight: {err}"))),
+    };
+    if let Err(err) = stream.write_all(&line).and_then(|_| stream.flush()) {
+        return Err((3, format!("transport error during identify pre-flight: {err}")));
+    }
+    // Read the response byte-wise: the same stream is later handed to a
+    // BufReader, and buffering here could swallow bytes it needs.
+    line.clear();
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => return Err((3, "transport closed before identify response".to_string())),
+            Ok(_) => {
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            Err(err) => {
+                return Err((3, format!("transport error reading identify response: {err}")));
+            }
+        }
+    }
+    let value: Value = match serde_json::from_slice(&line) {
+        Ok(value) => value,
+        Err(err) => return Err((3, format!("bad identify response: {err}"))),
+    };
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        let error = value.get("error").and_then(Value::as_str).unwrap_or("unknown error");
+        return Err((3, format!("identify pre-flight failed: {error}")));
+    }
+    let data = value.get("data").cloned().unwrap_or(Value::Null);
+    match mux_core::server::require_input_ack_capability(&data) {
+        Ok(()) => Ok(()),
+        Err(err) => Err((1, err.to_string())),
+    }
+}
+
 fn run_command(args: CliArgs) -> i32 {
     match args.verb.name {
         "list-sessions" => return run_list_sessions(&args.global, &args.flags),
@@ -778,8 +842,28 @@ fn run_command(args: CliArgs) -> i32 {
         let wait_ms =
             args.flags.optional("timeout").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
         let _ = stream.set_read_timeout(Some(Duration::from_millis(wait_ms.saturating_add(5_000))));
+    } else if args.verb.name == "send"
+        && request.get("confirm").and_then(Value::as_bool) == Some(true)
+    {
+        // Issue #88: a confirmed send's reply legitimately arrives after
+        // up to `--timeout-ms` (plus the identify pre-flight below), so
+        // budget the socket read like wait-agent-status does.
+        let ack_ms = request
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(mux_core::server::DEFAULT_INPUT_ACK_TIMEOUT_MS);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(ack_ms.saturating_add(5_000))));
     } else {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    }
+    // Issue #88: confirmed send is capability-gated client-side. The
+    // identify pre-flight refuses a daemon that lacks input-ACK with
+    // `legacy_host_receipt_rejected` (exit 1) instead of silently
+    // downgrading to fire-and-forget.
+    if args.verb.name == "send" && request.get("confirm").and_then(Value::as_bool) == Some(true) {
+        if let Err((code, message)) = input_ack_capability_gate(&mut stream) {
+            return cli_error(args.global.json, code, &message);
+        }
     }
     let mut line = match serde_json::to_vec(&request) {
         Ok(line) => line,
@@ -978,6 +1062,27 @@ fn build_send(flags: &FlagMap) -> Result<Value, UsageError> {
             )));
         }
         value["shell"] = json!(shell);
+    }
+    // Issue #88: confirmed (receipted) input is the CLI DEFAULT — the
+    // command exits 0 only after the daemon observes the input consumed
+    // (surface echo/advance or child exit within the timeout).
+    // `--no-confirm` (or `--confirm=false`) preserves the pre-#88
+    // fire-and-forget behavior; the two flags cannot disagree.
+    let confirm_flag = flags.optional_bool("confirm");
+    let no_confirm = flags.optional_bool("no-confirm").unwrap_or(false);
+    if confirm_flag == Some(true) && no_confirm {
+        return Err(UsageError("--confirm and --no-confirm are mutually exclusive".into()));
+    }
+    let confirm = !no_confirm && confirm_flag != Some(false);
+    if confirm {
+        value["confirm"] = json!(true);
+        if let Some(raw) = flags.optional("timeout-ms") {
+            let timeout_ms = parse_u64("timeout-ms", &raw)?;
+            if timeout_ms == 0 {
+                return Err(UsageError("--timeout-ms must be at least 1".into()));
+            }
+            value["timeout_ms"] = json!(timeout_ms);
+        }
     }
     if value.get("text").is_none() && value.get("bytes").is_none() {
         let mut text = String::new();
