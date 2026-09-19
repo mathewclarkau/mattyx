@@ -2461,6 +2461,45 @@ Example:
 {"id":109,"ok":true,"data":{"matched":true,"surface":4,"state":"idle","agent":"worker-1","message":"done for now","updated_at_ms":1710000005000,"elapsed_ms":412,"text":"$ "}}
 ```
 
+### wait-ready
+
+| Field  | Value            |
+| ------ | ---------------- |
+| name   | `wait-ready`     |
+| status | implemented      |
+| since  | protocol 7       |
+
+Issue #85: block until a surface is *ready* — its visible screen shows a recognised prompt (a shell prompt or an identified agent) **and** its PTY has a running process-tree child — or `timeout_ms` elapses. Read-only observation: it never writes to the pane or mutates mux state. This is the post-spawn health check for headless orchestrators, which otherwise cannot distinguish a completed launch from a silent partial one (`send` succeeds once bytes reach the PTY buffer).
+
+A timeout is **not** an error: the reply is `ok:true` with `ready:false`, so the caller reads the structured result. The `mtyx` CLI maps `ready:false` to exit 1 while still printing the JSON payload.
+
+Params:
+
+| Name         | JSON type | Required/default          | Constraints                                  |
+| ------------ | --------- | ------------------------- | -------------------------------------------- |
+| `surface`    | `Id`      | required                  | PTY surface to observe (browser surfaces error) |
+| `timeout_ms` | `u64`     | default 5000              | milliseconds; `0` is a single immediate check; capped at 600000 |
+
+Result:
+
+```text
+object{ready:bool,surface:Id,prompt_seen:bool,child:object{pid:u32,comm:string}|null,elapsed_ms:u64}
+```
+
+Example (ready):
+
+```json
+{"id":110,"cmd":"wait-ready","surface":4,"timeout_ms":5000}
+{"id":110,"ok":true,"data":{"ready":true,"surface":4,"prompt_seen":true,"child":{"pid":48213,"comm":"fish"},"elapsed_ms":128}}
+```
+
+Example (timeout):
+
+```json
+{"id":111,"cmd":"wait-ready","surface":4,"timeout_ms":300}
+{"id":111,"ok":true,"data":{"ready":false,"surface":4,"prompt_seen":false,"child":null,"elapsed_ms":301}}
+```
+
 ### pane-worktree-create
 
 | Field  | Value                    |

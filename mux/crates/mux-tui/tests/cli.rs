@@ -5176,3 +5176,53 @@ fn json_errors_return_structured_envelope() {
     assert!(human.stdout.is_empty(), "non-JSON errors keep stdout clean");
     assert!(String::from_utf8_lossy(&human.stderr).contains("unknown agent"));
 }
+
+// --- Issue #85: wait-ready post-spawn health check ---
+
+/// AC1 end to end through the real binary: a freshly spawned shell pane
+/// becomes `ready:true` with spawn metadata (`child.pid`/`child.comm` and
+/// `prompt_seen`) and exits 0.
+#[test]
+fn wait_ready_json_reports_ready_with_child() {
+    let server = HeadlessServer::start("wait-ready");
+    let workspace = cli(&server, &["new-workspace", "--name", "ready"]);
+    assert_success(&workspace);
+    let surface = String::from_utf8(workspace.stdout).unwrap().trim().parse::<u64>().unwrap();
+
+    // Give the login shell a moment to draw its prompt and fork nothing
+    // (the shell itself is the PTY child); wait-ready handles the rest.
+    let ready = cli(
+        &server,
+        &["--json", "wait-ready", "--surface", &surface.to_string(), "--timeout", "5000"],
+    );
+    assert_success(&ready);
+    let value: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+    assert_eq!(value["ready"].as_bool(), Some(true), "payload: {value}");
+    assert_eq!(value["surface"].as_u64(), Some(surface));
+    assert_eq!(value["prompt_seen"].as_bool(), Some(true), "payload: {value}");
+    assert!(value["child"]["pid"].as_u64().unwrap_or(0) > 0, "payload: {value}");
+    assert!(!value["child"]["comm"].as_str().unwrap_or("").is_empty(), "payload: {value}");
+    assert!(value["elapsed_ms"].is_u64());
+}
+
+/// AC2 end to end: a surface that cannot become ready (here: one already
+/// closed) exits 1 but still prints `ready:false` as JSON, so a headless
+/// caller gets both a gateable exit code and a parseable payload.
+#[test]
+fn wait_ready_timeout_json_ready_false_exits_nonzero() {
+    let server = HeadlessServer::start("wait-ready-fail");
+    let workspace = cli(&server, &["new-workspace", "--name", "wedge"]);
+    assert_success(&workspace);
+    let surface = String::from_utf8(workspace.stdout).unwrap().trim().parse::<u64>().unwrap();
+    let close = cli(&server, &["close-surface", "--surface", &surface.to_string()]);
+    assert_success(&close);
+
+    let not_ready = cli(
+        &server,
+        &["--json", "wait-ready", "--surface", &surface.to_string(), "--timeout", "200"],
+    );
+    assert_eq!(not_ready.status.code(), Some(1), "not-ready must exit nonzero");
+    let value: serde_json::Value = serde_json::from_slice(&not_ready.stdout).unwrap();
+    assert_eq!(value["ready"].as_bool(), Some(false), "payload: {value}");
+    assert_eq!(value["child"], serde_json::Value::Null, "payload: {value}");
+}

@@ -91,6 +91,62 @@ pub struct CloseWorkspaceReport {
     pub survivors: Vec<WorktreeChild>,
 }
 
+/// A pane PTY's running process-tree child (issue #85).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadinessChild {
+    pub pid: u32,
+    /// `/proc/<pid>/comm` (argv0 basename, 15-char kernel limit).
+    pub comm: String,
+}
+
+/// Issue #85: read-only post-spawn health of one surface. `ready` is
+/// derived by the caller as `prompt_seen && child.is_some()` so the
+/// two halves stay separately inspectable in the JSON response.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SurfaceReadiness {
+    /// The pane's visible screen shows a recognised prompt, or an agent
+    /// was detected in it.
+    pub prompt_seen: bool,
+    /// The running process-tree child (shell, or the spawned command).
+    pub child: Option<ReadinessChild>,
+}
+
+impl SurfaceReadiness {
+    /// Both halves observed: the shell/agent prompt is up AND a child
+    /// process is actually running.
+    pub fn is_ready(&self) -> bool {
+        self.prompt_seen && self.child.is_some()
+    }
+}
+
+/// Issue #85 shell-prompt fallback for [`Mux::surface_readiness`].
+///
+/// [`crate::agent_state_classify`]'s generic idle markers are `"$ "`,
+/// `"# "`, `"% "`, `"❯ "`, `"λ "` — all ending in a space. The VT
+/// plain formatter runs with `trim: true` (`Terminal::plain_text`), so a
+/// real prompt sitting at the end of its line (`"$ "` with the cursor
+/// after it) reads back as `"$"` and every marker misses. This checks
+/// the last non-blank line's right-trimmed form for a trailing prompt
+/// token instead, which survives the trim. Deliberately conservative:
+/// only well-known prompt terminators count, so ordinary output (e.g. a
+/// line ending in `"3"`) is not mistaken for a prompt.
+fn screen_shows_shell_prompt(text: &str) -> bool {
+    let Some(last) = text.lines().rev().find(|line| !line.trim().is_empty()) else {
+        return false;
+    };
+    let line = last.trim_end();
+    // Single-glyph shell/user prompts at end of line.
+    if line.ends_with('$') || line.ends_with('#') || line.ends_with('%') {
+        return true;
+    }
+    if line.ends_with('❯') || line.ends_with('λ') {
+        return true;
+    }
+    // Agent REPL prompts: `pi> `, `codex>`. These also lose their
+    // trailing space to the trim, so match the token without it.
+    line.ends_with("pi>") || line.ends_with("codex>")
+}
+
 /// The multiplexer. Shared by frontends and the control socket server.
 pub struct Mux {
     state: Mutex<State>,
@@ -1892,6 +1948,82 @@ reattaching to remote session {session_id} on {host} \
         Ok(all)
     }
 
+    /// Issue #85: one read-only readiness snapshot for a surface — the
+    /// pair of observations a headless orchestrator needs to tell a
+    /// completed spawn from a silent partial launch. Observation only:
+    /// it takes the terminal lock, reads `/proc`, and mutates nothing.
+    ///
+    /// * `prompt_seen` is true once the pane's visible screen shows a
+    ///   recognised resting prompt ([`crate::agent_state_classify`]'s
+    ///   `Idle` markers — `$ `, `# `, `pi> `, `codex>`, …) **or** the
+    ///   ambient agent detector identifies an agent (its own prompt is
+    ///   the marker). This is the "shell/agent came up" half.
+    /// * `child` is the pane PTY's process-tree child that is actually
+    ///   running — the most-recently-spawned entry of the PTY child plus
+    ///   its descendants (`agent_detect::collect_process_evidence`),
+    ///   which is the direct shell for a bare pane and the spawned
+    ///   command once `send` has run it. This is the "the spawned
+    ///   command is running" half.
+    ///
+    /// A surface is `ready` only when BOTH hold; the caller decides
+    /// when to give up (see `Command::WaitReady`).
+    pub fn surface_readiness(&self, surface: &Arc<Surface>) -> SurfaceReadiness {
+        if surface.kind() != crate::SurfaceKind::Pty {
+            return SurfaceReadiness::default();
+        }
+        // Process half: the child tree under the PTY. `collect_process_evidence`
+        // already walks the direct child + every descendant and reads
+        // comm/cmdline; a dead child leaves it empty.
+        let evidence = crate::agent_detect::collect_process_evidence(surface.child_pid());
+        let child = evidence
+            .iter()
+            // Prefer the most-recently-spawned process (the actual
+            // command once a shell has exec'd/forks it), matching
+            // `agent_detect`'s tie-break; a bare shell only ever has
+            // itself, so this degrades to the shell.
+            .max_by_key(|e| e.starttime)
+            .map(|e| ReadinessChild { pid: e.pid, comm: e.comm.clone() });
+        // Screen half: a recognised resting prompt, or an agent the
+        // detector identifies. Both reuse existing detectors rather than
+        // introducing a third prompt grammar. The pure `detect` function
+        // is called directly (NOT `detect_agent`, which caches the result
+        // and emits `TreeChanged`) so this probe stays mutation-free.
+        let screen = surface.try_with_terminal(|t| t.plain_text()).ok().and_then(|r| r.ok());
+        let prompt_seen = match screen {
+            Some(text) => {
+                let settings = self.agent_detection();
+                let detected_agent = if settings.enabled {
+                    self.agent_pattern_list()
+                        .ok()
+                        .map(|patterns| {
+                            crate::agent_detect::detect(
+                                &evidence,
+                                &text,
+                                &patterns,
+                                settings.min_confidence,
+                            )
+                            .agent
+                        })
+                        .unwrap_or_default()
+                } else {
+                    // Detection disabled by configuration: fall back to
+                    // the last cached detection, if any.
+                    surface.detected_agent().map(|d| d.agent).unwrap_or_default()
+                };
+                let named_agent = !detected_agent.is_empty() && detected_agent != "unknown";
+                // `classify_signal` is a pure function of (agent, screen)
+                // and returns `Idle` for a resting prompt of the detected
+                // agent's bucket (or `generic` shells).
+                let signal = crate::agent_state_classify::classify_signal(&detected_agent, &text);
+                named_agent
+                    || matches!(signal, crate::agent_state_classify::StateSignal::Idle)
+                    || screen_shows_shell_prompt(&text)
+            }
+            None => false,
+        };
+        SurfaceReadiness { prompt_seen, child }
+    }
+
     /// Run ambient detection on one surface (issue #78 AC1): collect
     /// process + screen evidence, score it against the registry, cache
     /// the result on the surface, and emit `TreeChanged` so frontends
@@ -2556,6 +2688,26 @@ mod tests {
         let opts =
             SurfaceOptions { command: Some(vec!["/bin/cat".to_string()]), ..Default::default() };
         Mux::new("test", opts)
+    }
+
+    /// Issue #85: the shell-prompt fallback. The VT plain formatter trims
+    /// trailing spaces, so a real `$ ` prompt at end of line reads back
+    /// as `$`; the fallback must still recognise it without matching
+    /// arbitrary output.
+    #[test]
+    fn shell_prompt_fallback_survives_plain_text_trim() {
+        assert!(screen_shows_shell_prompt("boot log\nready$"));
+        assert!(screen_shows_shell_prompt("root@host:/# "));
+        assert!(screen_shows_shell_prompt("user%"));
+        assert!(screen_shows_shell_prompt("pi>"));
+        assert!(screen_shows_shell_prompt("codex>"));
+        assert!(screen_shows_shell_prompt("❯"));
+        // Trailing blank rows are skipped to find the prompt line.
+        assert!(screen_shows_shell_prompt("out$\n\n  \n"));
+        // Ordinary output must not read as a prompt.
+        assert!(!screen_shows_shell_prompt("build finished in 3s"));
+        assert!(!screen_shows_shell_prompt(""));
+        assert!(!screen_shows_shell_prompt("   \n  "));
     }
 
     fn seed_split_ratio_tree(mux: &Mux) -> (PaneId, PaneId, PaneId) {

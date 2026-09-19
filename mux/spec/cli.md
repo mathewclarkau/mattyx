@@ -101,6 +101,7 @@ The generated CLI requires one of `--index` or `--delta` for `select-tab`, `sele
 | `agent-read`          | implemented | `--target <name-or-id>`                             | `--source visible/recent/recent-unwrapped`, `--lines <n>`         | pane text                                                                                                                                                     |
 | `agent-send`          | implemented | `--target <name-or-id> --text <text>`               | `--shell auto/fish/bash/zsh/sh/nu/raw`                            | none                                                                                                                                                          |
 | `wait-agent-status`   | implemented | `--target <name-or-id> --status <state> --timeout <ms>` | none                                                          | pane text                                                                                                                                                     |
+| `wait-ready`          | implemented | `--surface <id>`                                    | `--timeout <ms>` (default 5000)                                   | readiness line (`ready=… surface=… prompt_seen=… child… elapsed_ms=…`); JSON payload with `--json`. Exit 1 when `ready:false`. |
 
 
 ## Plugin Verb Group

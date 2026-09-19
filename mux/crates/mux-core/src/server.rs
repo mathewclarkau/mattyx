@@ -782,6 +782,24 @@ enum Command {
         state: String,
         timeout_ms: u64,
     },
+    /// Issue #85: block until a surface is *ready* — its screen shows a
+    /// recognised prompt (or an agent) AND its PTY has a running
+    /// process-tree child — or `timeout_ms` elapses. Read-only
+    /// observation: it never writes to the pane or mutates mux state.
+    ///
+    /// The reply is always `ok:true` with a structured payload (see
+    /// [`wait_ready_json`]); a timeout is `{"ready": false, ...}`, NOT
+    /// an error, so a headless orchestrator can read the JSON and
+    /// decide. The CLI maps `ready:false` to a nonzero exit (AC2).
+    /// `timeout_ms` defaults to [`DEFAULT_WAIT_READY_MS`] when absent
+    /// (backward compat: a pre-#85 daemon hits serde's unknown-variant
+    /// path) and is capped at [`MAX_AGENT_WAIT_MS`] so a leaked waiter
+    /// cannot park on its connection thread forever.
+    WaitReady {
+        surface: SurfaceId,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
     /// Rename THIS daemon's session (issue #63): atomically move its
     /// `.sock`/`.pid` to the new name, update the logical session name,
     /// and best-effort reparent the persisted snapshot file. The listener
@@ -1257,6 +1275,45 @@ fn tail_lines(text: &str, n: usize) -> String {
 /// server parks one connection thread per waiter, so an unbounded
 /// timeout would let leaked waiters accumulate forever (plan §5.4).
 const MAX_AGENT_WAIT_MS: u64 = 600_000;
+
+/// Issue #85: default `wait-ready` timeout when the request omits
+/// `timeout_ms`. 5 s is long enough for a login shell/first prompt on a
+/// cold pane and short enough that a caller that forgot the flag does
+/// not hang; explicit callers should pass their own budget.
+pub const DEFAULT_WAIT_READY_MS: u64 = 5_000;
+
+/// Issue #85: resolve + cap a `wait-ready` timeout. Absent falls back to
+/// [`DEFAULT_WAIT_READY_MS`]; `0` is a legal single immediate check
+/// (mirrors `wait-agent-status`), anything over [`MAX_AGENT_WAIT_MS`]
+/// is rejected. Extracted so a table test can pin it.
+fn validate_wait_ready_timeout(timeout_ms: Option<u64>) -> anyhow::Result<u64> {
+    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_WAIT_READY_MS);
+    if timeout_ms > MAX_AGENT_WAIT_MS {
+        anyhow::bail!("timeout {timeout_ms}ms exceeds the {MAX_AGENT_WAIT_MS}ms cap");
+    }
+    Ok(timeout_ms)
+}
+
+/// Issue #85 response payload, sent both when ready and on timeout
+/// (`ready` distinguishes them). `child` is `null` until a process-tree
+/// child is observed; `prompt_seen` reports the screen half on its own
+/// so a caller can tell "shell up, command not yet" from "nothing yet".
+fn wait_ready_json(
+    surface: SurfaceId,
+    readiness: &crate::mux::SurfaceReadiness,
+    elapsed_ms: u64,
+) -> Value {
+    json!({
+        "ready": readiness.is_ready(),
+        "surface": surface,
+        "prompt_seen": readiness.prompt_seen,
+        "child": readiness.child.as_ref().map(|child| json!({
+            "pid": child.pid,
+            "comm": child.comm,
+        })),
+        "elapsed_ms": elapsed_ms,
+    })
+}
 
 /// Shared validation for `wait-agent-status` (issue #75): the state
 /// string and the timeout cap. Extracted from the handler so the table
@@ -2095,6 +2152,53 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
                 }
             }
         }
+        Command::WaitReady { surface, timeout_ms } => {
+            // Issue #85: read-only readiness poll. Everything here only
+            // observes (terminal lock + /proc); no writes, no state
+            // mutation, so it is safe alongside a live orchestrator.
+            let timeout_ms = validate_wait_ready_timeout(timeout_ms)?;
+            // A vanished surface (child exited and the pane was reaped) is
+            // reported as `ready:false`, not an error: a health verb must
+            // give an orchestrator a uniform "not ready" answer rather
+            // than forcing it to distinguish an exit from a timeout. An
+            // id that never existed reads the same way — acceptable for a
+            // probe, and the caller owns the id it just spawned.
+            let started = std::time::Instant::now();
+            let mut last = crate::mux::SurfaceReadiness::default();
+            loop {
+                if let Some(surface_arc) = mux.surface(surface) {
+                    require_pty(&surface_arc)?;
+                    last = mux.surface_readiness(&surface_arc);
+                    if last.is_ready() {
+                        return Ok(wait_ready_json(
+                            surface,
+                            &last,
+                            started.elapsed().as_millis() as u64,
+                        ));
+                    }
+                } else {
+                    // Surface removed: no prompt, no child.
+                    last = crate::mux::SurfaceReadiness::default();
+                }
+                if std::time::Instant::now()
+                    >= started + std::time::Duration::from_millis(timeout_ms)
+                {
+                    // Timeout is a successful RPC with `ready:false` (see
+                    // the Command doc); the CLI turns that into exit 1.
+                    return Ok(wait_ready_json(
+                        surface,
+                        &last,
+                        started.elapsed().as_millis() as u64,
+                    ));
+                }
+                // Poll cadence: fine-grained enough that a prompt landing
+                // just after a check is seen promptly, coarse enough not
+                // to spin a core re-reading /proc + the terminal.
+                let remaining = (started + std::time::Duration::from_millis(timeout_ms))
+                    .saturating_duration_since(std::time::Instant::now());
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(25)));
+            }
+        }
         Command::RenameSession { new_name } => {
             // Issue #63. Scout-plan Q4 ordering: the socket rename is the
             // commit point (only it changes reachability), so the pid moves
@@ -2416,6 +2520,20 @@ mod tests {
         assert!(validate_wait_request("idle", MAX_AGENT_WAIT_MS + 1).is_err());
         assert!(validate_wait_request("idle", MAX_AGENT_WAIT_MS).is_ok());
         assert!(validate_wait_request("idle", 0).is_ok());
+    }
+
+    #[test]
+    fn wait_ready_validates_timeout_table() {
+        // Issue #85: absent defaults, 0 and the cap are legal, over-cap
+        // is rejected. Extracted so this is pinned without a live PTY.
+        assert_eq!(validate_wait_ready_timeout(None).unwrap(), DEFAULT_WAIT_READY_MS);
+        assert_eq!(validate_wait_ready_timeout(Some(0)).unwrap(), 0);
+        assert_eq!(validate_wait_ready_timeout(Some(5000)).unwrap(), 5000);
+        assert!(validate_wait_ready_timeout(Some(MAX_AGENT_WAIT_MS + 1)).is_err());
+        assert_eq!(
+            validate_wait_ready_timeout(Some(MAX_AGENT_WAIT_MS)).unwrap(),
+            MAX_AGENT_WAIT_MS
+        );
     }
 
     #[test]

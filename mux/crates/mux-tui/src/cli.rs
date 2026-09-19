@@ -438,6 +438,17 @@ const VERBS: &[VerbSpec] = &[
         stream: false,
     },
     VerbSpec {
+        // Issue #85: block until the surface is ready (prompt up + a
+        // running process-tree child) or --timeout ms elapses. The
+        // response is structured JSON; `ready:false` exits nonzero, so
+        // this is the headless-orchestrator post-spawn gate.
+        name: "wait-ready",
+        allowed: &["surface", "timeout"],
+        build: build_wait_ready,
+        print: print_wait_ready,
+        stream: false,
+    },
+    VerbSpec {
         name: "browser-reload",
         allowed: &["surface"],
         build: build_surface,
@@ -842,6 +853,17 @@ fn run_command(args: CliArgs) -> i32 {
         let wait_ms =
             args.flags.optional("timeout").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
         let _ = stream.set_read_timeout(Some(Duration::from_millis(wait_ms.saturating_add(5_000))));
+    } else if args.verb.name == "wait-ready" {
+        // Issue #85: like wait-agent-status, the reply legitimately
+        // arrives after up to `--timeout` ms (the server's default when
+        // absent is 5 s), so budget the read rather than the 10 s
+        // default.
+        let wait_ms = args
+            .flags
+            .optional("timeout")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(mux_core::server::DEFAULT_WAIT_READY_MS);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(wait_ms.saturating_add(5_000))));
     } else if args.verb.name == "send"
         && request.get("confirm").and_then(Value::as_bool) == Some(true)
     {
@@ -880,7 +902,16 @@ fn run_command(args: CliArgs) -> i32 {
     if args.verb.stream {
         run_stream(reader, args.global.json)
     } else {
-        run_one_response(&mut reader, args.global.json, args.verb.print)
+        // Issue #85: `wait-ready` reports a timeout as `ok:true` +
+        // `ready:false`; map that to a nonzero exit while still printing
+        // the JSON payload, so a headless caller can both read the
+        // structured result and gate on the exit code (AC2).
+        run_one_response(
+            &mut reader,
+            args.global.json,
+            args.verb.print,
+            args.verb.name == "wait-ready",
+        )
     }
 }
 
@@ -903,6 +934,7 @@ fn run_one_response(
     reader: &mut BufReader<Box<dyn transport::Stream>>,
     json_output: bool,
     print_human: PrintFn,
+    fail_unless_ready: bool,
 ) -> i32 {
     loop {
         let mut line = String::new();
@@ -918,7 +950,7 @@ fn run_one_response(
         if value.get("event").is_some() {
             continue;
         }
-        return print_response(&value, json_output, print_human);
+        return print_response(&value, json_output, print_human, fail_unless_ready);
     }
 }
 
@@ -978,7 +1010,12 @@ fn run_stream(mut reader: BufReader<Box<dyn transport::Stream>>, json_output: bo
     }
 }
 
-fn print_response(value: &Value, json_output: bool, print_human: PrintFn) -> i32 {
+fn print_response(
+    value: &Value,
+    json_output: bool,
+    print_human: PrintFn,
+    fail_unless_ready: bool,
+) -> i32 {
     if value.get("ok").and_then(Value::as_bool) != Some(true) {
         let error = value.get("error").and_then(Value::as_str).unwrap_or("unknown error");
         // Issue #98: a server-reported error under `--json` is the
@@ -986,6 +1023,10 @@ fn print_response(value: &Value, json_output: bool, print_human: PrintFn) -> i32
         return cli_error(json_output, 1, error);
     }
     let data = value.get("data").unwrap_or(&Value::Null);
+    // Issue #85: `wait-ready` exits nonzero when the pane is not ready,
+    // but the payload (including `ready:false`) is still printed first
+    // so a headless caller can read the JSON and the exit code both.
+    let not_ready = fail_unless_ready && data.get("ready").and_then(Value::as_bool) != Some(true);
     let mut stdout = io::stdout();
     let result = if json_output {
         serde_json::to_writer(&mut stdout, data)
@@ -995,6 +1036,7 @@ fn print_response(value: &Value, json_output: bool, print_human: PrintFn) -> i32
         print_human(data, &mut stdout)
     };
     match result.and_then(|_| stdout.flush()) {
+        Ok(()) if not_ready => 1,
         Ok(()) => 0,
         Err(err) => {
             eprintln!("stdout error: {err}");
@@ -1513,6 +1555,17 @@ fn build_agent_send(flags: &FlagMap) -> Result<Value, UsageError> {
             )));
         }
         value["shell"] = json!(shell);
+    }
+    Ok(value)
+}
+
+fn build_wait_ready(flags: &FlagMap) -> Result<Value, UsageError> {
+    // Issue #85: required surface id; `--timeout` is optional (the
+    // server defaults it) and in milliseconds, mirroring
+    // `wait-agent-status`'s flag spelling.
+    let mut value = json!({ "surface": flags.required_u64("surface")? });
+    if let Some(timeout) = flags.optional("timeout") {
+        value["timeout_ms"] = json!(parse_u64("timeout", &timeout)?);
     }
     Ok(value)
 }
@@ -2635,6 +2688,27 @@ fn print_read_screen(data: &Value, out: &mut dyn Write) -> io::Result<()> {
     write!(out, "{}", data.get("text").and_then(Value::as_str).unwrap_or(""))
 }
 
+/// Issue #85 human output: one line naming readiness, the child (if any)
+/// and how long it took. `--json` bypasses this and prints the payload.
+fn print_wait_ready(data: &Value, out: &mut dyn Write) -> io::Result<()> {
+    let ready = data.get("ready").and_then(Value::as_bool).unwrap_or(false);
+    let surface = data.get("surface").and_then(Value::as_u64).unwrap_or(0);
+    let prompt_seen = data.get("prompt_seen").and_then(Value::as_bool).unwrap_or(false);
+    let elapsed = data.get("elapsed_ms").and_then(Value::as_u64).unwrap_or(0);
+    let child = match data.get("child") {
+        Some(Value::Object(child)) => format!(
+            " pid={} comm={}",
+            child.get("pid").and_then(Value::as_u64).unwrap_or(0),
+            child.get("comm").and_then(Value::as_str).unwrap_or("?")
+        ),
+        _ => String::new(),
+    };
+    writeln!(
+        out,
+        "ready={ready} surface={surface} prompt_seen={prompt_seen}{child} elapsed_ms={elapsed}"
+    )
+}
+
 fn print_vt_state(data: &Value, out: &mut dyn Write) -> io::Result<()> {
     writeln!(
         out,
@@ -3131,5 +3205,44 @@ mod tests {
             envelope["error"]["message"].as_str(),
             Some("unknown flag --file for agent-read")
         );
+    }
+
+    // --- issue #85: wait-ready verb ---
+
+    /// `wait-ready` parses --surface (required) and optional --timeout,
+    /// and the wire request maps them onto surface/timeout_ms.
+    #[test]
+    fn wait_ready_builds_request() {
+        let parsed = parse_ok(&["wait-ready", "--surface", "7"]);
+        assert_eq!(parsed.verb.name, "wait-ready");
+        let built = (parsed.verb.build)(&parsed.flags).unwrap();
+        assert_eq!(built["surface"].as_u64(), Some(7));
+        assert!(built.get("timeout_ms").is_none(), "timeout is optional: {built}");
+
+        let parsed = parse_ok(&["wait-ready", "--surface=9", "--timeout", "2500"]);
+        let built = (parsed.verb.build)(&parsed.flags).unwrap();
+        assert_eq!(built["surface"].as_u64(), Some(9));
+        assert_eq!(built["timeout_ms"].as_u64(), Some(2500));
+    }
+
+    /// AC1/AC2: `wait-ready` maps `ready:false` to exit 1 while STILL
+    /// printing the JSON payload; `ready:true` exits 0. The flag only
+    /// affects `wait-ready`, so a generic ok response is unaffected.
+    #[test]
+    fn wait_ready_exit_code_tracks_ready_field() {
+        let not_ready = json!({
+            "ok": true,
+            "data": {"ready": false, "surface": 3, "prompt_seen": false, "child": null, "elapsed_ms": 501}
+        });
+        assert_eq!(print_response(&not_ready, true, print_wait_ready, true), 1);
+        // The gate is off for every other verb: ok:true is always exit 0.
+        assert_eq!(print_response(&not_ready, true, print_wait_ready, false), 0);
+
+        let ready = json!({
+            "ok": true,
+            "data": {"ready": true, "surface": 3, "prompt_seen": true,
+                     "child": {"pid": 42, "comm": "sleep"}, "elapsed_ms": 12}
+        });
+        assert_eq!(print_response(&ready, true, print_wait_ready, true), 0);
     }
 }
