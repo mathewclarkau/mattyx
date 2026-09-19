@@ -1132,6 +1132,43 @@ pub(crate) fn rewrite_pane_worktree_alias(args: &mut Vec<String>) {
     }
 }
 
+/// Issue #91: tmux-style verb shorthands, rewritten to the canonical
+/// spelling at the verb position (the first token after the global
+/// `--socket`/`--session`/`--json` flags) BEFORE dispatch. Exact
+/// whole-word match only — never a prefix match — so `ls` cannot
+/// shadow `list-sessions`, `new` cannot shadow `new-tab`, and `at`
+/// cannot shadow `attach-surface`. Because the rewrite lands before
+/// `is_cli_invocation`/`cli::run`, every handler downstream of dispatch
+/// sees the long form: the socket request's `cmd` field — what the
+/// server switches on — is byte-identical to the long-form invocation,
+/// so the `--json` contract is unchanged. `at` targets the TUI
+/// `attach` subcommand (not a control-socket verb), so `mtyx at`
+/// dispatches exactly like `mtyx attach`. `send` is not aliased: it is
+/// already the short form, no longer spelling exists.
+const VERB_ALIASES: &[(&str, &str)] = &[
+    ("ls", "list-workspaces"),
+    ("new", "new-workspace"),
+    ("at", "attach"),
+    ("read", "read-screen"),
+    ("shot", "screenshot"),
+];
+
+pub(crate) fn resolve_verb_alias(args: &mut [String]) {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--socket" | "--session" => i += 2,
+            "--json" => i += 1,
+            arg => {
+                if let Some((_, canonical)) = VERB_ALIASES.iter().find(|(a, _)| *a == arg) {
+                    args[i] = (*canonical).to_string();
+                }
+                return;
+            }
+        }
+    }
+}
+
 /// A colour value is required so an omitted flag never silently clears
 /// the workspace colour. `--color` is primary; `--colour` remains an alias.
 fn build_set_workspace_color(flags: &FlagMap) -> Result<Value, UsageError> {
@@ -1217,7 +1254,7 @@ fn build_report_agent(flags: &FlagMap) -> Result<Value, UsageError> {
                 return Err(UsageError(
                     "--surface is required (or run inside a mtyx pane via $MTYX_MUX_SURFACE)"
                         .into(),
-                ))
+                ));
             }
         },
     };
@@ -1652,7 +1689,7 @@ pub(crate) fn one_shot_rpc(socket: &std::path::Path, request: Value) -> OneShotO
             return OneShotOutcome::ConnectErr(format!(
                 "cannot connect to session socket {}: {err}",
                 socket.display()
-            ))
+            ));
         }
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
@@ -2279,7 +2316,10 @@ fn print_close_workspace(data: &Value, out: &mut dyn Write) -> io::Result<()> {
                 out,
                 "worktree child still open: workspace {id} ({name}) in {path} (branch {branch}){agent}"
             )?,
-            None => writeln!(out, "worktree child still open: workspace {id} ({name}) in {path}{agent}")?,
+            None => writeln!(
+                out,
+                "worktree child still open: workspace {id} ({name}) in {path}{agent}"
+            )?,
         }
     }
     let closed = data["closed"].as_array().cloned().unwrap_or_default();
@@ -2708,5 +2748,92 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- issue #91: tmux-style shorthand aliases ---
+
+    /// AC3: an alias must never collide with an existing verb name (a
+    /// colliding alias is dead at best and silently changes an existing
+    /// verb's meaning at worst), and every alias target must be a real
+    /// command — a VerbSpec, or the TUI `attach` subcommand which
+    /// main.rs dispatches before the verb table.
+    #[test]
+    fn verb_aliases_never_collide_with_existing_verbs() {
+        for (alias, canonical) in VERB_ALIASES {
+            assert!(
+                verb_by_name(alias).is_none(),
+                "alias {alias:?} collides with an existing verb name"
+            );
+            assert!(
+                verb_by_name(canonical).is_some() || *canonical == "attach",
+                "alias {alias:?} points at unknown command {canonical:?}"
+            );
+        }
+    }
+
+    /// AC2 + AC1: every alias rewrites to its canonical spelling, and
+    /// for verb targets `parse` then resolves the SAME VerbSpec the
+    /// long form resolves (pointer-identical handler table entry). The
+    /// socket request carries the canonical `cmd`, so `--json` output
+    /// is byte-identical to the long-form invocation.
+    #[test]
+    fn verb_aliases_resolve_to_the_same_verb_spec() {
+        for (alias, canonical) in VERB_ALIASES {
+            // Rewritten at the verb position after global flags.
+            let mut args = vec!["--json".to_string(), alias.to_string()];
+            resolve_verb_alias(&mut args);
+            assert_eq!(args[0], "--json", "global flags must not be touched");
+            assert_eq!(args[1], *canonical, "alias {alias:?} must rewrite to {canonical:?}");
+
+            if *canonical == "attach" {
+                // Not a VerbSpec: `mtyx at` must become exactly the argv
+                // that `mtyx attach` feeds main.rs's TUI subcommand
+                // parse, so both spellings dispatch identically.
+                continue;
+            }
+            let mut long = vec!["--json".to_string(), canonical.to_string()];
+            match (parse(&args), parse(&long)) {
+                (Ok(Parsed::Command(short)), Ok(Parsed::Command(full))) => {
+                    assert!(
+                        std::ptr::eq(short.verb, full.verb),
+                        "{alias:?} and {canonical:?} must resolve to the same VerbSpec"
+                    );
+                    assert_eq!(short.verb.name, *canonical);
+                }
+                _ => panic!("parse failed for alias {alias:?} / {canonical:?}"),
+            }
+        }
+    }
+
+    /// AC3: exact whole-word match only. Prefixed verbs (`list-sessions`
+    /// vs `ls`, `new-tab`/`new-screen` vs `new`, `attach-surface` vs
+    /// `at`, `read-screen` vs `read`, `screenshot` vs `shot`) are never
+    /// rewritten, an alias-spelled flag VALUE (`--session ls`) is not
+    /// the verb position, and a verb-less argv falls through unchanged.
+    #[test]
+    fn verb_aliases_match_exact_words_and_never_prefixes() {
+        for verb in [
+            "list-sessions",
+            "list-workspaces",
+            "new-tab",
+            "new-screen",
+            "new-workspace",
+            "attach-surface",
+            "read-screen",
+            "screenshot",
+        ] {
+            assert!(verb_by_name(verb).is_some(), "test premise: {verb:?} is a verb");
+            let mut args = vec![verb.to_string()];
+            resolve_verb_alias(&mut args);
+            assert_eq!(args[0], verb, "exact verb {verb:?} must not be rewritten");
+        }
+        // A flag value is never the verb position.
+        let mut args = vec!["--session".to_string(), "ls".to_string()];
+        resolve_verb_alias(&mut args);
+        assert_eq!(args[1], "ls", "an alias-spelled --session value must not be rewritten");
+        // No verb at all: unchanged (TUI launch flags pass through).
+        let mut args = vec!["--headless".to_string()];
+        resolve_verb_alias(&mut args);
+        assert_eq!(args, vec!["--headless".to_string()]);
     }
 }

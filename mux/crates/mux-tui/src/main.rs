@@ -216,6 +216,14 @@ CLI VERBS
   pane-worktree-create, pane-worktree-list, pane-worktree-remove
       (also spelled `mtyx pane worktree <create|list|remove>`; issue #77)
 
+SHORTHAND ALIASES (issue #91)
+  ls -> list-workspaces    new -> new-workspace    at -> attach
+  read -> read-screen      shot -> screenshot
+      Rewritten to the canonical spelling before dispatch (exact
+      whole-word match on the verb only, so `list-sessions`, `new-tab`,
+      `attach-surface` etc. are never shadowed). Output — including
+      `--json` — is byte-identical to the long form.
+
 SEND
   mtyx send --surface <id> --text <text> [--shell auto|fish|bash|zsh|sh|nu|raw]
       Writes input to a PTY surface (stdin is used when neither --text nor
@@ -647,6 +655,11 @@ fn main() {
         }
         std::process::exit(cli::run(&args, USAGE));
     }
+    // Issue #91: tmux-style shorthands (`ls`, `new`, `at`, ...) rewrite
+    // to the canonical spelling before dispatch — and before
+    // `is_cli_invocation`, which would not recognise a bare alias as a
+    // verb (nor would `at` reach the `attach` subcommand below).
+    cli::resolve_verb_alias(&mut raw_args);
     // Issue #77: accept the documented three-word form `mtyx pane
     // worktree create ...` by rewriting it to the flat verb before CLI
     // dispatch (must run before `is_cli_invocation`, which would not
