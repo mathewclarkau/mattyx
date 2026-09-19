@@ -99,12 +99,58 @@ fn connect(
 
 fn ensure_remote_binary(host: &str) -> anyhow::Result<PathBuf> {
     let (os, arch) = detect_remote_platform(host)?;
-    let cache_path = cache_dir()?.join(format!("cmuxd-remote-{os}-{arch}"));
-    if !cache_path.exists() {
-        eprintln!("mtyx: building cmuxd-remote for {os}/{arch}...");
-        build_mtyxd_remote(&os, &arch, &cache_path)?;
+    let cache_path = cache_dir()?.join(cache_binary_name(&os, &arch));
+    let version = crate::VERSION;
+    if cache_is_fresh(&cache_path, &stamp_path_for(&cache_path), version) {
+        return Ok(cache_path);
     }
+    // Missing binary, or one built by a different mtyx: (re)build and
+    // stamp it. Issue #90: the daemon is stamped with mtyx's version via
+    // -ldflags (below), so a cache entry from an older/newer mtyx must
+    // not be reused — it would run a daemon whose wire protocol/config
+    // expectations may not match the mtyx talking to it.
+    eprintln!("mtyx: building cmuxd-remote for {os}/{arch} (version {version})...");
+    build_mtyxd_remote(&os, &arch, &cache_path)?;
+    write_stamp(&stamp_path_for(&cache_path), version)?;
     Ok(cache_path)
+}
+
+/// Cache filename for a cross-compiled daemon. Kept as a function so the
+/// naming scheme has a single home (and a unit test).
+fn cache_binary_name(os: &str, arch: &str) -> String {
+    format!("cmuxd-remote-{os}-{arch}")
+}
+
+/// The version stamp sibling of a cached daemon binary, e.g.
+/// `cmuxd-remote-linux-amd64.version`. A sidecar file rather than a
+/// version-suffixed binary name so a stale entry is overwritten in place
+/// instead of accumulating one never-reused binary per mtyx release.
+fn stamp_path_for(binary: &Path) -> PathBuf {
+    let mut name = binary.file_name().unwrap_or_default().to_os_string();
+    name.push(".version");
+    binary.with_file_name(name)
+}
+
+/// A cached daemon is fresh only if the binary exists *and* its sidecar
+/// stamp names the version of the running mtyx. A missing stamp (cache
+/// written by a pre-#90 mtyx) counts as stale, so the first run after an
+/// upgrade rebuilds rather than trusting an unstamped binary.
+fn cache_is_fresh(binary: &Path, stamp: &Path, version: &str) -> bool {
+    if !binary.exists() {
+        return false;
+    }
+    match std::fs::read_to_string(stamp) {
+        Ok(stamped) => stamped.trim() == version,
+        Err(_) => false,
+    }
+}
+
+fn write_stamp(stamp: &Path, version: &str) -> anyhow::Result<()> {
+    if let Some(dir) = stamp.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(stamp, format!("{version}\n"))?;
+    Ok(())
 }
 
 fn detect_remote_platform(host: &str) -> anyhow::Result<(String, String)> {
@@ -224,5 +270,85 @@ fn send_request(socket_path: &Path, cmd: &str, mut params: Value) -> anyhow::Res
     } else {
         let message = response.get("error").and_then(Value::as_str).unwrap_or("unknown error");
         anyhow::bail!("{message}")
+    }
+}
+
+// ---------- tests ----------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal unique scratch dir; no tempfile dependency in this crate.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("mtyx-ssh-bootstrap-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[test]
+    fn cache_binary_name_is_platform_scoped() {
+        assert_eq!(cache_binary_name("linux", "amd64"), "cmuxd-remote-linux-amd64");
+        assert_eq!(cache_binary_name("darwin", "arm64"), "cmuxd-remote-darwin-arm64");
+    }
+
+    #[test]
+    fn stamp_path_is_a_sibling_of_the_binary() {
+        let binary = Path::new("/tmp/cache/cmuxd-remote-linux-amd64");
+        assert_eq!(
+            stamp_path_for(binary),
+            PathBuf::from("/tmp/cache/cmuxd-remote-linux-amd64.version")
+        );
+    }
+
+    #[test]
+    fn missing_binary_is_stale() {
+        let dir = scratch("missing-binary");
+        let binary = dir.join(cache_binary_name("linux", "amd64"));
+        // Stamp alone must not be enough: the binary is what gets executed.
+        write_stamp(&stamp_path_for(&binary), "0.17.2").unwrap();
+        assert!(!cache_is_fresh(&binary, &stamp_path_for(&binary), "0.17.2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unstamped_binary_is_stale() {
+        // Pre-#90 caches shipped a binary with no sidecar; they must be
+        // rebuilt, not trusted.
+        let dir = scratch("unstamped");
+        let binary = dir.join(cache_binary_name("darwin", "arm64"));
+        std::fs::write(&binary, b"\x7fELF-fake").unwrap();
+        assert!(!cache_is_fresh(&binary, &stamp_path_for(&binary), "0.17.2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_version_cache_is_not_fresh_and_rebuild_refreshes_it() {
+        let dir = scratch("stale-version");
+        let binary = dir.join(cache_binary_name("linux", "amd64"));
+        let stamp = stamp_path_for(&binary);
+        std::fs::write(&binary, b"\x7fELF-fake").unwrap();
+        write_stamp(&stamp, "0.17.1").unwrap();
+
+        // Different mtyx built the cached daemon: stale, so
+        // ensure_remote_binary takes the rebuild path and re-stamps.
+        assert!(!cache_is_fresh(&binary, &stamp, "0.17.2"));
+        write_stamp(&stamp, "0.17.2").unwrap();
+        assert!(cache_is_fresh(&binary, &stamp, "0.17.2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stamp_tolerates_trailing_whitespace() {
+        let dir = scratch("whitespace");
+        let binary = dir.join(cache_binary_name("linux", "arm64"));
+        let stamp = stamp_path_for(&binary);
+        std::fs::write(&binary, b"\x7fELF-fake").unwrap();
+        // A stamp written with a blank line / CRLF still matches.
+        write_stamp(&stamp, "0.17.2\r").unwrap();
+        assert!(cache_is_fresh(&binary, &stamp, "0.17.2"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
