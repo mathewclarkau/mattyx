@@ -966,6 +966,26 @@ pub fn serve(mux: Arc<Mux>, path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     std::fs::write(&pid_p, format!("{}\n", std::process::id()))?;
     platform::restrict_file(&pid_p)?;
 
+    // Issue #89 shutdown-join audit: the accept thread and each per-conn
+    // `mux-conn` thread are DETACHED, and this is deliberate rather than
+    // an oversight. A clean join is not feasible without a redesign:
+    //
+    // - The listener is moved into the accept thread, so nothing outside
+    //   it can unblock a blocking `accept()`; a shutdown flag alone does
+    //   not wake the thread. Closing it needs either a self-connect to
+    //   release the syscall or a switch to non-blocking accept with a
+    //   poll timeout — a real behavioural change to connection latency.
+    // - Per-conn threads live only for one connection and are never
+    //   registered anywhere, so there is no handle list to join. Adding
+    //   one means a shared registry + a join at shutdown, and a long-lived
+    //   connection (a streaming `mux watch`) would block that join
+    //   indefinitely unless each conn also grew a cancellation path.
+    // - The process is already torn down by `Mux::shutdown`/process exit;
+    //   the OS reclaims the threads. Detaching keeps `serve()` returning
+    //   promptly, which the daemon start path depends on.
+    //
+    // Recording the audit outcome here so the next reader does not
+    // "fix" it into a shutdown hang. See PORT-PLAN #89.
     std::thread::Builder::new().name("mux-server".into()).spawn(move || loop {
         let Ok(stream) = listener.accept() else { continue };
         let mux = mux.clone();

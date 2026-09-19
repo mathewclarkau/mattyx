@@ -324,6 +324,16 @@ impl Deref for Surface {
 pub struct PtySurface {
     pub(crate) meta: SurfaceMeta,
     term: Mutex<Terminal>,
+    /// Issue #89: serialises everything that touches the PTY byte
+    /// stream — input writes (`writer`) and window resizes (`master`).
+    /// On ConPTY a resize applied concurrently with an input write can
+    /// tear the control stream, so both paths take this lock first.
+    ///
+    /// Lock order is always `io_lock` → (`term` / `writer` / `master`).
+    /// Never acquire it while already holding one of those. The reader
+    /// thread takes `term` without it and only reaches `write_bytes`
+    /// after releasing `term`, so there is no cycle.
+    io_lock: Mutex<()>,
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send>>,
@@ -581,6 +591,7 @@ impl Surface {
         let surface = Arc::new(Surface::Pty(PtySurface {
             meta: SurfaceMeta { id, name: Mutex::new(None), detected_agent: Mutex::new(None) },
             term: Mutex::new(term),
+            io_lock: Mutex::new(()),
             writer: Mutex::new(writer),
             master: Mutex::new(pty.master),
             killer: Mutex::new(killer),
@@ -719,6 +730,9 @@ impl Surface {
                 "browser surface does not accept PTY bytes",
             ));
         };
+        // Issue #89: take the shared stream lock so an input write can
+        // never interleave with a resize of the same PTY.
+        let _stream = pty.io_lock.lock().unwrap();
         let mut writer = pty.writer.lock().unwrap();
         writer.write_all(bytes)?;
         writer.flush()
@@ -793,6 +807,9 @@ impl Surface {
         let result = (|| {
             let baseline = pty.output_epoch.load(Ordering::Acquire);
             {
+                // Issue #89: same shared stream lock as `write_bytes` /
+                // `resize`, held only for the write, not the receipt wait.
+                let _stream = pty.io_lock.lock().unwrap();
                 let mut writer = pty.writer.lock().unwrap();
                 writer.write_all(bytes)?;
                 writer.flush()?;
@@ -1196,6 +1213,11 @@ impl PtySurface {
             }
             *size = (cols, rows);
         }
+        // Issue #89: serialise the resize against input writes. Held
+        // across the term lock + attach marker below so a racing
+        // `write_bytes` cannot slip between the PTY resize and the VT
+        // resize (which would tear the ConPTY control stream).
+        let _stream = self.io_lock.lock().unwrap();
         // Hold the terminal lock while resizing and while sending the
         // attach marker, so attach mirrors observe bytes and resizes in
         // the exact order the server terminal applied them.

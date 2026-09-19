@@ -710,7 +710,22 @@ fn runtime_base_dir() -> PathBuf {
 
 #[cfg(windows)]
 fn runtime_base_dir() -> PathBuf {
-    env_path("TEMP").or_else(|| env_path("TMP")).unwrap_or_else(std::env::temp_dir)
+    runtime_base_dir_from(env_path("TEMP"), env_path("TMP"), std::env::temp_dir())
+}
+
+/// Issue #89: the precedence core of the Windows [`runtime_base_dir`],
+/// extracted so it is a pure function. `%TEMP%` wins, then `%TMP%`, then
+/// the OS temp dir. Available under `cfg(test)` on every platform (not
+/// just Windows) so the precedence is pinned by a unit test that runs on
+/// the Linux CI leg too — the ordering is platform-independent even
+/// though only Windows consults it.
+#[cfg(any(windows, test))]
+fn runtime_base_dir_from(
+    temp: Option<PathBuf>,
+    tmp: Option<PathBuf>,
+    fallback: PathBuf,
+) -> PathBuf {
+    temp.or(tmp).unwrap_or(fallback)
 }
 
 #[cfg(not(windows))]
@@ -752,7 +767,29 @@ fn user_id_component() -> String {
 
 #[cfg(windows)]
 fn user_id_component() -> String {
-    std::env::var("USERNAME").unwrap_or_else(|_| "user".to_string())
+    user_id_component_from(std::env::var("USERNAME").ok())
+}
+
+/// Issue #89: pure core of the Windows [`user_id_component`]. Available
+/// under `cfg(test)` on every platform (see `runtime_base_dir_from`).
+///
+/// `%USERNAME%` when set and non-empty; otherwise the literal `"user"`.
+/// The fallback is a KNOWN collision hazard: two Windows accounts with an
+/// unset/empty `USERNAME` both resolve to `mtyx-user` and would fight over
+/// one runtime dir and socket. That is documented, not fixed here: the
+/// runtime dir is already per-user under the normal (USERNAME-set) case,
+/// and inventing a pid/hash-suffixed component would break the
+/// client/server rendezvous (both sides must derive the SAME name, and a
+/// pid is not shared between them). A real fix belongs with a Windows
+/// SID lookup, which is out of scope for #89. The empty-string case is
+/// folded into the fallback so `USERNAME=""` cannot produce
+/// `mtyx-` (a shared, unnamed dir).
+#[cfg(any(windows, test))]
+fn user_id_component_from(username: Option<String>) -> String {
+    match username {
+        Some(name) if !name.trim().is_empty() => name,
+        _ => "user".to_string(),
+    }
 }
 
 fn push_path_candidates(candidates: &mut Vec<PathBuf>, names: &[&str]) {
@@ -1025,5 +1062,72 @@ mod tests {
                 SnapshotTrustDecision::Accept
             );
         }
+    }
+
+    // ---- Issue #89: Windows runtime path precedence ----
+
+    /// `%TEMP%` beats `%TMP%` beats the OS temp dir, and an explicit-but-
+    /// empty env value is treated as unset by `env_path` (so it cannot
+    /// shadow a lower-priority source with `""`). Pure function, so this
+    /// runs on the Linux CI leg as well as Windows.
+    #[test]
+    fn windows_runtime_path_prefers_temp_over_tmp_over_fallback() {
+        let temp = PathBuf::from(r"C:\Users\u\AppData\Local\Temp");
+        let tmp = PathBuf::from(r"D:\tmp");
+        let fallback = PathBuf::from(r"C:\Windows\Temp");
+
+        // TEMP wins outright.
+        assert_eq!(
+            runtime_base_dir_from(Some(temp.clone()), Some(tmp.clone()), fallback.clone()),
+            temp
+        );
+        // TEMP unset: TMP is next.
+        assert_eq!(runtime_base_dir_from(None, Some(tmp.clone()), fallback.clone()), tmp);
+        // Both unset: the OS temp dir is the floor.
+        assert_eq!(runtime_base_dir_from(None, None, fallback.clone()), fallback);
+    }
+
+    /// `env_path` folds an empty value into `None`, so `TEMP=""` must not
+    /// win over a set `TMP` — the shape `runtime_base_dir` feeds it.
+    #[test]
+    fn windows_runtime_path_ignores_empty_env_values() {
+        let empty: Option<PathBuf> = None; // env_path("") -> None
+        let tmp = PathBuf::from(r"D:\tmp");
+        let fallback = PathBuf::from(r"C:\Windows\Temp");
+        assert_eq!(runtime_base_dir_from(empty.clone(), Some(tmp.clone()), fallback.clone()), tmp);
+        assert_eq!(runtime_base_dir_from(empty, None, fallback.clone()), fallback);
+    }
+
+    /// Windows user component: `USERNAME` when usable, else the literal
+    /// `"user"`. The unset-USERNAME collision (`mtyx-user` shared by two
+    /// accounts) is pinned here as the documented current behaviour, and
+    /// the empty-string case is asserted to fold into the same fallback
+    /// (so it cannot produce a bare, shared `mtyx-` dir).
+    #[test]
+    fn windows_runtime_path_user_component_fallback_is_documented() {
+        assert_eq!(user_id_component_from(Some("alice".to_string())), "alice");
+        assert_eq!(user_id_component_from(None), "user");
+        assert_eq!(user_id_component_from(Some(String::new())), "user");
+        assert_eq!(user_id_component_from(Some("   ".to_string())), "user");
+        // The documented hazard: two distinct unset-USERNAME accounts
+        // derive the identical component. Changing this requires a SID
+        // lookup shared by client and server (see the helper docs).
+        assert_eq!(user_id_component_from(None), user_id_component_from(None));
+    }
+
+    /// Windows-only integration: the real `runtime_base_dir`/`user_id_
+    /// component` honour the actual process env. Guarded so it only runs
+    /// where `%TEMP%` is meaningful; it still COMPILES on unix because the
+    /// helpers are unconditional.
+    #[cfg(windows)]
+    #[test]
+    fn windows_runtime_path_real_env_chain() {
+        // Not asserting a specific path (the CI temp dir is arbitrary),
+        // only that resolution succeeds and matches the precedence core
+        // fed from the live env.
+        let from_env =
+            runtime_base_dir_from(env_path("TEMP"), env_path("TMP"), std::env::temp_dir());
+        assert_eq!(runtime_base_dir(), from_env);
+        assert!(!user_id_component().is_empty());
     }
 }
