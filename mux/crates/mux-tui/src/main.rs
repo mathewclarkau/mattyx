@@ -200,8 +200,8 @@ MOUSE
   screen entries to switch screens (+ for a new screen).
 
 CLI VERBS
-  identify, list-workspaces, send, read-screen, vt-state, new-tab,
-  new-browser-tab, new-workspace, new-screen, split, set-ratio,
+  identify, list-workspaces, send, read-screen, screenshot, vt-state,
+  new-tab, new-browser-tab, new-workspace, new-screen, split, set-ratio,
   set-default-colors, close-surface, close-pane, close-screen,
   close-workspace, rename-pane, rename-surface, rename-screen,
   rename-workspace, set-workspace-color, set-status, workspace-color,
@@ -247,6 +247,16 @@ LAYOUT EXPORT/APPLY (issue #76)
       Layout-export records these argv/env pairs; for remote sessions
       compose `layout-apply` against the remote socket with a follow-up
       `mtyx attach --apply-local-config`.
+
+SCREENSHOT (issue #84)
+  mtyx screenshot --surface <id> <file>
+  mtyx screenshot --surface <id> --output <file>
+      Write a surface's visible text to <file> — the exact bytes
+      `mtyx read-screen --surface <id>` prints to stdout (the same
+      read-screen request; there is no separate server command).
+      Client-side atomic write (tmp + rename); symlinked outputs are
+      refused. Exit codes: 0 ok · 1 server/file error · 2 bad flags ·
+      3 connect failure.
 
 AGENT DETECTION
   mtyx detect-agent --surface <id>

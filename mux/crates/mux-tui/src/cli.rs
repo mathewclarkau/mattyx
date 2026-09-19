@@ -33,6 +33,12 @@ pub(crate) struct GlobalArgs {
 /// forms (`--group 1`, `--group 0`) still work.
 const BARE_BOOL_FLAGS: &[&str] = &["group"];
 
+/// Verbs that accept one bare positional argument alongside their flags
+/// (issue #84: `mtyx screenshot --surface <id> <file>`), mapped onto the
+/// named flag of the same meaning (`<file>` == `--output <file>`). Passing
+/// both forms is a usage error.
+const POSITIONAL_FLAG_VERBS: &[(&str, &str)] = &[("screenshot", "output")];
+
 #[derive(Default)]
 struct FlagMap {
     values: BTreeMap<String, String>,
@@ -483,6 +489,18 @@ const VERBS: &[VerbSpec] = &[
         print: print_empty,
         stream: false,
     },
+    VerbSpec {
+        // Issue #84: capture a surface's visible text to a file with the
+        // exact bytes `read-screen` prints to stdout. Like the layout
+        // verbs it is special-cased in `run_command` (client-side file
+        // I/O around the socket round-trip); it rides the plain
+        // `read-screen` request — no new server command.
+        name: "screenshot",
+        allowed: &["surface", "output"],
+        build: build_screenshot,
+        print: print_empty,
+        stream: false,
+    },
 ];
 
 pub fn is_cli_invocation(args: &[String]) -> bool {
@@ -600,7 +618,22 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 i += if bare_bool { 1 } else { 2 };
             }
             _ if verb.is_some() => {
-                return Err(UsageError(format!("unexpected argument {arg:?}")));
+                let spec = verb.unwrap();
+                // Issue #84: verbs listed in POSITIONAL_FLAG_VERBS take
+                // one bare argument, stored as its mapped flag (so
+                // `screenshot --surface 1 /tmp/x` == `--output /tmp/x`).
+                match POSITIONAL_FLAG_VERBS.iter().find(|(name, _)| *name == spec.name) {
+                    Some((_, flag)) if !flags.values.contains_key(*flag) => {
+                        flags.values.insert(flag.to_string(), arg.to_string());
+                        i += 1;
+                    }
+                    Some((_, flag)) => {
+                        return Err(UsageError(format!(
+                            "pass --{flag} once: positional and --{flag} given twice"
+                        )));
+                    }
+                    None => return Err(UsageError(format!("unexpected argument {arg:?}"))),
+                }
             }
             _ => return Err(UsageError(format!("unknown argument {arg:?}"))),
         }
@@ -627,6 +660,7 @@ fn run_command(args: CliArgs) -> i32 {
         "layout-export" => return run_layout_export(&args.global, &args.flags),
         "layout-apply" => return run_layout_apply(&args.global, &args.flags),
         "layout-export-all" => return run_layout_export_all(&args.global, &args.flags),
+        "screenshot" => return run_screenshot(&args.global, &args.flags),
         _ => {}
     }
     let request = match (args.verb.build)(&args.flags) {
@@ -1306,6 +1340,17 @@ fn build_layout_apply(flags: &FlagMap) -> Result<Value, UsageError> {
 fn build_layout_export_all(flags: &FlagMap) -> Result<Value, UsageError> {
     let mut value = json!({});
     flags.insert_optional_string(&mut value, "output-dir");
+    Ok(value)
+}
+
+/// Issue #84 screenshot parser: carries the flags (the positional <file>
+/// already landed in `output` during parse); the runner does the
+/// required checks, the file I/O, and the exit-code map — special-cased
+/// in `run_command` like the layout verbs.
+fn build_screenshot(flags: &FlagMap) -> Result<Value, UsageError> {
+    let mut value = json!({});
+    flags.insert_optional_string(&mut value, "surface");
+    flags.insert_optional_string(&mut value, "output");
     Ok(value)
 }
 
@@ -2011,14 +2056,80 @@ fn run_layout_export_all(global: &GlobalArgs, flags: &FlagMap) -> i32 {
     }
 }
 
+/// `mtyx screenshot --surface <id> [--output] <file>` (issue #84):
+/// capture a surface's visible text to a file. The request is the plain
+/// `read-screen` command — the file's bytes are exactly what `mtyx
+/// read-screen --surface <id>` prints to stdout — and the CLIENT writes
+/// the file (tmp + rename, refusing symlinked targets) like
+/// layout-export, so no daemon ever touches the invoker's filesystem.
+/// Exit codes: 0 ok · 1 server/file error · 2 bad flags · 3 transport.
+fn run_screenshot(global: &GlobalArgs, flags: &FlagMap) -> i32 {
+    let surface = match flags.required_u64("surface") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("mtyx: {}", e.0);
+            return 2;
+        }
+    };
+    let output = match flags.required("output") {
+        Ok(o) => PathBuf::from(o),
+        Err(e) => {
+            eprintln!("mtyx: {}", e.0);
+            return 2;
+        }
+    };
+    if let Err(e) = refuse_symlink(&output) {
+        eprintln!("mtyx: {e}");
+        return 1;
+    }
+    let request = json!({ "cmd": "read-screen", "surface": surface, "id": REQUEST_ID });
+    match one_shot_rpc(&resolve_socket(global), request) {
+        OneShotOutcome::Ok(value) => {
+            // print_read_screen writes data["text"] verbatim; the file
+            // must hold those same bytes — no trailing newline added.
+            let text =
+                value.get("data").and_then(|d| d.get("text")).and_then(Value::as_str).unwrap_or("");
+            if let Err(e) = write_text_atomic(&output, text) {
+                eprintln!("mtyx: writing {}: {e}", output.display());
+                return 1;
+            }
+            if global.json {
+                println!("{}", json!({ "output": output.display().to_string() }));
+            } else {
+                println!("{}", output.display());
+            }
+            0
+        }
+        OneShotOutcome::ServerErr(e) => {
+            eprintln!("mtyx: {e}");
+            1
+        }
+        OneShotOutcome::ConnectErr(e) => {
+            eprintln!("{e}");
+            3
+        }
+    }
+}
+
 /// Atomic pretty-JSON write (write-to-temp then rename — the
 /// `persist::SessionSnapshot::save` pattern) so a crash or a concurrent
 /// reader never observes a truncated file.
 fn write_json_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    write_atomic(path, "json.tmp", contents)
+}
+
+/// Issue #84: screenshot's plain-text write, same tmp+rename discipline.
+fn write_text_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    write_atomic(path, "txt.tmp", contents)
+}
+
+/// Shared core of the atomic file writers: stage the contents in a
+/// sibling tmp file, then rename into place.
+fn write_atomic(path: &std::path::Path, tmp_ext: &str, contents: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(tmp_ext);
     // A leftover tmp from a crashed run could itself be a symlink; the
     // rename must never write through one.
     let _ = std::fs::remove_file(&tmp);

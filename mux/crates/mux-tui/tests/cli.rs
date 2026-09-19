@@ -4401,6 +4401,170 @@ fn layout_export_refuses_symlinked_output() {
     assert_eq!(fs::read_to_string(&target).unwrap(), "", "the symlink target must be untouched");
 }
 
+// -- issue #84: screenshot -------------------------------------------------
+
+/// AC1: `screenshot --surface <id> <file>` exits 0, prints the written
+/// path, and the file's bytes are exactly `read-screen --surface <id>`
+/// stdout (the request is the same read-screen round-trip). The
+/// `--output <file>` flag form writes the identical bytes.
+#[test]
+fn screenshot_writes_read_screen_bytes_to_file() {
+    let server = HeadlessServer::start("screenshot");
+    let ws = cli(&server, &["new-workspace", "--name", "shot"]);
+    assert_success(&ws);
+    let surface: u64 = String::from_utf8(ws.stdout).unwrap().trim().parse().unwrap();
+
+    // Distinctive bytes on the pane so the capture is not incidental.
+    let marker = format!("SHOTMARK_{}", std::process::id());
+    let send = cli(
+        &server,
+        &["send", "--surface", &surface.to_string(), "--text", &format!("printf '{marker}\\n'\n")],
+    );
+    assert_success(&send);
+    let screen = wait_for_screen(&server, surface, &marker);
+    assert!(screen.contains(&marker), "screen did not contain marker; got {screen:?}");
+    // Let the shell settle (next prompt) so both captures below see the
+    // same static screen.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let read = cli(&server, &["read-screen", "--surface", &surface.to_string()]);
+    assert_success(&read);
+    assert!(!read.stdout.is_empty(), "read-screen should have captured the pane");
+
+    // Positional form.
+    let out = server.dir.join("shot.txt");
+    let shot =
+        cli(&server, &["screenshot", "--surface", &surface.to_string(), out.to_str().unwrap()]);
+    assert_success(&shot);
+    assert_eq!(
+        String::from_utf8_lossy(&shot.stdout).trim(),
+        out.display().to_string(),
+        "plain mode prints the written path"
+    );
+    assert_eq!(
+        fs::read(&out).unwrap(),
+        read.stdout,
+        "screenshot file must equal read-screen stdout byte for byte"
+    );
+    assert!(
+        !out.with_extension("txt.tmp").exists(),
+        "the staged tmp file must be renamed away, not left behind"
+    );
+
+    // --output flag form writes the identical bytes.
+    let flagged = server.dir.join("shot-flag.txt");
+    let shot2 = cli(
+        &server,
+        &["screenshot", "--surface", &surface.to_string(), "--output", flagged.to_str().unwrap()],
+    );
+    assert_success(&shot2);
+    assert_eq!(fs::read(&flagged).unwrap(), read.stdout, "--output form must write the same bytes");
+}
+
+/// AC2: the write is staged (tmp) then renamed, never written straight
+/// to the target. Pre-creating a DIRECTORY at the predicted tmp path
+/// makes the staging write fail (remove_file cannot clear a directory);
+/// a tmp+rename writer must then fail nonzero and leave the target's
+/// old bytes untouched, while a direct-to-target writer would have
+/// clobbered them.
+#[test]
+fn screenshot_write_is_staged_then_renamed() {
+    let server = HeadlessServer::start("screenshot-atomic");
+    let ws = cli(&server, &["new-workspace", "--name", "shot-atomic"]);
+    assert_success(&ws);
+    let surface: u64 = String::from_utf8(ws.stdout).unwrap().trim().parse().unwrap();
+
+    let out = server.dir.join("shot.txt");
+    fs::write(&out, "previous capture").unwrap();
+    // Block the predicted staging path with a directory.
+    fs::create_dir_all(out.with_extension("txt.tmp")).unwrap();
+
+    let shot =
+        cli(&server, &["screenshot", "--surface", &surface.to_string(), out.to_str().unwrap()]);
+    assert_ne!(
+        shot.status.code(),
+        Some(0),
+        "a blocked staging path must fail the write, got success\nstdout:\n{}",
+        String::from_utf8_lossy(&shot.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&shot.stderr).contains("writing"),
+        "stderr should name the failed write, got: {}",
+        String::from_utf8_lossy(&shot.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&out).unwrap(),
+        "previous capture",
+        "the target must keep its old bytes when the staged write fails"
+    );
+}
+
+/// AC2: a symlinked output path is refused with a nonzero exit and the
+/// symlink's target is untouched (fs::write would clobber through the
+/// link) — same discipline as layout-export.
+#[test]
+fn screenshot_refuses_symlinked_output() {
+    let server = HeadlessServer::start("screenshot-symlink");
+    let ws = cli(&server, &["new-workspace", "--name", "shot-symlink"]);
+    assert_success(&ws);
+    let surface: u64 = String::from_utf8(ws.stdout).unwrap().trim().parse().unwrap();
+
+    let target = server.dir.join("real-target.txt");
+    fs::write(&target, "").unwrap();
+    let link = server.dir.join("link.txt");
+    symlink(&target, &link).unwrap();
+
+    let shot =
+        cli(&server, &["screenshot", "--surface", &surface.to_string(), link.to_str().unwrap()]);
+    assert_eq!(
+        shot.status.code(),
+        Some(1),
+        "symlinked output must be refused (exit 1), got {:?}\nstderr: {}",
+        shot.status.code(),
+        String::from_utf8_lossy(&shot.stderr)
+    );
+    assert!(String::from_utf8_lossy(&shot.stderr).contains("symlink"));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "", "the symlink target must be untouched");
+}
+
+/// Usage errors are exit 2 with a clear message: no output file at all,
+/// or the file given twice (positional AND --output). No server needed —
+/// the flag checks run before any socket I/O.
+#[test]
+fn screenshot_usage_errors_exit_2() {
+    let dir = unique_temp_dir("screenshot-usage");
+    fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("absent.sock");
+
+    let missing = Command::new(bin())
+        .arg("--socket")
+        .arg(&sock)
+        .args(["screenshot", "--surface", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(2), "missing output file is a usage error");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("--output"),
+        "stderr should name --output, got: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+
+    let both = Command::new(bin())
+        .arg("--socket")
+        .arg(&sock)
+        .args(["screenshot", "--surface", "1", "--output", "a.txt", "b.txt"])
+        .output()
+        .unwrap();
+    assert_eq!(both.status.code(), Some(2), "positional + --output is a usage error");
+    assert!(
+        String::from_utf8_lossy(&both.stderr).contains("once"),
+        "stderr should explain the double pass, got: {}",
+        String::from_utf8_lossy(&both.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Fixture for the install-skill symlink-refusal test.
 ///
 /// Owns a temp "project" dir acting as CWD for `mtyx claude install-skill`
