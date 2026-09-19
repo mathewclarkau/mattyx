@@ -1,0 +1,22 @@
+{
+  "//": "Golden fixtures for screen-derived agent-state classification (issue #96).",
+  "//schema": "Each case: file = fixture under this directory; agent = registry name from agent_detect/agents.json, or 'generic'/'unknown' for an unidentified pane; expected = working|blocked|idle|unknown.",
+  "cases": [
+    { "file": "claude__confirm_enter_to_confirm.screen", "agent": "claude", "expected": "blocked" },
+    { "file": "claude__working_spinner_esc_to_interrupt.screen", "agent": "claude", "expected": "working" },
+    { "file": "claude__idle_prompt.screen", "agent": "claude", "expected": "idle" },
+
+    { "file": "pi__idle_prompt_at_rest.screen", "agent": "pi", "expected": "idle" },
+    { "file": "pi__blocked_confirm_dialog.screen", "agent": "pi", "expected": "blocked" },
+    { "file": "pi__working_thinking.screen", "agent": "pi", "expected": "working" },
+
+    { "file": "codex__blocked_allow_command.screen", "agent": "codex", "expected": "blocked" },
+    { "file": "codex__working_thinking.screen", "agent": "codex", "expected": "working" },
+    { "file": "codex__idle_prompt.screen", "agent": "codex", "expected": "idle" },
+
+    { "file": "grok__blocked_allow_command.screen", "agent": "grok", "expected": "blocked" },
+
+    { "file": "generic__idle_shell_prompt.screen", "agent": "generic", "expected": "idle" },
+    { "file": "generic__shell_echoes_confirm_wording.screen", "agent": "generic", "expected": "idle" }
+  ]
+}

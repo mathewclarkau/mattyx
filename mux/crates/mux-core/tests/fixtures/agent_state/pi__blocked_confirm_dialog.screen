@@ -1,0 +1,10 @@
+  pi> run the tests
+
+  ╭─ Confirm ─────────────────────────────────────────────╮
+  │  Allow this command to run?                           │
+  │                                                       │
+  │  ❯ Yes                                                │
+  │    No                                                 │
+  │                                                       │
+  │  Enter to confirm · Esc to cancel                     │
+  ╰───────────────────────────────────────────────────────╯

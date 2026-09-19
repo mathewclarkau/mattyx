@@ -1,0 +1,5 @@
+matc@host:~/project$ ls -la
+total 42
+drwxr-xr-x  1 matc matc 4096 .
+drwxr-xr-x 12 matc matc 4096 ..
+matc@host:~/project$ 

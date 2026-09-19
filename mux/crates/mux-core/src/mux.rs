@@ -1904,6 +1904,24 @@ reattaching to remote session {session_id} on {host} \
         let surface =
             self.surface(surface).ok_or_else(|| anyhow::anyhow!("unknown surface {surface}"))?;
         let detection = self.detect_on_surface(&surface)?;
+        // Issue #96: publish a screen-derived (`Detected`-tier) state only
+        // when the classifier found an unambiguous `blocked`/`working`
+        // marker. The authority rules in `Surface::set_agent_report`
+        // already reject a `Detected` report while a `Socket`/`Hook`
+        // report is current, so this can never override a self-report;
+        // and the `blocked`/`working`-only gate keeps it from
+        // downgrading one to `idle`/`unknown` either.
+        if matches!(detection.screen_state, crate::AgentState::Blocked | crate::AgentState::Working)
+        {
+            self.report_agent(
+                surface.id,
+                detection.screen_state,
+                crate::AgentStateSource::Detected,
+                None,
+                None,
+                None,
+            );
+        }
         surface.set_detected_agent(detection.clone());
         self.emit(MuxEvent::TreeChanged);
         Ok(detection)
@@ -1940,6 +1958,13 @@ reattaching to remote session {session_id} on {host} \
         let screen = surface.try_with_terminal(|t| t.plain_text())??;
         let mut detection =
             crate::agent_detect::detect(&process, &screen, &patterns, settings.min_confidence);
+        // Issue #96: classify the screen text into a lifecycle state,
+        // using the agent detection just resolved (or `"unknown"` /
+        // `"generic"` when nothing matched). `screen_state` is
+        // informational for the caller; `detect_agent` publishes it as a
+        // `Detected`-tier report when it is `blocked`/`working`.
+        detection.screen_state =
+            crate::agent_state_classify::classify_agent_state(&detection.agent, &screen);
         if remote && detection.is_unknown() {
             detection.evidence =
                 "remote surface: process tree not local; no screen marker matched".to_string();
@@ -3060,6 +3085,64 @@ mod tests {
         assert!(mux.list_agents(Some(surface), Some(AgentState::Idle)).len() == 1);
         assert!(mux.list_agents(Some(surface), Some(AgentState::Working)).is_empty());
         assert!(mux.list_agents(Some(surface + 1), None).is_empty());
+    }
+
+    /// Issue #96 AC3: the `Detected` tier stays the lowest authority. A
+    /// screen-derived report is rejected while a `Socket` or `Hook`
+    /// report is current, and a `Detected` report can itself be upgraded
+    /// by either.
+    #[test]
+    fn report_agent_detected_is_lowest_authority_and_never_overrides_reports() {
+        let mux = test_mux();
+        mux.new_workspace(None, None).unwrap();
+        let surface = mux.with_state(|s| {
+            let pane = s.workspaces[0].screens[0].active_pane;
+            s.panes[&pane].tabs[0]
+        });
+
+        // A Detected report applies on a fresh pane…
+        let report = mux
+            .report_agent(
+                surface,
+                AgentState::Blocked,
+                AgentStateSource::Detected,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(report.state, AgentState::Blocked);
+        assert_eq!(report.source, AgentStateSource::Detected);
+
+        // …and a Socket report overrides it.
+        let report = mux
+            .report_agent(surface, AgentState::Working, AgentStateSource::Socket, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Working);
+        assert_eq!(report.source, AgentStateSource::Socket);
+
+        // A later Detected report cannot downgrade the socket report.
+        let report = mux
+            .report_agent(surface, AgentState::Idle, AgentStateSource::Detected, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Working, "detected must not override a socket report");
+        assert_eq!(report.source, AgentStateSource::Socket);
+
+        // Same against a hook report.
+        mux.report_agent(surface, AgentState::Blocked, AgentStateSource::Hook, None, None, None)
+            .unwrap();
+        let report = mux
+            .report_agent(
+                surface,
+                AgentState::Working,
+                AgentStateSource::Detected,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(report.state, AgentState::Blocked);
+        assert_eq!(report.source, AgentStateSource::Hook);
     }
 
     #[test]

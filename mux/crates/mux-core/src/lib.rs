@@ -21,6 +21,7 @@ mod surface;
 pub mod worktree;
 
 pub mod agent_detect;
+pub mod agent_state_classify;
 pub mod layout;
 pub mod platform;
 pub mod server;

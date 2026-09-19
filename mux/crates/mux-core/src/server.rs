@@ -1322,13 +1322,16 @@ fn agent_report_json(surface: SurfaceId, report: &crate::AgentReport) -> Value {
 }
 
 /// Issue #78 AC1 response: agent name + confidence + the evidence line
-/// that triggered the match.
+/// that triggered the match. Issue #96 adds `state`: the screen-derived
+/// lifecycle classification (informational; the `Detected`-tier report
+/// it may publish is what actually changes `agent_status`).
 fn detection_json(surface: SurfaceId, detection: &crate::agent_detect::Detection) -> Value {
     json!({
         "surface": surface,
         "agent": detection.agent,
         "confidence": detection.confidence.map(|c| c.as_str()),
         "evidence": detection.evidence,
+        "state": detection.screen_state.as_str(),
     })
 }
 
