@@ -6,6 +6,8 @@ use std::time::Duration;
 use mux_core::platform::transport;
 use serde_json::{json, Value};
 
+use crate::machine;
+
 const REQUEST_ID: u64 = 1;
 
 type BuildFn = fn(&FlagMap) -> Result<Value, UsageError>;
@@ -25,6 +27,11 @@ pub(crate) struct GlobalArgs {
     pub(crate) session: Option<String>,
     pub(crate) socket: Option<PathBuf>,
     pub(crate) json: bool,
+    /// Issue #94: route the verb to a saved SSH machine's mux server
+    /// (`mtyx machine add <label> <user@host>`) instead of the local
+    /// socket. Resolution to an SSH target happens before any socket
+    /// work, so an unknown label can never fall back to a local call.
+    pub(crate) machine: Option<String>,
 }
 
 /// Verb flags that are boolean and accept the bare form (`--group`) —
@@ -579,9 +586,14 @@ fn first_command_arg(args: &[String]) -> FirstCommand {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--socket" | "--session" => i += 2,
+            "--socket" | "--session" | "--machine" => i += 2,
             // Issue #98: `--flag=value` spellings of the global flags.
-            arg if arg.starts_with("--socket=") || arg.starts_with("--session=") => i += 1,
+            arg if arg.starts_with("--socket=")
+                || arg.starts_with("--session=")
+                || arg.starts_with("--machine=") =>
+            {
+                i += 1
+            }
             "--json" => i += 1,
             "-h" | "--help" => return FirstCommand::Help,
             arg if arg.starts_with("--") => return FirstCommand::None,
@@ -635,6 +647,17 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             }
             _ if arg.starts_with("--session=") => {
                 global.session = Some(arg["--session=".len()..].to_string());
+                i += 1;
+            }
+            // Issue #94: `--machine <label>` routes the verb to a saved
+            // SSH machine (see machine.rs) with no TUI, in place of the
+            // local socket. Global in the same sense as --session/--json.
+            "--machine" => {
+                global.machine = Some(value_after(args, i, "--machine")?);
+                i += 2;
+            }
+            _ if arg.starts_with("--machine=") => {
+                global.machine = Some(arg["--machine=".len()..].to_string());
                 i += 1;
             }
             _ if verb.is_none() && verb_by_name(arg).is_some() => {
@@ -822,6 +845,21 @@ fn input_ack_capability_gate(stream: &mut Box<dyn transport::Stream>) -> Result<
 }
 
 fn run_command(args: CliArgs) -> i32 {
+    // Issue #94: `--machine <label>` routes the verb to a saved SSH
+    // machine's mux server instead of the local socket, with no TUI.
+    // This is checked BEFORE the special-cased verbs below (list-sessions,
+    // screenshot, …) so a machine-scoped invocation can never fall through
+    // to a local-only code path. Unknown labels error out here, before any
+    // socket work (see machine::route_verb), which is the AC2 contract: a
+    // typo'd label never contacts a local socket.
+    if let Some(label) = args.global.machine.clone() {
+        let registry = match machine::load() {
+            Ok(r) => r,
+            Err(e) => return cli_error(args.global.json, 1, &format!("mtyx: {e}")),
+        };
+        let argv = remote_verb_argv(&args);
+        return machine::route_verb(&registry, &label, &argv);
+    }
     match args.verb.name {
         "list-sessions" => return run_list_sessions(&args.global, &args.flags),
         "kill-session" => return run_kill_session(&args.global, &args.flags),
@@ -926,6 +964,35 @@ fn run_command(args: CliArgs) -> i32 {
             args.verb.name == "wait-ready",
         )
     }
+}
+
+/// Issue #94: rebuild the verb's argv for remote execution as
+/// `mtyx <verb> [--flag value | --flag=value] [--json]`. The original
+/// argv is not kept around by `parse`, so the FlagMap (plus the verb
+/// name and the `--exec` argv) is the source of truth. `--machine`
+/// itself is dropped: the remote host resolves its own session, not the
+/// local label registry. Iteration order is deterministic (BTreeMap),
+/// and expandable flags (`--exec`) are re-emitted as their `--exec --
+/// <argv…>` form that the receiving side re-parses identically.
+fn remote_verb_argv(args: &CliArgs) -> Vec<String> {
+    let mut argv = vec![args.verb.name.to_string()];
+    if args.global.json {
+        argv.push("--json".to_string());
+    }
+    for (name, value) in &args.flags.values {
+        argv.push(format!("--{name}"));
+        // Bare booleans were stored as the literal "true"; re-emit the
+        // bare form so the remote parser's bare-bool convention matches.
+        if !(value == "true" && BARE_BOOL_FLAGS.contains(&name.as_str())) {
+            argv.push(value.clone());
+        }
+    }
+    if let Some(exec) = &args.flags.exec {
+        argv.push("--exec".to_string());
+        argv.push("--".to_string());
+        argv.extend(exec.clone());
+    }
+    argv
 }
 
 fn resolve_socket(global: &GlobalArgs) -> PathBuf {
@@ -3038,6 +3105,7 @@ mod tests {
             session: None,
             socket: Some(PathBuf::from("/tmp/mtyx-explicit/x.sock")),
             json: false,
+            machine: None,
         };
         assert_eq!(discovery_roots(&global), vec![PathBuf::from("/tmp/mtyx-explicit")]);
     }
@@ -3057,7 +3125,7 @@ mod tests {
         mk_sock_root(&canonical, &["newdemo"]);
         mk_sock_root(&legacy, &["olddemo"]);
 
-        let global = GlobalArgs { session: None, socket: None, json: false };
+        let global = GlobalArgs { session: None, socket: None, json: false, machine: None };
         let found = discover_sessions(&global);
 
         match prev {

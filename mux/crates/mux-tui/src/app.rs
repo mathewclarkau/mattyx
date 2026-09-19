@@ -1564,8 +1564,12 @@ impl App {
         let own_socket = self.session.socket_path().unwrap_or_default();
         // Scope discovery to the same runtime dir as the running session
         // (honours a --socket override pointing outside the default dir).
-        let global =
-            crate::cli::GlobalArgs { session: None, socket: Some(own_socket.clone()), json: false };
+        let global = crate::cli::GlobalArgs {
+            session: None,
+            socket: Some(own_socket.clone()),
+            json: false,
+            machine: None,
+        };
         let mut sessions = crate::cli::discover_sessions(&global);
         // Newest-first, matching the pre-attach picker ordering.
         sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
@@ -1672,8 +1676,12 @@ impl App {
         let Some(state) = self.session_manager.as_mut() else { return };
         let own = state.own_socket.clone();
         let seeded = state.workspaces.get(&own).cloned();
-        let global =
-            crate::cli::GlobalArgs { session: None, socket: Some(own.clone()), json: false };
+        let global = crate::cli::GlobalArgs {
+            session: None,
+            socket: Some(own.clone()),
+            json: false,
+            machine: None,
+        };
         let mut sessions = crate::cli::discover_sessions(&global);
         sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
         state.sessions = sessions;

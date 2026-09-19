@@ -24,6 +24,7 @@ mod help;
 mod hook_merge;
 mod host_colors;
 mod keys;
+mod machine;
 mod opencode_hook;
 mod pi_hook;
 mod plugin;
@@ -165,10 +166,13 @@ USAGE:
   mtyx agents <list|install>     Manage all agent hook integrations (see below)
   mtyx plugin <subcommand> Manage mtyx-plugin.toml manifests (see below)
   mtyx ssh <host> [OPTS]   Open a remote workspace over SSH (see below)
+  mtyx machine <subcommand>  Manage saved SSH machines (see below)
 
 OPTIONS:
   --session <name>   Session name (default: main). Determines the socket path.
   --socket <path>    Explicit control socket path.
+  --machine <label>  Route the verb to a saved SSH machine (see MACHINES
+                     below) instead of the local socket. No TUI.
   --headless         Run only the control socket, no TUI.
   --term <value>     TERM for child shells (default: xterm-256color).
   --apply-local-config
@@ -452,6 +456,29 @@ REMOTE (SSH) WORKSPACES
       persistent mode: closing the tab detaches without killing the
       remote shell, and this session's own daemon restarting reattaches
       to it automatically (see mux/docs/getting-started.md).
+
+MACHINES (issue #94, multi-machine SSH fleet)
+  mtyx machine add <label> <user@host>
+      Save an SSH destination under a short label. Persisted in the
+      mattyx config dir (machines.json, 0600). Re-adding a label
+      repoints it. SSH aliases from the config dir work; the target is
+      passed to ssh verbatim.
+  mtyx machine list [--json]
+      List saved machines (one `<label>\t<target>` per line, or a JSON
+      object {\"machines\":[{\"label\":...,\"target\":...}]}).
+  mtyx machine remove <label>
+      Forget a machine. Unknown label is an error.
+  mtyx --machine <label> <verb> [args]
+      Run a control verb against that machine's mux server over SSH
+      (ssh -o BatchMode=yes <target> mtyx <verb> ...), with no TUI. The
+      read/write trio - list-workspaces, send, read-screen - and every
+      other verb work this way. A dropped transport is retried up to
+      3 times (250ms, then 1s) before giving up.
+      Failure is explicit: an unknown label prints `unknown machine
+      '<label>'` and exits nonzero WITHOUT contacting any local socket,
+      and a failed remote command exits with the remote's status - the
+      verb is never silently re-run locally.
+      Windows SSH hosts are out of scope.
 ";
 
 #[derive(Clone)]
@@ -592,6 +619,7 @@ fn main() {
             && first != "agents"
             && first != "agent-pattern"
             && first != "ssh"
+            && first != "machine"
             && first != "socket-watchdog"
         {
             if plugin::lookup_plugin(first).is_ok() {
@@ -633,6 +661,10 @@ fn main() {
     }
     if raw_args.first().map(|arg| arg.as_str()) == Some("ssh") {
         std::process::exit(ssh_bootstrap::run(&raw_args[1..]));
+    }
+    // Issue #94: `mtyx machine add|list|remove` — the SSH fleet registry.
+    if raw_args.first().map(|arg| arg.as_str()) == Some("machine") {
+        std::process::exit(machine::run(&raw_args[1..]));
     }
     if raw_args.first().map(|arg| arg.as_str()) == Some("socket-watchdog") {
         std::process::exit(socket_watchdog::run(&raw_args[1..]));
@@ -721,6 +753,9 @@ fn main() {
             session: Some(args.session.clone()),
             socket: args.socket.clone(),
             json: args.json,
+            // Issue #94: session-list discovery is local-only; --machine
+            // is not a flag of the TUI/attach parser.
+            machine: None,
         };
         if args.json {
             // Issue #98: this dump is stdout payload too — pipe-close
