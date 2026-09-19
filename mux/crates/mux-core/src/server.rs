@@ -890,12 +890,59 @@ impl LineWriter {
     }
 }
 
+/// Issue #86: `std::fs::create_dir_all` that reports whether it actually
+/// created the leaf directory (vs. finding it already present). Needed so
+/// the bind path can distinguish "a dir we just made" (safe to chmod
+/// 0700) from "someone else's pre-existing dir" (e.g. `/tmp`).
+fn create_dir_all_tracked(dir: &Path) -> std::io::Result<bool> {
+    if dir.is_dir() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(dir)?;
+    Ok(true)
+}
+
+/// Issue #86: does this process own `dir` (same uid as the daemon)?
+/// Used to decide whether restricting the directory to 0700 is a
+/// legitimate hardening step or an intrusion into someone else's tree.
+/// Non-unix: always false (no uid concept; `restrict_permissions` is a
+/// no-op there anyway).
+#[cfg(unix)]
+fn dir_owned_by_us(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(dir) else { return false };
+    meta.uid() == unsafe { libc::getuid() }
+}
+
+#[cfg(not(unix))]
+fn dir_owned_by_us(_dir: &Path) -> bool {
+    false
+}
+
 /// Bind the socket and serve connections on background threads.
 pub fn serve(mux: Arc<Mux>, path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    let explicit = path.is_some();
     let path = path.unwrap_or_else(|| default_socket_path(&mux.session_name()));
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-        platform::restrict_directory(dir)?;
+        // Issue #86 bind-path guard: only chmod a parent directory we own.
+        // `create_dir_all` is tracked so "did we just create it" is known;
+        // for an explicit `--socket /tmp/x.sock` the parent (/tmp) already
+        // exists and is NOT ours, so chmod'ing it 0700 would be a
+        // system-breaking side effect. In that case we best-effort the
+        // restrict (ignore failure) and warn instead of hard-failing; the
+        // socket itself is still chmod 0600 below and peer-authed above.
+        let created = create_dir_all_tracked(dir)?;
+        let default_runtime_dir = !explicit;
+        if created || default_runtime_dir || dir_owned_by_us(dir) {
+            platform::restrict_directory(dir)?;
+        } else {
+            eprintln!(
+                "mtyx: warning: {dir} was not created by this process; leaving its \
+                 permissions alone (socket keeps 0600)",
+                dir = dir.display()
+            );
+            let _ = platform::restrict_directory(dir);
+        }
     }
     let pid_p = pid_path(&path);
     // Refuse to clobber a live socket; remove a stale one.
@@ -929,9 +976,81 @@ pub fn serve(mux: Arc<Mux>, path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+/// Issue #86: the exact JSON denial written on a rejected control
+/// connection, or `None` when the decision is not a rejection (accept no
+/// response, unsupported falls through to the filesystem boundary).
+///
+/// Kept as one pure function so the wire shape is pinned by a test and the
+/// handler cannot drift from it. `id` is explicitly `null` (unlike
+/// [`Response`], which omits a `None` id) because the plan specifies
+/// `{"id":null,"ok":false,"error":"peer uid <N> rejected"}` exactly.
+pub fn peer_auth_denial_json(decision: &platform::PeerAuthDecision) -> Option<Value> {
+    match decision {
+        platform::PeerAuthDecision::RejectForeign { uid } => Some(json!({
+            "id": Value::Null,
+            "ok": false,
+            "error": format!("peer uid {uid} rejected"),
+        })),
+        platform::PeerAuthDecision::RejectLookupError => Some(json!({
+            "id": Value::Null,
+            "ok": false,
+            "error": "peer authentication failed".to_string(),
+        })),
+        platform::PeerAuthDecision::Accept | platform::PeerAuthDecision::Unsupported => None,
+    }
+}
+
 fn handle_connection(mux: Arc<Mux>, stream: Box<dyn transport::Stream>) {
     let Ok(write_half) = stream.try_clone_box() else { return };
     let writer = LineWriter(Arc::new(Mutex::new(write_half)));
+
+    // Issue #86: peer-authenticate BEFORE any Request is parsed. The
+    // decision itself is pure (`platform::peer_auth_decision`); all we do
+    // here is gather the inputs and execute its verdict.
+    let peer = stream.peer_uid();
+    let decision = platform::peer_auth_decision(
+        peer.as_ref().map(|uid| *uid),
+        platform::daemon_uid(),
+        platform::transport_supports_peer_creds(),
+    );
+    let denial = peer_auth_denial_json(&decision);
+    match decision {
+        platform::PeerAuthDecision::Accept => {}
+        platform::PeerAuthDecision::RejectForeign { uid } => {
+            eprintln!("mtyx: rejected control connection from peer uid {uid}");
+            if let Some(denial) = &denial {
+                let _ = writer.send(denial);
+            }
+            return;
+        }
+        platform::PeerAuthDecision::RejectLookupError => {
+            let detail = match &peer {
+                Ok(_) => "no daemon uid available".to_string(),
+                Err(e) => e.to_string(),
+            };
+            eprintln!(
+                "mtyx: rejected control connection: peer-credential lookup failed ({detail})"
+            );
+            if let Some(denial) = &denial {
+                let _ = writer.send(denial);
+            }
+            return;
+        }
+        platform::PeerAuthDecision::Unsupported => {
+            // Documented interim: no peer-cred surface on this transport
+            // (Windows named pipes / non-Linux unix). Fall back to the
+            // filesystem-permissions boundary (runtime dir 0700, socket
+            // 0600) and say so exactly once.
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                eprintln!(
+                    "mtyx: warning: peer-credential authentication is unavailable on this \
+                     transport; relying on filesystem permissions (runtime dir 0700, socket 0600)"
+                );
+            });
+        }
+    }
+
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let Ok(line) = line else { break };
@@ -2687,6 +2806,29 @@ mod tests {
         assert!(validate_wait_request("idle", MAX_AGENT_WAIT_MS + 1).is_err());
         assert!(validate_wait_request("idle", MAX_AGENT_WAIT_MS).is_ok());
         assert!(validate_wait_request("idle", 0).is_ok());
+    }
+
+    #[test]
+    fn peer_auth_denial_json_pins_the_exact_wire_shape() {
+        // Issue #86: a foreign uid is denied with a structured response
+        // that names the uid, carries `id` as null (unlike Response), and
+        // is `ok:false`.
+        let foreign = platform::PeerAuthDecision::RejectForeign { uid: 4242 };
+        let denial = peer_auth_denial_json(&foreign).expect("foreign uid must deny");
+        assert_eq!(denial["ok"], json!(false));
+        assert!(denial["id"].is_null(), "id must be present and null");
+        assert_eq!(denial["error"], json!("peer uid 4242 rejected"));
+
+        // A lookup error also denies, but names no uid.
+        let lookup = peer_auth_denial_json(&platform::PeerAuthDecision::RejectLookupError)
+            .expect("lookup error must deny");
+        assert_eq!(lookup["ok"], json!(false));
+        assert_eq!(lookup["error"], json!("peer authentication failed"));
+
+        // Accept and Unsupported write NO denial (Unsupported falls back
+        // to the filesystem-permissions boundary).
+        assert!(peer_auth_denial_json(&platform::PeerAuthDecision::Accept).is_none());
+        assert!(peer_auth_denial_json(&platform::PeerAuthDecision::Unsupported).is_none());
     }
 
     #[test]

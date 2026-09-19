@@ -10,6 +10,36 @@ pub mod transport {
     pub trait Stream: Read + Write + Send {
         fn try_clone_box(&self) -> io::Result<Box<dyn Stream>>;
         fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+
+        /// Issue #86: the uid of the process at the other end of an
+        /// accepted local stream, when the transport can report one.
+        ///
+        /// Unix: `getsockopt(SO_PEERCRED)` on the underlying fd. This is
+        /// a *kernel-attested* credential — it cannot be spoofed by the
+        /// client — which is why it is the right basis for a default-deny
+        /// peer-auth check on the daemon control socket.
+        ///
+        /// The default is an `Unsupported` error, so a transport that
+        /// has no peer-credential surface (the Windows `uds_windows`
+        /// shim, or any future non-unix transport) is forced to declare
+        /// itself explicitly rather than silently reporting uid 0. Callers
+        /// MUST treat an `Err` as "cannot authenticate" (see
+        /// [`is_peer_cred_unsupported`]) and never as a match.
+        fn peer_uid(&self) -> io::Result<u32> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "peer credentials unsupported"))
+        }
+    }
+
+    /// Issue #86: is this `peer_uid()` error the "transport has no
+    /// peer-credential surface" case (Windows/unsupported) rather than a
+    /// genuine lookup failure on a transport that *does* support creds?
+    ///
+    /// The distinction drives the enforcement policy in `server.rs`: an
+    /// unsupported transport falls back to the filesystem-permissions
+    /// boundary with a one-time warning, while a lookup error on a
+    /// credential-capable transport is a hard reject.
+    pub fn is_peer_cred_unsupported(err: &io::Error) -> bool {
+        err.kind() == io::ErrorKind::Unsupported
     }
 
     pub struct Listener {
@@ -66,6 +96,46 @@ pub mod transport {
             fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
                 UnixStream::set_read_timeout(self, timeout)
             }
+
+            /// Issue #86: `getsockopt(SOL_SOCKET, SO_PEERCRED)` returns a
+            /// `struct ucred` describing the peer at connect(2) time.
+            /// Linux fills `pid`/`uid`/`gid`; `uid` is what we authenticate
+            /// on. A lookup error is returned as-is (never coerced to 0) so
+            /// the caller rejects rather than accepts.
+            ///
+            /// SO_PEERCRED is Linux-specific (other unix targets use
+            /// `LOCAL_PEERCRED`/`getpeereid`), so this is gated to Linux;
+            /// other unix hosts get the trait default (unsupported) and the
+            /// documented filesystem-permissions fallback.
+            #[cfg(target_os = "linux")]
+            fn peer_uid(&self) -> io::Result<u32> {
+                use std::os::unix::io::AsRawFd;
+
+                let fd = self.as_raw_fd();
+                let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+                let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+                let rc = unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_PEERCRED,
+                        &mut cred as *mut libc::ucred as *mut libc::c_void,
+                        &mut len,
+                    )
+                };
+                if rc != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(cred.uid)
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            fn peer_uid(&self) -> io::Result<u32> {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "SO_PEERCRED peer auth unavailable on this unix target",
+                ))
+            }
         }
     }
 
@@ -104,6 +174,23 @@ pub mod transport {
 
             fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
                 UnixStream::set_read_timeout(self, timeout)
+            }
+
+            /// Issue #86: DOCUMENTED GAP. The `uds_windows` shim wraps a
+            /// named pipe, which has no `SO_PEERCRED` equivalent — the
+            /// peer's uid is not knowable here. We deliberately do NOT
+            /// attempt a named-pipe impersonation/ACL rewrite in this
+            /// change. Returning `Unsupported` keeps the trait semantics
+            /// and makes `server.rs` fall back to the
+            /// filesystem-permissions boundary (the runtime dir is
+            /// per-user) with a one-time log line. A real fix would query
+            /// the pipe's client SID via `GetNamedPipeClientProcessId` +
+            /// token lookup — a separate, larger change.
+            fn peer_uid(&self) -> io::Result<u32> {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "peer credentials unsupported on Windows named pipes",
+                ))
             }
         }
     }
@@ -149,6 +236,85 @@ pub fn pick_runtime_socket(
     } else {
         canonical
     }
+}
+
+/// Issue #86: the uid of the daemon process, used as the reference for
+/// the peer-auth check. `None` on transports/hosts with no uid concept
+/// (Windows).
+#[cfg(unix)]
+pub fn daemon_uid() -> Option<u32> {
+    Some(unsafe { libc::getuid() })
+}
+
+#[cfg(not(unix))]
+pub fn daemon_uid() -> Option<u32> {
+    None
+}
+
+/// Issue #86: outcome of the peer-authentication decision for one
+/// accepted connection. Pure data so the whole matrix is unit-testable
+/// without a second uid, and so `server.rs` merely executes a decision
+/// it did not compute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerAuthDecision {
+    /// The peer's uid matches the daemon's (or is root). Forward normally.
+    Accept,
+    /// The peer authenticated as a DIFFERENT uid. Deny with the
+    /// structured response naming the offending uid.
+    RejectForeign { uid: u32 },
+    /// A uid lookup failed on a transport that DOES support peer creds
+    /// (Linux). A failed lookup must never be treated as a match, so this
+    /// is a hard deny — but there is no uid to name in the response.
+    RejectLookupError,
+    /// The transport has no peer-credential surface at all (Windows named
+    /// pipes, non-Linux unix). The peer is not authenticated here; the
+    /// caller falls back to the filesystem-permissions boundary and logs
+    /// once. This is the documented interim, not a silent accept.
+    Unsupported,
+}
+
+/// Issue #86: decide whether an accepted connection may speak the
+/// control protocol, BEFORE any `Request` is parsed.
+///
+/// - `peer`: the `peer_uid()` result for the connection.
+/// - `daemon_uid`: this process's uid (`None` only on hosts with no uid,
+///   i.e. Windows, where `transport_supports_creds` is false anyway).
+/// - `transport_supports_creds`: whether this transport is expected to be
+///   able to report a peer uid (true on Linux, false on Windows/other
+///   unix). Distinguishes "lookup failed" from "cannot look up at all".
+///
+/// Policy: default-deny. Accept only an explicit uid match (or root,
+/// uid 0, which is this process's superuser and is permitted — documented
+/// here, not implicit). Every error path denies or falls back; none of
+/// them accept.
+pub fn peer_auth_decision(
+    peer: Result<u32, &std::io::Error>,
+    daemon_uid: Option<u32>,
+    transport_supports_creds: bool,
+) -> PeerAuthDecision {
+    if !transport_supports_creds {
+        return PeerAuthDecision::Unsupported;
+    }
+    match peer {
+        // A mismatched uid is the whole point of this check: deny.
+        Ok(uid) => match daemon_uid {
+            Some(mine) if uid == mine || uid == 0 => PeerAuthDecision::Accept,
+            Some(_) => PeerAuthDecision::RejectForeign { uid },
+            // A transport that supports creds but a host with no uid
+            // concept is contradictory; fail closed.
+            None => PeerAuthDecision::RejectLookupError,
+        },
+        // Lookup error on a credential-capable transport: never a match.
+        Err(_) => PeerAuthDecision::RejectLookupError,
+    }
+}
+
+/// Issue #86: does this transport report peer credentials on this host?
+/// True only on Linux, where `Stream::peer_uid` is implemented via
+/// `SO_PEERCRED`; everywhere else the daemon uses the documented
+/// filesystem-permissions fallback (see `PeerAuthDecision::Unsupported`).
+pub const fn transport_supports_peer_creds() -> bool {
+    cfg!(target_os = "linux")
 }
 
 /// Where a session's persisted tree snapshot lives, honoring the XDG
@@ -620,5 +786,56 @@ mod tests {
         let base2 = dir.join("xdg3");
         std::fs::create_dir_all(&base2).unwrap();
         assert_eq!(honor_cmux_era_dir(base2.join("mattyx")), base2.join("mattyx"));
+    }
+
+    // ---- Issue #86: peer-auth decision matrix (default-deny) ----
+
+    #[test]
+    fn peer_auth_same_uid_accepted() {
+        assert_eq!(peer_auth_decision(Ok(1000), Some(1000), true), PeerAuthDecision::Accept);
+        // Root (uid 0) is this process's superuser and is permitted by
+        // policy (documented in peer_auth_decision).
+        assert_eq!(peer_auth_decision(Ok(0), Some(1000), true), PeerAuthDecision::Accept);
+    }
+
+    #[test]
+    fn peer_auth_foreign_uid_rejected() {
+        assert_eq!(
+            peer_auth_decision(Ok(0xdead), Some(1000), true),
+            PeerAuthDecision::RejectForeign { uid: 0xdead }
+        );
+        // uid 0 daemon with a non-root peer: still a mismatch, still denied.
+        assert_eq!(
+            peer_auth_decision(Ok(1000), Some(0), true),
+            PeerAuthDecision::RejectForeign { uid: 1000 }
+        );
+    }
+
+    #[test]
+    fn peer_auth_lookup_error_is_rejected_not_matched() {
+        // A lookup error on a credential-capable transport must NEVER be
+        // treated as a match.
+        let err = std::io::Error::new(std::io::ErrorKind::Other, "boom");
+        assert_eq!(
+            peer_auth_decision(Err(&err), Some(1000), true),
+            PeerAuthDecision::RejectLookupError
+        );
+        // Contradictory combination (creds supported, host has no uid)
+        // fails closed rather than accepting.
+        assert_eq!(peer_auth_decision(Ok(1000), None, true), PeerAuthDecision::RejectLookupError);
+    }
+
+    #[test]
+    fn peer_auth_unsupported_transport_falls_back() {
+        // Windows named pipes / non-Linux unix: no peer-cred surface, so
+        // the decision is the documented filesystem-permissions fallback
+        // regardless of what (if anything) the lookup returned.
+        let err = std::io::Error::new(std::io::ErrorKind::Unsupported, "nope");
+        assert_eq!(peer_auth_decision(Err(&err), None, false), PeerAuthDecision::Unsupported);
+        assert_eq!(peer_auth_decision(Ok(1000), Some(1000), false), PeerAuthDecision::Unsupported);
+        assert_eq!(
+            peer_auth_decision(Ok(0xbeef), Some(1000), false),
+            PeerAuthDecision::Unsupported
+        );
     }
 }
