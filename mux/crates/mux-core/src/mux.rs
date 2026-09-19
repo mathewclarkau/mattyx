@@ -201,6 +201,22 @@ pub struct Mux {
     /// never saw a client must not let its empty state delete a
     /// pre-existing non-empty snapshot.
     workspace_opened: AtomicBool,
+    /// Issue #92: daemon-global monotonic notification id sequence. One
+    /// counter shared by every pane, so a per-client last-read id is a
+    /// single high-water mark (see [`crate::notify::NotificationRecord`]).
+    next_notification_id: AtomicU64,
+    /// Issue #92: per-pane durable notification ring, fed from the same
+    /// place desktop emission happens (the `Surface` OSC watcher) and
+    /// bounded per pane by [`crate::notify::NOTIFICATION_RING_CAPACITY`].
+    notifications: Mutex<HashMap<SurfaceId, crate::notify::NotificationRing>>,
+    /// Issue #92: per-client read state — client id -> surface -> highest
+    /// notification id that client has read. Clients identify on the
+    /// control socket (`subscribe`'s optional `client` field, generated and
+    /// persisted per attach session by the CLI) or via an explicit
+    /// `notify-ack` client value. A request with no client uses the
+    /// empty-string key, so client-less `notify-ack` stays consistent.
+    /// Read state is in-memory only (session lifetime), matching the rings.
+    notification_reads: Mutex<HashMap<String, HashMap<SurfaceId, u64>>>,
 }
 
 impl Mux {
@@ -231,6 +247,9 @@ impl Mux {
             worktree_pattern: Mutex::new(None),
             client_attached: AtomicBool::new(false),
             workspace_opened: AtomicBool::new(false),
+            next_notification_id: AtomicU64::new(1),
+            notifications: Mutex::new(HashMap::new()),
+            notification_reads: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1965,6 +1984,148 @@ reattaching to remote session {session_id} on {host} \
         Some(report)
     }
 
+    // ---- Issue #92: durable per-pane notifications + per-client read state.
+
+    /// Allocate the next daemon-global monotonic notification id.
+    fn next_notification_id(&self) -> u64 {
+        self.next_notification_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Record a desktop notification for `surface` in its per-pane ring
+    /// (issue #92). Returns the stored record. This is the durable side
+    /// channel: it must be called alongside the unchanged
+    /// `MuxEvent::OscNotification` desktop emission (see `surface.rs`),
+    /// never instead of it.
+    ///
+    /// The ring is bounded at
+    /// [`crate::notify::NOTIFICATION_RING_CAPACITY`]: pushing into a full
+    /// ring evicts the oldest record. Because ids are monotonic and a
+    /// client's read mark only moves forward, eviction only ages out
+    /// notifications a lagging client could no longer selectively miss —
+    /// it silently drops the oldest, which is the documented bound.
+    pub fn record_notification(
+        self: &Arc<Self>,
+        surface: SurfaceId,
+        title: String,
+        body: String,
+    ) -> crate::notify::NotificationRecord {
+        let record = crate::notify::NotificationRecord {
+            id: self.next_notification_id(),
+            surface,
+            title,
+            body,
+            timestamp_ms: crate::notify::now_ms(),
+        };
+        let mut rings = self.notifications.lock().unwrap();
+        rings
+            .entry(surface)
+            .or_insert_with(crate::notify::NotificationRing::new)
+            .push(record.clone());
+        record
+    }
+
+    /// The stored notifications for one pane, oldest first (issue #92).
+    /// Empty when the pane never emitted any or its ring aged out.
+    pub fn notifications_for(&self, surface: SurfaceId) -> Vec<crate::notify::NotificationRecord> {
+        let rings = self.notifications.lock().unwrap();
+        rings.get(&surface).map(|ring| ring.records().cloned().collect()).unwrap_or_default()
+    }
+
+    /// All stored notifications across every pane, oldest first by id
+    /// (issue #92) — the `--all` shape for a client that does not filter
+    /// by surface.
+    pub fn all_notifications(&self) -> Vec<crate::notify::NotificationRecord> {
+        let rings = self.notifications.lock().unwrap();
+        let mut records: Vec<_> = rings.values().flat_map(|ring| ring.records().cloned()).collect();
+        records.sort_by_key(|r| r.id);
+        records
+    }
+
+    /// A client's last-read notification id for one pane (issue #92).
+    /// `None` means the client has never acked anything in that pane, so
+    /// nothing is filtered out.
+    pub fn client_read_mark(&self, client: &str, surface: SurfaceId) -> Option<u64> {
+        self.notification_reads.lock().unwrap().get(client).and_then(|m| m.get(&surface).copied())
+    }
+
+    /// Notifications a client has not yet read, optionally restricted to
+    /// one pane, oldest first by id (issue #92) — the replay slice for
+    /// `subscribe`. `surface: None` covers every pane.
+    pub fn unread_notifications(
+        &self,
+        client: &str,
+        surface: Option<SurfaceId>,
+    ) -> Vec<crate::notify::NotificationRecord> {
+        let reads = self.notification_reads.lock().unwrap();
+        let marks = reads.get(client);
+        let mark_for = |s: SurfaceId| marks.and_then(|m| m.get(&s).copied()).unwrap_or(0);
+        let rings = self.notifications.lock().unwrap();
+        let mut records: Vec<_> = match surface {
+            Some(s) => rings
+                .get(&s)
+                .map(|ring| ring.unread_after(mark_for(s)).cloned().collect())
+                .unwrap_or_default(),
+            None => rings
+                .iter()
+                .flat_map(|(s, ring)| ring.unread_after(mark_for(*s)).cloned())
+                .collect(),
+        };
+        records.sort_by_key(|r| r.id);
+        records
+    }
+
+    /// Mark notifications read for `client` (issue #92). With `id: None`
+    /// the mark advances to the pane's latest stored id (ack all); with
+    /// `id: Some(n)` it advances to `max(current, n)`, so re-acking an
+    /// older id never rewinds the high-water mark while an id newer than
+    /// anything stored still advances it (the client asserts it has seen
+    /// it). `surface: None` applies to every pane that has stored
+    /// notifications. Returns the (surface, new-mark) pairs written.
+    pub fn ack_notifications(
+        &self,
+        client: &str,
+        surface: Option<SurfaceId>,
+        id: Option<u64>,
+    ) -> Vec<(SurfaceId, u64)> {
+        let latest: Vec<(SurfaceId, u64)> = {
+            let rings = self.notifications.lock().unwrap();
+            match surface {
+                Some(s) => {
+                    rings.get(&s).and_then(|r| r.latest_id()).map(|l| (s, l)).into_iter().collect()
+                }
+                None => rings.iter().filter_map(|(s, r)| r.latest_id().map(|l| (*s, l))).collect(),
+            }
+        };
+        let mut applied = Vec::new();
+        let mut reads = self.notification_reads.lock().unwrap();
+        let marks = reads.entry(client.to_string()).or_default();
+        for (s, pane_latest) in latest {
+            // `--all` (id == None) acks the whole pane; an explicit id
+            // advances to exactly that id (whether or not it is still
+            // stored), never rewinding past the existing mark below.
+            let target = id.unwrap_or(pane_latest);
+            let entry = marks.entry(s).or_insert(0);
+            if target > *entry {
+                *entry = target;
+                applied.push((s, target));
+            }
+        }
+        applied
+    }
+
+    /// Drop a surface's notification ring and every client's read mark for
+    /// it (called when the surface leaves the tree, so a long-lived daemon
+    /// does not retain rings for panes that no longer exist). Read marks
+    /// for OTHER panes are untouched, and the global id sequence is never
+    /// rewound.
+    fn forget_surface_notifications(&self, surface: SurfaceId) {
+        self.notifications.lock().unwrap().remove(&surface);
+        let mut reads = self.notification_reads.lock().unwrap();
+        for marks in reads.values_mut() {
+            marks.remove(&surface);
+        }
+    }
+
     /// Resolve an agent-verb target (issue #75): an exact match on a
     /// surface's reported agent name, else a numeric surface id, else an
     /// error. Duplicate names are ambiguous and rejected (disambiguate
@@ -2432,6 +2593,7 @@ reattaching to remote session {session_id} on {host} \
     /// drop their render state.
     pub fn surface_exited(&self, id: SurfaceId) {
         self.close_surface(id);
+        self.forget_surface_notifications(id);
         self.emit(MuxEvent::SurfaceExited(id));
     }
 
@@ -4217,5 +4379,85 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    // ---- Issue #92: durable notifications + per-client read state ----
+
+    /// AC1 (state half): records are stored per pane, and a client that
+    /// never acked sees all of them; acking moves the mark so a later read
+    /// sees nothing. Ids are daemon-global and strictly increasing.
+    #[test]
+    fn unread_and_ack_round_trip() {
+        let mux = test_mux();
+        let a = mux.record_notification(10, String::new(), "first".into());
+        let b = mux.record_notification(10, "T".into(), "second".into());
+        let other_pane = mux.record_notification(99, String::new(), "elsewhere".into());
+        assert!(a.id < b.id && b.id < other_pane.id, "ids must be monotonic globally");
+
+        assert_eq!(mux.notifications_for(10).len(), 2);
+        let unread = mux.unread_notifications("alice", Some(10));
+        assert_eq!(
+            unread.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        // A different client's read state is independent.
+        assert_eq!(mux.unread_notifications("bob", Some(10)).len(), 2);
+
+        let applied = mux.ack_notifications("alice", Some(10), None);
+        assert_eq!(applied, vec![(10, b.id)]);
+        assert!(
+            mux.unread_notifications("alice", Some(10)).is_empty(),
+            "acked client sees nothing"
+        );
+        assert_eq!(mux.unread_notifications("bob", Some(10)).len(), 2, "other client unaffected");
+        // Bob's pane is still unread for alice too.
+        assert_eq!(mux.unread_notifications("alice", None).len(), 1);
+    }
+
+    /// AC1: an explicit id acks only up to that id (a later record still
+    /// replays), and re-acking an older id never rewinds the mark.
+    #[test]
+    fn partial_ack_and_no_rewind() {
+        let mux = test_mux();
+        let first = mux.record_notification(1, String::new(), "a".into());
+        let second = mux.record_notification(1, String::new(), "b".into());
+        assert_eq!(mux.ack_notifications("c", Some(1), Some(first.id)), vec![(1, first.id)]);
+        let unread: Vec<_> =
+            mux.unread_notifications("c", Some(1)).into_iter().map(|r| r.id).collect();
+        assert_eq!(unread, vec![second.id]);
+        // Re-ack the older id: the mark must not move backwards.
+        assert!(mux.ack_notifications("c", Some(1), Some(first.id)).is_empty());
+        assert_eq!(mux.client_read_mark("c", 1), Some(first.id));
+        assert_eq!(mux.unread_notifications("c", Some(1)).len(), 1);
+    }
+
+    /// AC2 (ring bound, through the mux): more than the cap keeps only
+    /// the newest records; the oldest ids are gone.
+    #[test]
+    fn ring_is_bounded_at_capacity() {
+        let mux = test_mux();
+        let cap = crate::notify::NOTIFICATION_RING_CAPACITY;
+        let mut last_id = 0;
+        for i in 0..(cap + 25) {
+            last_id = mux.record_notification(5, String::new(), format!("n{i}")).id;
+        }
+        let stored = mux.notifications_for(5);
+        assert_eq!(stored.len(), cap, "ring must be capped at {cap}");
+        assert_eq!(stored.last().unwrap().id, last_id, "newest record retained");
+        assert_eq!(stored.first().unwrap().body, "n25".to_string(), "oldest 25 records evicted");
+    }
+
+    /// A pane whose surface exits drops its ring and every client's read
+    /// mark for it; other panes are untouched.
+    #[test]
+    fn surface_exit_forgets_ring_and_marks() {
+        let mux = test_mux();
+        mux.record_notification(7, String::new(), "x".into());
+        mux.record_notification(8, String::new(), "y".into());
+        mux.ack_notifications("d", Some(7), None);
+        mux.forget_surface_notifications(7);
+        assert!(mux.notifications_for(7).is_empty());
+        assert_eq!(mux.client_read_mark("d", 7), None);
+        assert_eq!(mux.notifications_for(8).len(), 1);
     }
 }

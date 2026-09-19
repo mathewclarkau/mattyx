@@ -666,6 +666,11 @@ impl Surface {
                                     None,
                                     None,
                                 );
+                                // Issue #92: durable record, fed from the SAME
+                                // place as the (unchanged) ephemeral desktop
+                                // emission below, so a client attaching later can
+                                // replay it.
+                                mux.record_notification(surface.id, title.clone(), body.clone());
                                 mux.emit(MuxEvent::OscNotification {
                                     surface: surface.id,
                                     title,

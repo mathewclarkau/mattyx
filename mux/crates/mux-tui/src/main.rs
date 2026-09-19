@@ -237,7 +237,7 @@ CLI VERBS
   move-workspace, scroll-surface, subscribe, attach-surface, report-agent,
   list-agents, agent-read, agent-send, wait-agent-status, detect-agent,
   detect-agents, agent-pattern-add, agent-pattern-list,
-  agent-pattern-remove, browser-reload, list-sessions,
+  agent-pattern-remove, notify-ack, browser-reload, list-sessions,
   kill-session, kill-stale, rename-session, layout-export, layout-apply,
   layout-export-all, theme list,
   pane-worktree-create, pane-worktree-list, pane-worktree-remove

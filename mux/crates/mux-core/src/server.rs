@@ -13,6 +13,25 @@
 //!   Browsers receive `{"event":"browser-state"}` with optional latest
 //!   frame followed by live `{"event":"frame"}` PNG payloads.
 //!
+//! ## Durable notifications (issue #92)
+//!
+//! Desktop notifications scraped from a pane's OSC output are no longer
+//! fire-and-forget: every one is also stored in a bounded per-pane ring
+//! (see [`crate::notify`]) alongside the UNCHANGED `MuxEvent::OscNotification`
+//! emission. `subscribe` takes an optional `client` id; when present, the
+//! server replays that client's unread records (id greater than its
+//! last-read mark) as `{"event":"notification","surface":..,"id":..,
+//! "title":..,"body":..,"timestamp_ms":..}` lines. Replay is written on
+//! the SAME line stream and BEFORE the live forwarder starts, so a client
+//! sees every replayed record (oldest first) strictly before any live
+//! event — a live notification can never overtake a replayed older one.
+//! `notify-ack` (optionally scoped by `surface`, and either
+//! `notification_id` or the default "ack-all") advances the client's
+//! read high-water mark, so a second attach with the same client id
+//! replays nothing. All new request fields are serde-defaulted: an old
+//! client sending a bare `subscribe` gets no replay and the pre-#92
+//! behaviour, and an old daemon ignores the extra `client` field.
+//!
 //! ```text
 //! {"id":1,"cmd":"identify"}
 //! {"id":1,"ok":true,"data":{"app":"mtyx","session":"main",...}}
@@ -672,7 +691,34 @@ enum Command {
         delta: Option<isize>,
     },
     /// Stream mux events on this connection.
-    Subscribe,
+    ///
+    /// Issue #92: the optional `client` id scopes durable-notification
+    /// replay and per-client read state. When present, the server replays
+    /// this client's unread notification records as `notification` events
+    /// BEFORE any live events from the subscription, then streams live as
+    /// before. Absent (old clients) means no replay and the empty-string
+    /// client key — the pre-#92 behaviour.
+    Subscribe {
+        #[serde(default)]
+        client: Option<String>,
+    },
+    /// Issue #92: mark durable notifications read for a client.
+    ///
+    /// `surface` restricts the ack to one pane; absent applies to every
+    /// pane with stored notifications. `notification_id`, when present,
+    /// advances the client's read high-water mark to that id (never
+    /// rewinding it); absent acks up to each pane's latest stored id
+    /// ("ack all"). `client` identifies the reader (the CLI persists one
+    /// per attach session) and defaults to the empty-string key when
+    /// absent, matching `subscribe`.
+    NotifyAck {
+        #[serde(default)]
+        surface: Option<SurfaceId>,
+        #[serde(default)]
+        notification_id: Option<u64>,
+        #[serde(default)]
+        client: Option<String>,
+    },
     /// Stream a surface: vt-state event followed by live output events.
     AttachSurface {
         surface: SurfaceId,
@@ -1108,6 +1154,20 @@ fn handle_connection(mux: Arc<Mux>, stream: Box<dyn transport::Stream>) {
             break;
         }
     }
+}
+
+/// Issue #92: one durable notification as a subscribe-stream event. The
+/// same `notification` event shape is used for replay and for any future
+/// live durable push, so a client has one parse path.
+fn notification_json(record: crate::notify::NotificationRecord) -> Value {
+    json!({
+        "event": "notification",
+        "surface": record.surface,
+        "id": record.id,
+        "title": record.title,
+        "body": record.body,
+        "timestamp_ms": record.timestamp_ms,
+    })
 }
 
 fn node_json(node: &Node) -> Value {
@@ -2607,12 +2667,35 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
                 "surfaces": summary.surfaces,
             }))
         }
-        Command::Subscribe => {
+        Command::Subscribe { client } => {
             // Issue #95: a subscribing client is an attached client; the
             // session is live from here, so an empty tree at shutdown means
             // the user really emptied it (and the snapshot may be removed).
             mux.mark_client_attached();
+            // Issue #92: durable-notification replay. Subscribe BEFORE
+            // snapshotting the unread set so a notification that fires
+            // concurrently is either in the snapshot or arrives live —
+            // never lost. The unread list uses the client's last-read
+            // high-water mark, so a second attach after `notify-ack` sees
+            // nothing. Replay is written on the SAME line stream as live
+            // events, before the live forwarder thread starts, so the
+            // client sees all replayed records (oldest first) strictly
+            // before any live event: a live OSC notification can never
+            // overtake a replayed older one.
+            let replay = match client.as_deref() {
+                Some(client) => mux
+                    .unread_notifications(client, None)
+                    .into_iter()
+                    .map(notification_json)
+                    .collect(),
+                None => Vec::new(),
+            };
             let events = mux.subscribe();
+            for value in &replay {
+                if writer.send(value).is_err() {
+                    return Ok(json!({}));
+                }
+            }
             let writer = writer.clone();
             std::thread::Builder::new().name("mux-events-out".into()).spawn(move || {
                 while let Ok(event) = events.recv() {
@@ -2670,6 +2753,21 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
                 }
             })?;
             Ok(json!({}))
+        }
+        Command::NotifyAck { surface, notification_id, client } => {
+            // Issue #92: advance this client's read high-water mark. The
+            // reply reports what was written so a caller can tell "acked N
+            // panes" from "nothing to ack" without a second round-trip.
+            let client = client.unwrap_or_default();
+            let applied = mux.ack_notifications(&client, surface, notification_id);
+            Ok(json!({
+                "client": client,
+                "acked": applied
+                    .iter()
+                    .map(|(surface, id)| json!({"surface": surface, "notification_id": id}))
+                    .collect::<Vec<_>>(),
+                "unread": mux.unread_notifications(&client, surface).len(),
+            }))
         }
         Command::AttachSurface { surface: surface_id } => {
             // Issue #95: a direct surface attach is an attached client too.

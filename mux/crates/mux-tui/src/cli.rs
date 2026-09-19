@@ -40,7 +40,7 @@ pub(crate) struct GlobalArgs {
 /// forms (`--group 1`, `--group 0`) still work. `confirm`/`no-confirm`
 /// (issue #88) join the same convention.
 const BARE_BOOL_FLAGS: &[&str] =
-    &["group", "confirm", "no-confirm", "force", "wait", "require-transition"];
+    &["group", "confirm", "no-confirm", "force", "wait", "require-transition", "all"];
 
 /// Verbs that accept one bare positional argument alongside their flags
 /// (issue #84: `mtyx screenshot --surface <id> <file>`), mapped onto the
@@ -324,10 +324,26 @@ const VERBS: &[VerbSpec] = &[
     },
     VerbSpec {
         name: "subscribe",
-        allowed: &[],
-        build: build_no_args,
+        // Issue #92: --client opts into durable-notification replay.
+        allowed: &["client"],
+        build: build_subscribe,
         print: print_empty,
         stream: true,
+    },
+    VerbSpec {
+        // Issue #92: mark durable notifications read for this client.
+        // `--surface <id>` scopes to one pane; omitted acks every pane
+        // with stored notifications. `--all` (default) acks up to the
+        // pane's latest id; `--id <n>` advances the read high-water mark
+        // to that notification id instead. `--client <id>` identifies the
+        // reader and must match the id used on `subscribe` for the ack to
+        // suppress replay there; omitted uses the same empty-string key
+        // an unidentified subscriber gets.
+        name: "notify-ack",
+        allowed: &["surface", "all", "id", "client"],
+        build: build_notify_ack,
+        print: print_notify_ack,
+        stream: false,
     },
     VerbSpec {
         name: "attach-surface",
@@ -1146,6 +1162,15 @@ fn build_surface(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(json!({ "surface": flags.required_u64("surface")? }))
 }
 
+/// Issue #92: build a `subscribe` request, forwarding the optional client
+/// id that scopes durable-notification replay. No `--client` keeps the
+/// pre-#92 wire shape (an empty object), which older daemons accept.
+fn build_subscribe(flags: &FlagMap) -> Result<Value, UsageError> {
+    let mut value = json!({});
+    flags.insert_optional_string(&mut value, "client");
+    Ok(value)
+}
+
 fn build_pane(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(json!({ "pane": flags.required_u64("pane")? }))
 }
@@ -1589,6 +1614,29 @@ fn build_scroll_surface(flags: &FlagMap) -> Result<Value, UsageError> {
         "surface": flags.required_u64("surface")?,
         "delta": flags.required_isize("delta")?,
     }))
+}
+
+/// Issue #92: build a `notify-ack` request. `--all` is a bare boolean and
+/// is the default; `--id <n>` targets a specific notification. Passing
+/// both `--all` and `--id` is rejected rather than guessed at (a silent
+/// precedence pick would make an ack that means the opposite easy to
+/// write by accident).
+fn build_notify_ack(flags: &FlagMap) -> Result<Value, UsageError> {
+    let all = flags.optional_bool("all").unwrap_or(false);
+    let id = match flags.optional("id") {
+        Some(raw) => Some(parse_u64("id", &raw)?),
+        None => None,
+    };
+    if all && id.is_some() {
+        return Err(UsageError("--all and --id are mutually exclusive".to_string()));
+    }
+    let mut value = json!({});
+    flags.insert_optional_u64(&mut value, "surface")?;
+    if let Some(id) = id {
+        value["notification_id"] = json!(id);
+    }
+    flags.insert_optional_string(&mut value, "client");
+    Ok(value)
 }
 
 fn build_report_agent(flags: &FlagMap) -> Result<Value, UsageError> {
@@ -2739,6 +2787,24 @@ fn print_detect_agent(data: &Value, out: &mut dyn Write) -> io::Result<()> {
     )
 }
 
+/// Issue #92 human output: one `acked <surface> -> <id>` row and a
+/// trailing unread count, or a single line when nothing was acked.
+fn print_notify_ack(data: &Value, out: &mut dyn Write) -> io::Result<()> {
+    let acked = data.get("acked").and_then(Value::as_array).cloned().unwrap_or_default();
+    for entry in &acked {
+        writeln!(
+            out,
+            "acked {} -> {}",
+            entry.get("surface").and_then(Value::as_u64).unwrap_or(0),
+            entry.get("notification_id").and_then(Value::as_u64).unwrap_or(0),
+        )?;
+    }
+    if acked.is_empty() {
+        writeln!(out, "nothing to ack")?;
+    }
+    writeln!(out, "unread: {}", data.get("unread").and_then(Value::as_u64).unwrap_or(0))
+}
+
 /// Issue #78 AC2 human output: `<surface> <agent>` rows, id-ordered.
 fn print_detect_agents(data: &Value, out: &mut dyn Write) -> io::Result<()> {
     let Some(agents) = data.get("agents").and_then(Value::as_object) else {
@@ -3380,5 +3446,30 @@ mod tests {
                      "child": {"pid": 42, "comm": "sleep"}, "elapsed_ms": 12}
         });
         assert_eq!(print_response(&ready, true, print_wait_ready, true), 0);
+    }
+
+    /// Issue #92: `notify-ack` builds the documented wire request and
+    /// rejects the ambiguous `--all --id N` combination.
+    #[test]
+    fn notify_ack_build_maps_flags_and_rejects_all_plus_id() {
+        let all = parse_ok(&["notify-ack", "--surface", "4", "--client", "c1"]);
+        let built = (all.verb.build)(&all.flags).unwrap();
+        assert_eq!(built["surface"], json!(4));
+        assert_eq!(built["client"], json!("c1"));
+        assert!(built.get("notification_id").is_none(), "default is ack-all");
+
+        let by_id = parse_ok(&["notify-ack", "--surface", "4", "--id", "9"]);
+        let built = (by_id.verb.build)(&by_id.flags).unwrap();
+        assert_eq!(built["notification_id"], json!(9));
+
+        let conflict = parse_ok(&["notify-ack", "--all", "--id", "9"]);
+        let err = (conflict.verb.build)(&conflict.flags).unwrap_err();
+        assert!(err.0.contains("mutually exclusive"), "got: {}", err.0);
+
+        // No --client keeps the pre-#92 subscribe shape (empty object).
+        let sub = parse_ok(&["subscribe"]);
+        assert_eq!((sub.verb.build)(&sub.flags).unwrap(), json!({}));
+        let sub = parse_ok(&["subscribe", "--client", "c2"]);
+        assert_eq!((sub.verb.build)(&sub.flags).unwrap()["client"], json!("c2"));
     }
 }
