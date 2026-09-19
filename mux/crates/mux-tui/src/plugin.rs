@@ -265,7 +265,7 @@ pub fn validate_capabilities(cap: &Capabilities) -> Result<(), String> {
         Some(other) => {
             return Err(format!(
                 r#"manifest capabilities.socket must be one of off/read/write; got {other:?}"#
-            ))
+            ));
         }
         None => {}
     }
@@ -293,7 +293,7 @@ pub fn validate_capabilities(cap: &Capabilities) -> Result<(), String> {
         Some(other) => {
             return Err(format!(
                 r#"manifest capabilities.network must be one of off/outbound; got {other:?}"#
-            ))
+            ));
         }
     }
     Ok(())
