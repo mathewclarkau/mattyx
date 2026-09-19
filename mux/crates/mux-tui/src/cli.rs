@@ -508,6 +508,13 @@ pub fn is_cli_invocation(args: &[String]) -> bool {
 }
 
 pub fn run(args: &[String], usage: &str) -> i32 {
+    // Issue #98: CLI invocations write their payload to stdout, so a
+    // downstream pipe closing early (`... | head -1`) must end the
+    // process quietly via SIGPIPE (the shell's 141), never a Rust
+    // panic (exit 101) from `println!` hitting EPIPE. Only the CLI
+    // paths install this: the TUI/server keep Rust's SIG_IGN so a dead
+    // client socket stays a handled EPIPE error, never a signal death.
+    crate::reset_sigpipe_default();
     match parse(args) {
         Ok(Parsed::Help) => {
             print!("{usage}");
@@ -515,8 +522,12 @@ pub fn run(args: &[String], usage: &str) -> i32 {
         }
         Ok(Parsed::Command(args)) => run_command(args),
         Err(err) => {
-            eprintln!("mtyx: {}", err.0);
-            2
+            // Issue #98: the parse aborted before `--json` could be
+            // recorded in GlobalArgs, so scan the raw argv for the flag
+            // to decide envelope vs human string — `agent-read --file
+            // /nope --json` still gets the machine-readable form.
+            let json = args.iter().any(|a| a == "--json");
+            cli_error(json, 2, &format!("mtyx: {}", err.0))
         }
     }
 }
@@ -537,6 +548,8 @@ fn first_command_arg(args: &[String]) -> FirstCommand {
     while i < args.len() {
         match args[i].as_str() {
             "--socket" | "--session" => i += 2,
+            // Issue #98: `--flag=value` spellings of the global flags.
+            arg if arg.starts_with("--socket=") || arg.starts_with("--session=") => i += 1,
             "--json" => i += 1,
             "-h" | "--help" => return FirstCommand::Help,
             arg if arg.starts_with("--") => return FirstCommand::None,
@@ -556,10 +569,19 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
     let mut global = GlobalArgs::default();
     let mut flags = FlagMap::default();
     let mut verb: Option<&'static VerbSpec> = None;
+    // Issue #98: set once a bare `--` is seen after the verb — every
+    // token past it is a positional, never a flag.
+    let mut positional_only = false;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
         match arg {
+            // Issue #98: after `--`, even flag-SHAPED tokens (and the
+            // global-flag literals below) are positionals.
+            _ if positional_only => {
+                take_positional(verb.unwrap(), &mut flags, arg)?;
+                i += 1;
+            }
             "-h" | "--help" | "help" => return Ok(Parsed::Help),
             "--json" => {
                 global.json = true;
@@ -569,12 +591,30 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 global.socket = Some(PathBuf::from(value_after(args, i, "--socket")?));
                 i += 2;
             }
+            // Issue #98: `--flag=value` is accepted everywhere the
+            // space form is (global flags included).
+            _ if arg.starts_with("--socket=") => {
+                global.socket = Some(PathBuf::from(&arg["--socket=".len()..]));
+                i += 1;
+            }
             "--session" => {
                 global.session = Some(value_after(args, i, "--session")?);
                 i += 2;
             }
+            _ if arg.starts_with("--session=") => {
+                global.session = Some(arg["--session=".len()..].to_string());
+                i += 1;
+            }
             _ if verb.is_none() && verb_by_name(arg).is_some() => {
                 verb = verb_by_name(arg);
+                i += 1;
+            }
+            // Issue #98: bare `--` is the end-of-options marker — no
+            // token after it is ever parsed as a flag. Distinct from
+            // the `--` that must follow `--exec`: that one is consumed
+            // by the `--exec` arm below.
+            "--" if verb.is_some() => {
+                positional_only = true;
                 i += 1;
             }
             // Issue #76: `--exec -- <argv...>` — everything after the
@@ -605,35 +645,32 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 let Some(spec) = verb else {
                     return Err(UsageError(format!("unknown global flag {arg:?}")));
                 };
-                let name = arg.trim_start_matches("--");
+                // Issue #98: both spellings — `--flag value` and
+                // `--flag=value` — land in the same FlagMap slot, in any
+                // position relative to the verb's positionals (the
+                // linear scan below is already order-neutral about them).
+                let (name, inline) = split_flag(arg);
                 if !spec.allowed.contains(&name) {
-                    return Err(UsageError(format!("unknown flag {arg:?} for {}", spec.name)));
+                    return Err(UsageError(format!("unknown flag --{name} for {}", spec.name)));
                 }
-                let bare_bool = BARE_BOOL_FLAGS.contains(&name)
+                let bare_bool = inline.is_none()
+                    && BARE_BOOL_FLAGS.contains(&name)
                     && args.get(i + 1).map(|s| s.starts_with("--")).unwrap_or(true);
-                let value = if bare_bool { "true".to_string() } else { value_after(args, i, arg)? };
+                let value = if let Some(value) = inline {
+                    value.to_string()
+                } else if bare_bool {
+                    "true".to_string()
+                } else {
+                    value_after(args, i, &format!("--{name}"))?
+                };
                 if flags.values.insert(name.to_string(), value).is_some() {
-                    return Err(UsageError(format!("duplicate flag {arg:?}")));
+                    return Err(UsageError(format!("duplicate flag --{name}")));
                 }
-                i += if bare_bool { 1 } else { 2 };
+                i += if bare_bool || inline.is_some() { 1 } else { 2 };
             }
             _ if verb.is_some() => {
-                let spec = verb.unwrap();
-                // Issue #84: verbs listed in POSITIONAL_FLAG_VERBS take
-                // one bare argument, stored as its mapped flag (so
-                // `screenshot --surface 1 /tmp/x` == `--output /tmp/x`).
-                match POSITIONAL_FLAG_VERBS.iter().find(|(name, _)| *name == spec.name) {
-                    Some((_, flag)) if !flags.values.contains_key(*flag) => {
-                        flags.values.insert(flag.to_string(), arg.to_string());
-                        i += 1;
-                    }
-                    Some((_, flag)) => {
-                        return Err(UsageError(format!(
-                            "pass --{flag} once: positional and --{flag} given twice"
-                        )));
-                    }
-                    None => return Err(UsageError(format!("unexpected argument {arg:?}"))),
-                }
+                take_positional(verb.unwrap(), &mut flags, arg)?;
+                i += 1;
             }
             _ => return Err(UsageError(format!("unknown argument {arg:?}"))),
         }
@@ -643,12 +680,61 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
     Ok(Parsed::Command(CliArgs { global, verb, flags }))
 }
 
+/// Issue #98: split `--flag[=value]` (the caller guarantees the `--`
+/// prefix) into its name and optional inline value. Splits on the FIRST
+/// `=` so a value may itself contain one (`--env=A=B` → `("env", "A=B")`).
+fn split_flag(arg: &str) -> (&str, Option<&str>) {
+    match arg[2..].split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (&arg[2..], None),
+    }
+}
+
+/// Consume one bare positional for `verb` (issue #84's screenshot
+/// <file>, and since #98 anything after a bare `--`): verbs listed in
+/// POSITIONAL_FLAG_VERBS map it onto its named flag; every other verb
+/// rejects it. Shared by the pre-`--` and post-`--` arms of `parse` so
+/// both positions behave identically.
+fn take_positional(verb: &VerbSpec, flags: &mut FlagMap, arg: &str) -> Result<(), UsageError> {
+    match POSITIONAL_FLAG_VERBS.iter().find(|(name, _)| *name == verb.name) {
+        Some((_, flag)) if !flags.values.contains_key(*flag) => {
+            flags.values.insert(flag.to_string(), arg.to_string());
+            Ok(())
+        }
+        Some((_, flag)) => {
+            Err(UsageError(format!("pass --{flag} once: positional and --{flag} given twice")))
+        }
+        None => Err(UsageError(format!("unexpected argument {arg:?}"))),
+    }
+}
+
 fn value_after(args: &[String], index: usize, flag: &str) -> Result<String, UsageError> {
     args.get(index + 1).cloned().ok_or_else(|| UsageError(format!("{flag} needs a value")))
 }
 
 fn verb_by_name(name: &str) -> Option<&'static VerbSpec> {
     VERBS.iter().find(|verb| verb.name == name)
+}
+
+/// Issue #98: the `--json` error envelope — `{"ok":false,"error":{...}}`
+/// carrying the process exit code and the human message, so a caller
+/// can branch on `ok` instead of scraping stderr text.
+fn error_envelope(exit: i32, message: &str) -> Value {
+    json!({ "ok": false, "error": { "code": exit, "message": message } })
+}
+
+/// Issue #98: one error surface for the control-socket CLI. Non-JSON
+/// output is byte-identical to the historical bare string on stderr;
+/// with `--json` the same message rides the machine-readable envelope
+/// on stdout. The exit code is the caller's and is passed through
+/// unchanged.
+fn cli_error(json_output: bool, exit: i32, message: &str) -> i32 {
+    if json_output {
+        println!("{}", error_envelope(exit, message));
+    } else {
+        eprintln!("{message}");
+    }
+    exit
 }
 
 fn run_command(args: CliArgs) -> i32 {
@@ -669,17 +755,17 @@ fn run_command(args: CliArgs) -> i32 {
             value["id"] = json!(REQUEST_ID);
             value
         }
-        Err(err) => {
-            eprintln!("mtyx: {}", err.0);
-            return 2;
-        }
+        Err(err) => return cli_error(args.global.json, 2, &format!("mtyx: {}", err.0)),
     };
     let socket_path = resolve_socket(&args.global);
     let mut stream = match transport::connect(&socket_path) {
         Ok(stream) => stream,
         Err(err) => {
-            eprintln!("cannot connect to session socket {}: {err}", socket_path.display());
-            return 3;
+            return cli_error(
+                args.global.json,
+                3,
+                &format!("cannot connect to session socket {}: {err}", socket_path.display()),
+            );
         }
     };
     if args.verb.stream {
@@ -698,19 +784,17 @@ fn run_command(args: CliArgs) -> i32 {
     let mut line = match serde_json::to_vec(&request) {
         Ok(line) => line,
         Err(err) => {
-            eprintln!("failed to encode request: {err}");
-            return 2;
+            return cli_error(args.global.json, 2, &format!("failed to encode request: {err}"));
         }
     };
     line.push(b'\n');
     if let Err(err) = stream.write_all(&line) {
-        eprintln!("transport error: {err}");
-        return 3;
+        return cli_error(args.global.json, 3, &format!("transport error: {err}"));
     }
 
     let mut reader = BufReader::new(stream);
     if args.verb.stream {
-        run_stream(reader)
+        run_stream(reader, args.global.json)
     } else {
         run_one_response(&mut reader, args.global.json, args.verb.print)
     }
@@ -739,22 +823,13 @@ fn run_one_response(
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
-            Ok(0) => {
-                eprintln!("transport closed before response");
-                return 3;
-            }
+            Ok(0) => return cli_error(json_output, 3, "transport closed before response"),
             Ok(_) => {}
-            Err(err) => {
-                eprintln!("transport error: {err}");
-                return 3;
-            }
+            Err(err) => return cli_error(json_output, 3, &format!("transport error: {err}")),
         }
         let value = match serde_json::from_str::<Value>(&line) {
             Ok(value) => value,
-            Err(err) => {
-                eprintln!("bad response: {err}");
-                return 3;
-            }
+            Err(err) => return cli_error(json_output, 3, &format!("bad response: {err}")),
         };
         if value.get("event").is_some() {
             continue;
@@ -763,7 +838,13 @@ fn run_one_response(
     }
 }
 
-fn run_stream(mut reader: BufReader<Box<dyn transport::Stream>>) -> i32 {
+/// Issue #98: `json_output` threads the `--json` flag through so a
+/// server-reported error on a streaming verb surfaces as the envelope
+/// too. Behaviour is otherwise unchanged: the loop keeps streaming
+/// until the transport closes; on a closed stdout pipe the process now
+/// ends quietly via SIGPIPE (see `reset_sigpipe_default` in main.rs)
+/// instead of panicking inside `println!`.
+fn run_stream(mut reader: BufReader<Box<dyn transport::Stream>>, json_output: bool) -> i32 {
     let mut line = String::new();
     loop {
         if crate::shutdown_requested() {
@@ -774,12 +855,10 @@ fn run_stream(mut reader: BufReader<Box<dyn transport::Stream>>) -> i32 {
                 if line.is_empty() {
                     return 0;
                 }
-                eprintln!("transport closed with partial stream line");
-                return 3;
+                return cli_error(json_output, 3, "transport closed with partial stream line");
             }
             Ok(_) if !line.ends_with('\n') => {
-                eprintln!("transport closed with partial stream line");
-                return 3;
+                return cli_error(json_output, 3, "transport closed with partial stream line");
             }
             Ok(_) => {}
             Err(err)
@@ -787,17 +866,11 @@ fn run_stream(mut reader: BufReader<Box<dyn transport::Stream>>) -> i32 {
             {
                 continue;
             }
-            Err(err) => {
-                eprintln!("transport error: {err}");
-                return 3;
-            }
+            Err(err) => return cli_error(json_output, 3, &format!("transport error: {err}")),
         }
         let value = match serde_json::from_str::<Value>(&line) {
             Ok(value) => value,
-            Err(err) => {
-                eprintln!("bad stream line: {err}");
-                return 3;
-            }
+            Err(err) => return cli_error(json_output, 3, &format!("bad stream line: {err}")),
         };
         if value.get("event").is_some() {
             print!("{}", line.trim_end_matches(['\r', '\n']));
@@ -817,16 +890,16 @@ fn run_stream(mut reader: BufReader<Box<dyn transport::Stream>>) -> i32 {
             continue;
         }
         let error = value.get("error").and_then(Value::as_str).unwrap_or("unknown error");
-        eprintln!("{error}");
-        return 1;
+        return cli_error(json_output, 1, error);
     }
 }
 
 fn print_response(value: &Value, json_output: bool, print_human: PrintFn) -> i32 {
     if value.get("ok").and_then(Value::as_bool) != Some(true) {
         let error = value.get("error").and_then(Value::as_str).unwrap_or("unknown error");
-        eprintln!("{error}");
-        return 1;
+        // Issue #98: a server-reported error under `--json` is the
+        // envelope, not a bare stderr string (non-JSON output unchanged).
+        return cli_error(json_output, 1, error);
     }
     let data = value.get("data").unwrap_or(&Value::Null);
     let mut stdout = io::stdout();
@@ -1115,6 +1188,8 @@ pub(crate) fn rewrite_pane_worktree_alias(args: &mut Vec<String>) {
     while i < args.len() {
         match args[i].as_str() {
             "--socket" | "--session" => i += 2,
+            // Issue #98: `--flag=value` spellings of the global flags.
+            arg if arg.starts_with("--socket=") || arg.starts_with("--session=") => i += 1,
             "--json" => i += 1,
             "pane"
                 if args.get(i + 1).map(String::as_str) == Some("worktree")
@@ -1158,6 +1233,8 @@ pub(crate) fn resolve_verb_alias(args: &mut [String]) {
     while i < args.len() {
         match args[i].as_str() {
             "--socket" | "--session" => i += 2,
+            // Issue #98: `--flag=value` spellings of the global flags.
+            arg if arg.starts_with("--socket=") || arg.starts_with("--session=") => i += 1,
             "--json" => i += 1,
             arg => {
                 if let Some((_, canonical)) = VERB_ALIASES.iter().find(|(a, _)| *a == arg) {
@@ -1777,11 +1854,14 @@ pub(crate) fn select_workspace_remote(
     }
 }
 
+/// `kill-session` targets are matched EXACTLY, case-sensitively (issue
+/// #98 AC3): the socket/pid paths are built verbatim from the given
+/// name, so `mtyx kill-session --session Main` fails cleanly when only
+/// `main` exists — there is deliberately no case-insensitive fallback.
 fn run_kill_session(global: &GlobalArgs, flags: &FlagMap) -> i32 {
     let target_session = flags.optional("session").or_else(|| global.session.clone());
     let Some(session_name) = target_session else {
-        eprintln!("mtyx: --session is required");
-        return 2;
+        return cli_error(global.json, 2, "mtyx: --session is required");
     };
 
     let dir = get_runtime_dir(global);
@@ -1789,8 +1869,7 @@ fn run_kill_session(global: &GlobalArgs, flags: &FlagMap) -> i32 {
     let pid_p = dir.join(format!("{session_name}.pid"));
 
     if !sock_path.exists() && !pid_p.exists() {
-        eprintln!("mtyx: session {session_name:?} not found");
-        return 1;
+        return cli_error(global.json, 1, &format!("mtyx: session {session_name:?} not found"));
     }
 
     let pid = read_pid_file(&pid_p);
@@ -2835,5 +2914,117 @@ mod tests {
         let mut args = vec!["--headless".to_string()];
         resolve_verb_alias(&mut args);
         assert_eq!(args, vec!["--headless".to_string()]);
+    }
+
+    // --- issue #98: flag order, `=` forms, `--` passthrough, envelope ---
+
+    fn parse_ok(args: &[&str]) -> CliArgs {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        match parse(&owned) {
+            Ok(Parsed::Command(args)) => args,
+            _ => panic!("parse({args:?}) did not yield a command"),
+        }
+    }
+
+    fn parse_err(args: &[&str]) -> String {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        match parse(&owned) {
+            Err(UsageError(msg)) => msg,
+            _ => panic!("parse({args:?}) should have errored"),
+        }
+    }
+
+    /// AC2: `--flag value` and `--flag=value` land in the same FlagMap
+    /// slot, for both verb flags and the global --socket/--session.
+    #[test]
+    fn parse_accepts_space_and_equals_flag_forms() {
+        let spaced = parse_ok(&["read-screen", "--surface", "7"]);
+        assert_eq!(spaced.flags.values.get("surface").map(String::as_str), Some("7"));
+
+        let equals = parse_ok(&["read-screen", "--surface=7"]);
+        assert_eq!(equals.flags.values.get("surface").map(String::as_str), Some("7"));
+
+        // A value may itself contain '=' (the first '=' splits).
+        let env = parse_ok(&["new-tab", "--env=A=B,C=D"]);
+        assert_eq!(env.flags.values.get("env").map(String::as_str), Some("A=B,C=D"));
+
+        // Global flags accept the equals form too, before or after the verb.
+        let global = parse_ok(&["--socket=/tmp/x.sock", "identify"]);
+        assert_eq!(global.global.socket, Some(PathBuf::from("/tmp/x.sock")));
+        let after = parse_ok(&["identify", "--session=work"]);
+        assert_eq!(after.global.session.as_deref(), Some("work"));
+
+        // Bare-bool valued forms keep their value (`--group=0` is false).
+        let group = parse_ok(&["close-workspace", "--workspace=1", "--group=0"]);
+        assert_eq!(group.flags.optional_bool("group"), Some(false));
+    }
+
+    /// AC2: flags parse identically before and after the positional
+    /// (screenshot's <file> is the one positional-taking verb).
+    #[test]
+    fn parse_flags_in_any_position_relative_to_positional() {
+        for argv in [
+            vec!["screenshot", "--surface", "3", "out.png"],
+            vec!["screenshot", "out.png", "--surface", "3"],
+            vec!["screenshot", "--surface=3", "out.png"],
+            vec!["screenshot", "out.png", "--surface=3"],
+        ] {
+            let parsed = parse_ok(&argv);
+            assert_eq!(
+                parsed.flags.values.get("surface").map(String::as_str),
+                Some("3"),
+                "{argv:?}"
+            );
+            assert_eq!(
+                parsed.flags.values.get("output").map(String::as_str),
+                Some("out.png"),
+                "{argv:?}"
+            );
+        }
+        // Passing both the positional and --output is still an error,
+        // whichever way round they appear.
+        assert!(parse_err(&["screenshot", "out.png", "--output", "other.png"])
+            .contains("duplicate flag --output"));
+        assert!(parse_err(&["screenshot", "--output", "other.png", "out.png"]).contains("once"));
+    }
+
+    /// AC3: a bare `--` ends flag parsing — everything after it is a
+    /// positional, even flag-shaped tokens, global-flag names, and
+    /// `--exec` (which only means exec-argv in its `--exec --` form).
+    #[test]
+    fn parse_dashdash_makes_following_tokens_positional() {
+        let parsed = parse_ok(&["screenshot", "--surface=1", "--", "--weird.png"]);
+        assert_eq!(parsed.flags.values.get("output").map(String::as_str), Some("--weird.png"));
+
+        // `--json` after `--` is a positional, not the global flag.
+        let parsed = parse_ok(&["screenshot", "--", "--json"]);
+        assert!(!parsed.global.json);
+        assert_eq!(parsed.flags.values.get("output").map(String::as_str), Some("--json"));
+
+        // A verb with no positional slot rejects the token as an
+        // unexpected ARGUMENT (not an unknown FLAG).
+        let err = parse_err(&["read-screen", "--surface=1", "--", "--weird"]);
+        assert!(err.contains("unexpected argument"), "got {err:?}");
+
+        // `--exec` after `--` is a positional too, never the exec form.
+        let err = parse_err(&["new-tab", "--", "--exec", "ls"]);
+        assert!(err.contains("unexpected argument"), "got {err:?}");
+
+        // The `--exec -- <argv>` form is untouched (issue #76).
+        let parsed = parse_ok(&["new-tab", "--exec", "--", "ls", "-la"]);
+        assert_eq!(parsed.flags.exec.as_deref(), Some(&["ls".to_string(), "-la".to_string()][..]));
+    }
+
+    /// AC4: the --json error envelope carries ok:false plus the exit
+    /// code and message.
+    #[test]
+    fn error_envelope_carries_code_and_message() {
+        let envelope = error_envelope(2, "unknown flag --file for agent-read");
+        assert_eq!(envelope["ok"].as_bool(), Some(false));
+        assert_eq!(envelope["error"]["code"].as_i64(), Some(2));
+        assert_eq!(
+            envelope["error"]["message"].as_str(),
+            Some("unknown flag --file for agent-read")
+        );
     }
 }

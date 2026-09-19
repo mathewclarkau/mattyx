@@ -5,6 +5,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::symlink;
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
@@ -2275,12 +2276,23 @@ fn pane_worktree_create_failure_returns_exit_1_and_cwd_unchanged() {
     assert_eq!(
         failed.status.code(),
         Some(1),
-        "git failure must surface as exit 1 (AC7), got {:?}\nstderr: {}",
+        "git failure must surface as exit 1 (AC7), got {:?}\nstdout:\n{}\nstderr: {}",
         failed.status.code(),
+        String::from_utf8_lossy(&failed.stdout),
         String::from_utf8_lossy(&failed.stderr)
     );
-    assert!(String::from_utf8_lossy(&failed.stderr).contains("not a valid branch name"));
-    assert!(failed.stdout.is_empty(), "no JSON on failure");
+    // Issue #98: under --json a server-reported error is the structured
+    // {"ok":false,"error":{...}} envelope on stdout (was: bare stderr
+    // string) — the git failure text rides error.message.
+    let envelope: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap_or_else(|e| {
+        panic!("envelope not JSON ({e}): {}", String::from_utf8_lossy(&failed.stdout))
+    });
+    assert_eq!(envelope["ok"].as_bool(), Some(false));
+    assert_eq!(envelope["error"]["code"].as_i64(), Some(1));
+    assert!(envelope["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("not a valid branch name"));
 
     // Pane cwd unchanged (AC7) and no record was kept.
     assert_eq!(pane_cwds(&server), before, "pane cwd must be unchanged after failure");
@@ -4833,4 +4845,202 @@ mod legacy_socket_fallback {
 
         let _ = fs::remove_dir_all(&base);
     }
+}
+
+// --- issue #98: CLI ergonomics batch --------------------------------------
+// (flag order / `=` forms, SIGPIPE pipe-close, `--` passthrough +
+// case-sensitive kill, structured --json errors)
+
+/// AC2: `--flag value` and `--flag=value` are interchangeable, and
+/// flags parse the same before or after the positional. The screenshot
+/// verb is the positional-taking one: every spelling must produce a
+/// file whose bytes equal `read-screen`'s stdout.
+#[test]
+fn flag_forms_and_orders_produce_the_same_request() {
+    let server = HeadlessServer::start("flag-forms");
+    let ws = cli(&server, &["new-workspace", "--name", "flag-forms"]);
+    assert_success(&ws);
+    let surface: u64 = String::from_utf8(ws.stdout).unwrap().trim().parse().unwrap();
+    let send = cli(
+        &server,
+        &["send", "--surface", &surface.to_string(), "--text", "printf 'ff-marker\n'\n"],
+    );
+    assert_success(&send);
+    let screen = wait_for_screen(&server, surface, "ff-marker");
+    assert!(screen.contains("ff-marker"));
+
+    // The two read-screen spellings agree byte-for-byte.
+    let spaced = cli(&server, &["read-screen", "--surface", &surface.to_string()]);
+    assert_success(&spaced);
+    let equals = cli(&server, &["read-screen", &format!("--surface={surface}")]);
+    assert_success(&equals);
+    assert_eq!(spaced.stdout, equals.stdout);
+    assert!(!spaced.stdout.is_empty(), "screen must have content to compare against");
+
+    // Every screenshot flag order writes the same bytes as read-screen.
+    // The `--` case doubles as AC3: `--weird.png` is a positional, not a
+    // flag (and `--surface=N` before it still parses). The screenshot
+    // runner prints the path it wrote (relative, as given), so run it
+    // with cwd = the server's temp dir and read the file back from there.
+    let surface_str = surface.to_string();
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        (
+            "flag-then-positional",
+            vec!["screenshot".into(), "--surface".into(), surface_str.clone(), "out1.png".into()],
+        ),
+        (
+            "positional-then-flag",
+            vec!["screenshot".into(), "out2.png".into(), "--surface".into(), surface_str.clone()],
+        ),
+        (
+            "equals-form",
+            vec!["screenshot".into(), format!("--surface={surface}"), "out3.png".into()],
+        ),
+        (
+            "dashdash-positional",
+            vec![
+                "screenshot".into(),
+                format!("--surface={surface}"),
+                "--".into(),
+                "--weird.png".into(),
+            ],
+        ),
+    ];
+    for (tag, argv) in &cases {
+        let out = Command::new(bin())
+            .args(["--socket"])
+            .arg(&server.socket)
+            .args(argv)
+            .current_dir(&server.dir)
+            .env_remove("MTYX_MUX_SOCKET")
+            .env_remove("CMUX_MUX_SOCKET")
+            .output()
+            .unwrap();
+        assert_success(&out);
+        let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let path = server.dir.join(&printed);
+        let written = fs::read(&path).unwrap_or_else(|e| panic!("{tag}: read {path:?}: {e}"));
+        assert_eq!(written, spaced.stdout, "{tag}: file bytes must equal read-screen stdout");
+    }
+
+    // A flag-shaped token after `--` for a verb with no positional slot
+    // is an unexpected ARGUMENT (exit 2), not an unknown flag.
+    let dash = cli(&server, &["read-screen", "--surface", &surface.to_string(), "--", "--weird"]);
+    assert_eq!(dash.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&dash.stderr).contains("unexpected argument"));
+}
+
+/// AC1: a closed downstream pipe must end the CLI quietly — SIGPIPE
+/// (the shell's 141), never a Rust panic (exit 101). The read end of
+/// the pipe is dropped before mtyx's first stdout write (it still has a
+/// socket round trip to do), so the write hits EPIPE; with the default
+/// SIGPIPE disposition restored at the CLI boundary the kernel ends the
+/// process instead of `println!`/flush panicking.
+#[test]
+fn read_screen_pipe_close_exits_quietly_without_panic() {
+    let server = HeadlessServer::start("sigpipe");
+    let ws = cli(&server, &["new-workspace", "--name", "sigpipe"]);
+    assert_success(&ws);
+    let surface: u64 = String::from_utf8(ws.stdout).unwrap().trim().parse().unwrap();
+    let send = cli(
+        &server,
+        &["send", "--surface", &surface.to_string(), "--text", "printf 'pipe-me\n'\n"],
+    );
+    assert_success(&send);
+    let _ = wait_for_screen(&server, surface, "pipe-me");
+
+    let mut child = Command::new(bin())
+        .args(["--socket"])
+        .arg(&server.socket)
+        .args(["read-screen", "--surface", &surface.to_string()])
+        .env_remove("MTYX_MUX_SOCKET")
+        .env_remove("CMUX_MUX_SOCKET")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Close the read end immediately: the child still owes a socket
+    // round trip before it writes, so this close wins the race and every
+    // stdout byte it later writes fails with EPIPE.
+    drop(child.stdout.take());
+    let status = child.wait().unwrap();
+    assert_ne!(
+        status.code(),
+        Some(101),
+        "a closed pipe must never surface as a Rust panic; status {status:?}"
+    );
+    // And when it is a signal death, it must be SIGPIPE itself (13),
+    // i.e. the shell-convention 141 — not some other failure mode.
+    // (map_or, not is_none_or: the repo keeps to conservative syntax.)
+    assert!(
+        status.signal().map_or(true, |sig| sig == 13),
+        "unexpected terminating signal {status:?}"
+    );
+    // The server must be untouched by the client's pipe death.
+    let identify = cli(&server, &["identify"]);
+    assert_success(&identify);
+}
+
+/// AC3: kill-session matches the session name EXACTLY (case-sensitive):
+/// only "mux" exists (the fixture's socket is mux.sock), so "MUX" must
+/// fail with not-found and leave the session alive to prove it.
+#[test]
+fn kill_session_matches_name_case_sensitively() {
+    let server = HeadlessServer::start("kill-case");
+
+    let wrong = cli(&server, &["kill-session", "--session", "MUX"]);
+    assert_eq!(wrong.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&wrong.stderr).contains("not found"),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&wrong.stderr)
+    );
+
+    // The case-mismatched kill must not have touched the real session.
+    let identify = cli(&server, &["identify"]);
+    assert_success(&identify);
+    assert!(server.socket.exists(), "live socket must survive a wrong-case kill");
+}
+
+/// AC4: with `--json`, CLI errors return a machine-readable
+/// {"ok":false,"error":{...}} envelope on stdout with the usual nonzero
+/// exit — both client-side usage errors (unknown flag) and
+/// server-reported ones (unknown agent). Non-JSON output is unchanged:
+/// the bare human string on stderr, nothing on stdout.
+#[test]
+fn json_errors_return_structured_envelope() {
+    let server = HeadlessServer::start("json-envelope");
+
+    // Usage error (--file is not an agent-read flag): exit 2 + envelope,
+    // wherever --json sits on the line (the parse aborts before the
+    // flag is recorded, so the raw argv is scanned).
+    for argv in [
+        vec!["agent-read", "--file", "/nope", "--json"],
+        vec!["--json", "agent-read", "--file", "/nope"],
+    ] {
+        let out = cli(&server, &argv);
+        assert_eq!(out.status.code(), Some(2), "argv {argv:?}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!("argv {argv:?}: stdout not JSON: {e}: {}", String::from_utf8_lossy(&out.stdout))
+        });
+        assert_eq!(value["ok"].as_bool(), Some(false), "argv {argv:?}");
+        assert_eq!(value["error"]["code"].as_i64(), Some(2), "argv {argv:?}");
+        assert!(
+            value["error"]["message"].as_str().unwrap_or("").contains("--file"),
+            "argv {argv:?}: envelope {value}"
+        );
+    }
+
+    // Server-reported error: exit 1 + envelope.
+    let unknown = cli(&server, &["--json", "agent-read", "--target", "nosuch-agent"]);
+    assert_eq!(unknown.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&unknown.stdout).unwrap();
+    assert_eq!(value["ok"].as_bool(), Some(false));
+    assert_eq!(value["error"]["code"].as_i64(), Some(1));
+    assert!(value["error"]["message"].as_str().unwrap_or("").contains("unknown agent"));
+
+    // Non-JSON errors are unchanged: human string on stderr, empty stdout.
+    let human = cli(&server, &["agent-read", "--target", "nosuch-agent"]);
+    assert_eq!(human.status.code(), Some(1));
+    assert!(human.stdout.is_empty(), "non-JSON errors keep stdout clean");
+    assert!(String::from_utf8_lossy(&human.stderr).contains("unknown agent"));
 }

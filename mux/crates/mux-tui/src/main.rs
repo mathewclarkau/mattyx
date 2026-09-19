@@ -85,6 +85,29 @@ pub(crate) fn shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(Ordering::Acquire)
 }
 
+/// Issue #98: restore the default SIGPIPE disposition for
+/// control-socket CLI invocations. Rust starts with SIGPIPE ignored, so
+/// a write to a pipe whose reader exited (`mtyx read-screen --surface X
+/// | head -1`) surfaces as an EPIPE error — and through `println!`
+/// (list-sessions, subscribe, the JSON envelopes) as a panic, exit
+/// 101. With the default disposition the kernel ends the process
+/// quietly with SIGPIPE instead (the shell's 141, matching `head`'s own
+/// convention). Installed only on the CLI paths (cli::run and the
+/// --session-list --json dump): the TUI/server keep SIG_IGN so a dead
+/// client socket stays a handled EPIPE error, never a signal death,
+/// and PTY children spawned in server mode inherit an unchanged
+/// disposition. A no-op on Windows, where a closed pipe is a regular
+/// write error.
+#[cfg(unix)]
+pub(crate) fn reset_sigpipe_default() {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn reset_sigpipe_default() {}
+
 /// Install the terminate-shutdown hook: SIGTERM/SIGINT/SIGHUP on unix;
 /// CTRL_C/CTRL_BREAK/CTRL_CLOSE via `SetConsoleCtrlHandler` on Windows
 /// (routed to the same `SHUTDOWN_REQUESTED` flag, so the shutdown path
@@ -215,6 +238,15 @@ CLI VERBS
   layout-export-all, theme list,
   pane-worktree-create, pane-worktree-list, pane-worktree-remove
       (also spelled `mtyx pane worktree <create|list|remove>`; issue #77)
+
+FLAG SYNTAX (issue #98)
+  Every verb flag accepts `--flag value` and `--flag=value`
+  interchangeably, in any position relative to positionals (so
+  `screenshot <file> --surface 1` and `--surface 1 <file>` are the
+  same command). A bare `--` ends flag parsing: everything after it
+  is a positional, never a flag. With `--json`, errors return a
+  machine-readable `{\"ok\":false,\"error\":{...}}` envelope on stdout
+  (exit codes unchanged).
 
 SHORTHAND ALIASES (issue #91)
   ls -> list-workspaces    new -> new-workspace    at -> attach
@@ -601,6 +633,10 @@ fn main() {
     while command_index < raw_args.len() {
         match raw_args[command_index].as_str() {
             "--session" | "--socket" => command_index += 2,
+            // Issue #98: `--flag=value` spellings of the global flags.
+            arg if arg.starts_with("--socket=") || arg.starts_with("--session=") => {
+                command_index += 1
+            }
             "--json" => command_index += 1,
             _ => break,
         }
@@ -679,6 +715,10 @@ fn main() {
             json: args.json,
         };
         if args.json {
+            // Issue #98: this dump is stdout payload too — pipe-close
+            // must end quietly, like every other CLI path (cli::run
+            // resets it for the verb dispatch; this branch bypasses it).
+            reset_sigpipe_default();
             std::process::exit(cli::run_attach_session_list_json(&global));
         }
         // Interactive picker (Claims 2-7). It restores the terminal on every
