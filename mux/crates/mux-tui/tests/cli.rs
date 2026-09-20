@@ -2834,6 +2834,96 @@ impl Drop for SymlinkSkillFixture {
     }
 }
 
+/// Issue #107: a non-headless `mtyx` start must leave a session daemon
+/// running after the TUI process exits, so attach/identify still work.
+#[test]
+fn local_start_leaves_daemon_after_client_exits() {
+    let dir = unique_temp_dir("detach-107");
+    fs::create_dir_all(&dir).unwrap();
+    let name = "detach107";
+    let socket = dir.join(format!("{name}.sock"));
+    let mut client = Command::new(bin())
+        .args(["--session", name, "--socket"])
+        .arg(&socket)
+        .env("XDG_STATE_HOME", &dir)
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env("SHELL", "/bin/sh")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        if mux_core::server::is_session_socket_live(&socket) {
+            ready = true;
+            break;
+        }
+        if let Ok(Some(status)) = client.try_wait() {
+            let err = client.stderr.take().map(drain_stderr).unwrap_or_default();
+            let _ = fs::remove_dir_all(&dir);
+            panic!("client exited before the daemon socket was live: {status}; stderr:\n{err}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if !ready {
+        let _ = client.kill();
+        let _ = client.wait();
+        let _ = fs::remove_dir_all(&dir);
+        panic!("daemon did not become live at {}", socket.display());
+    }
+
+    // Tear down only the TUI client. SIGKILL skips raw-mode teardown; the
+    // daemon is a setsid child and must survive.
+    let _ = client.kill();
+    let _ = client.wait();
+
+    assert!(
+        mux_core::server::is_session_socket_live(&socket),
+        "session socket must survive TUI exit (issue #107)"
+    );
+
+    let identify = Command::new(bin())
+        .args(["--socket"])
+        .arg(&socket)
+        .arg("identify")
+        .output()
+        .unwrap();
+    if !identify.status.success() {
+        let _ = Command::new(bin())
+            .args(["--socket"])
+            .arg(&socket)
+            .args(["kill-session", "--session", name])
+            .status();
+        let _ = fs::remove_dir_all(&dir);
+        panic!(
+            "identify against surviving session failed: status {:?} stdout {:?} stderr {:?}",
+            identify.status,
+            String::from_utf8_lossy(&identify.stdout),
+            String::from_utf8_lossy(&identify.stderr)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&identify.stdout);
+    assert!(stdout.contains("mtyx session="), "identify stdout: {stdout}");
+
+    let kill = Command::new(bin())
+        .args(["--socket"])
+        .arg(&socket)
+        .args(["kill-session", "--session", name])
+        .output()
+        .unwrap();
+    assert_success(&kill);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn drain_stderr(mut stderr: impl std::io::Read) -> String {
+    let mut buf = String::new();
+    let _ = stderr.read_to_string(&mut buf);
+    buf
+}
+
 #[test]
 fn list_sessions_lists_active_headless_session() {
     let dir = unique_temp_dir("list-sess");

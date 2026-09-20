@@ -1515,8 +1515,9 @@ impl App {
                 return Ok(RenderAction::Draw);
             }
             Action::Detach => {
-                // Local sessions end with the TUI; remote sessions keep
-                // running server-side (detach).
+                // Issue #107: the interactive TUI is always a client of a
+                // session daemon, so quitting here detaches. `kill-session`
+                // is the verb that actually ends the daemon.
                 self.quit = true;
                 return Ok(RenderAction::None);
             }

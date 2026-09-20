@@ -11,7 +11,7 @@ cargo build -p mux-tui
 
 ## Local session
 
-A normal run starts an in-process mux, opens the TUI, and serves the control socket.
+A normal run starts a **detached session daemon** and attaches the TUI as a client.
 
 ```bash
 cd mux
@@ -19,7 +19,7 @@ cargo run -p mux-tui
 cargo run -p mux-tui -- --session agents
 ```
 
-The default session is `main`. Quitting a local TUI shuts down that in-process session and removes its socket.
+The default session is `main`. If a session with that name is already live, `mtyx` attaches to it instead of starting a second daemon. Prefix `d` (`Ctrl-b d`) detaches the TUI; the daemon keeps running. Re-run `mtyx` (or `mtyx attach`) to reconnect. `mtyx kill-session` ends the daemon.
 
 Use `--term <value>` to set `TERM` for child PTYs. Without it, children get `xterm-256color`; the surface layer also honors `MTYX_MUX_TERM` when no CLI value is supplied.
 
@@ -39,7 +39,7 @@ cd mux
 cargo run -p mux-tui -- attach --session agents
 ```
 
-Detach from an attached TUI with prefix `d`. With default keys, that is `Ctrl-b d`. The server keeps running, and another `attach` reconnects to the same tree. PTY tabs attach with a Ghostty VT-state replay followed by a live output stream.
+Detach from an attached TUI with prefix `d`. With default keys, that is `Ctrl-b d`. The server keeps running, and another `attach` (or a plain `mtyx --session <name>`) reconnects to the same tree. PTY tabs attach with a Ghostty VT-state replay followed by a live output stream. `--headless` is still the foreground-server form used by scripts, systemd, and the daemon child that a normal `mtyx` start launches.
 
 ### SSH and remote attach with local config
 

@@ -142,7 +142,7 @@ The default launched profile is `~/Library/Application Support/mtyx/chrome-profi
 | `keys.resize-shrink` | chord string or array or `"none"` | `"alt+-"` | Shrink the focused split |
 | `keys.scroll-up` | chord string or array or `"none"` | `"pageup"` | Scroll active PTY up 10 rows |
 | `keys.scroll-down` | chord string or array or `"none"` | `"pagedown"` | Scroll active PTY down 10 rows |
-| `keys.detach` | chord string or array or `"none"` | `"d"` | Quit local TUI or detach attached TUI |
+| `keys.detach` | chord string or array or `"none"` | `"d"` | Detach the TUI (session daemon keeps running) |
 
 Each action override replaces all default chords for that action. Values may be a string, an array of strings, or `"none"`. Non-string array entries are ignored. Set `keys.alt_shortcuts` to `false` to remove default Alt chords before applying user overrides; explicitly configured Alt chords still work. Prefix `1` through `9` stay fixed to tab selection.
 

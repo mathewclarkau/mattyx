@@ -66,9 +66,10 @@ commit; local changes are layered on top so a fresh clone can always fetch it), 
 ### Run it
 
 ```bash
-mtyx                          # start a session named "main" (TUI + control socket)
+mtyx                          # start (or attach to) session "main"
 mtyx --session agents         # start (or attach to) a differently-named session
 mtyx attach --session agents  # attach a second TUI to an already-running session
+# Ctrl-b d detaches; the session daemon keeps running. mtyx kill-session ends it.
 ```
 
 See [`mux/docs/getting-started.md`](./mux/docs/getting-started.md) for headless mode, socket paths, and session

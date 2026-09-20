@@ -715,18 +715,25 @@ tabs_after = sum(
 assert tabs_after == tabs_before - 1, (tabs_before, tabs_after, tree())
 print("right-click menu -> close tab ok")
 
-# Prefix + d: quit.
+# Prefix + d: detach (issue #107). The TUI client exits; the session daemon
+# keeps the control socket so a later attach can reconnect.
 os.write(fd, b"\x02d")
 deadline = time.time() + 5
 while time.time() < deadline:
     done, status = os.waitpid(pid, os.WNOHANG)
     if done:
-        print("clean quit, status", status)
+        print("clean detach, status", status)
         break
     drain(0.2)
 else:
     os.kill(pid, signal.SIGKILL)
-    raise SystemExit("TUI did not quit on prefix-d")
+    raise SystemExit("TUI did not detach on prefix-d")
+
+assert os.path.exists(SOCK), f"session socket must survive detach at {SOCK}"
+ident = rpc({"id": 1, "cmd": "identify"})
+assert ident.get("ok") and ident.get("data", {}).get("app") == "mtyx", ident
+print("prefix-d detaches, session remains ok")
+subprocess.run([BIN, "kill-session", "--session", SESSION], check=False)
 
 assert not os.path.exists(SOCK), "socket not cleaned up"
 print("socket cleanup ok")

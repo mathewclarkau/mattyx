@@ -10,7 +10,7 @@ Unknown prefixed keys are swallowed. Unprefixed non-Alt keys go to the active su
 
 mtyx's default prefix is `Ctrl-b` - the same as tmux's own default. If you run tmux
 inside a mtyx pane, mtyx's outer prefix always wins: `Ctrl-b d`, for example, detaches
-(or, in a local non-attached session, quits) the *mtyx* session, not the inner tmux
+the *mtyx* TUI (the session daemon keeps running), not the inner tmux
 one, since mtyx consumes the prefix before tmux ever sees it. Two ways to avoid this:
 
 - **Rebind one side's prefix.** Either give mtyx a different prefix in `mux.json`
@@ -62,7 +62,7 @@ These defaults come from `Keys::default`.
 | `Alt--` | Shrink the focused split |
 | `Ctrl-b PageUp` | Scroll the active PTY viewport up 10 rows |
 | `Ctrl-b PageDown` | Scroll the active PTY viewport down 10 rows |
-| `Ctrl-b d` | Quit a local TUI or detach an attached TUI |
+| `Ctrl-b d` | Detach the TUI; the session daemon keeps running |
 
 The screen bindings intentionally use tmux verbs: `c` creates a screen, `n` and `p` switch screens, `&` closes a screen, and `,` renames a screen. Tabs use `t`, `Tab`, `BackTab`, fixed number selectors, and tab-bar mouse actions.
 

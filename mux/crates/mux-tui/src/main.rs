@@ -3,8 +3,11 @@
 //! Runs the mux core (workspaces → split panes → tabs on real PTYs,
 //! terminal state from libghostty-vt) with a Ratatui frontend, and always
 //! exposes the JSON control socket so external frontends can attach.
-//! `mtyx attach` connects the same TUI to an existing (usually
-//! headless) session over that socket, which is how detach/reattach works.
+//! A normal `mtyx` start spawns a detached headless daemon (or reuses a
+//! live one) and attaches the TUI as a client, so prefix `d` detaches
+//! without killing the session (issue #107). `mtyx attach` is the same
+//! client path against an already-running socket. `--headless` is the
+//! foreground server used by scripts and the daemon child itself.
 
 mod agents;
 mod aider_hook;
@@ -152,7 +155,7 @@ const USAGE: &str = "\
 mtyx - terminal multiplexer backed by libghostty-vt
 
 USAGE:
-  mtyx [OPTIONS]           Start a session (TUI + control socket)
+  mtyx [OPTIONS]           Start a session daemon and attach the TUI (or attach if live)
   mtyx attach [OPTIONS]    Attach to an existing session's socket
   mtyx <verb> [OPTIONS]    Run one control-socket command
   mtyx workspace-color <name> <color>  Set a named workspace colour
@@ -214,7 +217,7 @@ KEYS (prefix: Ctrl-b)
   %  split right       \"  split down          x    close tab
   ,  rename pane       $    rename workspace
   Tab  next screen     S    session manager
-  h/j/k/l or arrows    move focus              d    quit (attach: detach)
+  h/j/k/l or arrows    move focus              d    detach (session keeps running)
   w  next workspace    W    new workspace       s    toggle sidebar
   <  browser back      >    browser forward     r/u  browser reload/edit URL
   ?  show key binding help
@@ -950,10 +953,13 @@ fn show_local_config_resolution(args: Args) {
 }
 
 fn run_server(args: Args) -> anyhow::Result<()> {
-    // Snapshot before any field is moved: a session-manager reattach
-    // (RunOutcome::Reattach) re-dispatches into run_attach with the chosen
-    // socket, carrying the local config overlay over.
-    let original_args = args.clone();
+    // Issue #107: an interactive (non-headless) start is a client. Spawn
+    // or reuse a detached daemon, then attach, so prefix `d` leaves the
+    // session running. `--headless` keeps the in-process server path.
+    if !args.headless {
+        return run_local_client(args);
+    }
+
     // Issue #28: inherit orphaned pane grandchildren so mux.shutdown()
     // can reap them instead of leaving them under PID 1.
     let _ = mux_core::process::set_child_subreaper();
@@ -1031,25 +1037,7 @@ fn run_server(args: Args) -> anyhow::Result<()> {
     // SIGKILL (handlers/atexit never run). Harmless no-op on graceful exit.
     socket_watchdog::spawn(std::process::id(), &socket_path);
 
-    let result = if args.headless {
-        run_headless(&mux, &socket_path).map(|()| app::RunOutcome::Done)
-    } else {
-        run_tui(Session::Local(mux.clone()), args.session.clone(), None, None)
-    };
-    if let Ok(app::RunOutcome::Reattach(socket)) = &result {
-        // The session-manager overlay asked to switch the TUI to another
-        // session. Keep THIS local server alive (headless) so the user can
-        // return to it later — skip shutdown/cleanup — and re-dispatch into
-        // the attach path against the chosen socket. (On a reattach from a
-        // local session the local server survives as a headless daemon.)
-        let mut attach_args = original_args.clone();
-        if let Some(session) = socket.file_stem().and_then(|s| s.to_str()) {
-            attach_args.session = session.to_string();
-        }
-        attach_args.socket = Some(socket.clone());
-        attach_args.attach = true;
-        return run_attach(attach_args, Some(socket_path.clone()));
-    }
+    let result = run_headless(&mux, &socket_path);
     mux.shutdown();
     // Issue #28: after known surfaces are killed, sweep anything that
     // reparented to us via PR_SET_CHILD_SUBREAPER (grandchildren whose
@@ -1059,7 +1047,31 @@ fn run_server(args: Args) -> anyhow::Result<()> {
         mux_core::process::kill_remaining_children();
     }
     mux_core::server::cleanup(&mux.socket_path().unwrap_or_else(|| socket_path.clone()));
-    result.map(|_| ())
+    result
+}
+
+/// Issue #107: interactive `mtyx` is always a client. If a session is
+/// already live, attach to it; otherwise spawn a detached headless
+/// daemon and attach. Prefix `d` then only exits this TUI.
+fn run_local_client(mut args: Args) -> anyhow::Result<()> {
+    let bind_path =
+        args.socket.clone().unwrap_or_else(|| mux_core::server::default_socket_path(&args.session));
+    // Prefer a live legacy-era socket when the canonical path is down
+    // (same probe `run_attach` uses), so a pre-rename daemon is reused
+    // rather than starting a second session beside it.
+    let attach_path =
+        args.socket.clone().unwrap_or_else(|| mux_core::server::client_socket_path(&args.session));
+    if mux_core::server::is_session_socket_live(&attach_path) {
+        args.socket = Some(attach_path);
+    } else {
+        let exe = std::env::current_exe()
+            .context("resolving mtyx executable for session daemon")?;
+        session::ensure_session_daemon(&exe, &args.session, &bind_path, args.term.as_deref())
+            .with_context(|| format!("starting session daemon at {}", bind_path.display()))?;
+        args.socket = Some(bind_path);
+    }
+    args.attach = true;
+    run_attach(args, None)
 }
 
 fn run_tui(
