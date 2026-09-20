@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -91,6 +91,62 @@ pub struct CloseWorkspaceReport {
     pub survivors: Vec<WorktreeChild>,
 }
 
+/// A pane PTY's running process-tree child (issue #85).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadinessChild {
+    pub pid: u32,
+    /// `/proc/<pid>/comm` (argv0 basename, 15-char kernel limit).
+    pub comm: String,
+}
+
+/// Issue #85: read-only post-spawn health of one surface. `ready` is
+/// derived by the caller as `prompt_seen && child.is_some()` so the
+/// two halves stay separately inspectable in the JSON response.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SurfaceReadiness {
+    /// The pane's visible screen shows a recognised prompt, or an agent
+    /// was detected in it.
+    pub prompt_seen: bool,
+    /// The running process-tree child (shell, or the spawned command).
+    pub child: Option<ReadinessChild>,
+}
+
+impl SurfaceReadiness {
+    /// Both halves observed: the shell/agent prompt is up AND a child
+    /// process is actually running.
+    pub fn is_ready(&self) -> bool {
+        self.prompt_seen && self.child.is_some()
+    }
+}
+
+/// Issue #85 shell-prompt fallback for [`Mux::surface_readiness`].
+///
+/// [`crate::agent_state_classify`]'s generic idle markers are `"$ "`,
+/// `"# "`, `"% "`, `"❯ "`, `"λ "` — all ending in a space. The VT
+/// plain formatter runs with `trim: true` (`Terminal::plain_text`), so a
+/// real prompt sitting at the end of its line (`"$ "` with the cursor
+/// after it) reads back as `"$"` and every marker misses. This checks
+/// the last non-blank line's right-trimmed form for a trailing prompt
+/// token instead, which survives the trim. Deliberately conservative:
+/// only well-known prompt terminators count, so ordinary output (e.g. a
+/// line ending in `"3"`) is not mistaken for a prompt.
+fn screen_shows_shell_prompt(text: &str) -> bool {
+    let Some(last) = text.lines().rev().find(|line| !line.trim().is_empty()) else {
+        return false;
+    };
+    let line = last.trim_end();
+    // Single-glyph shell/user prompts at end of line.
+    if line.ends_with('$') || line.ends_with('#') || line.ends_with('%') {
+        return true;
+    }
+    if line.ends_with('❯') || line.ends_with('λ') {
+        return true;
+    }
+    // Agent REPL prompts: `pi> `, `codex>`. These also lose their
+    // trailing space to the trim, so match the token without it.
+    line.ends_with("pi>") || line.ends_with("codex>")
+}
+
 /// The multiplexer. Shared by frontends and the control socket server.
 pub struct Mux {
     state: Mutex<State>,
@@ -134,6 +190,33 @@ pub struct Mux {
     /// from `mux-tui`'s `run_server` after `config::load()`.
     /// `None` means the default `<repo>/../<repo>.<branch>/`.
     worktree_pattern: Mutex<Option<String>>,
+    /// Issue #95: did a client ever attach this run? Set by `subscribe`
+    /// and `attach-surface` on the control socket (the two attach
+    /// handshakes a frontend uses). Together with `workspace_opened` this
+    /// defines a session that is safe to treat as *intentionally* empty at
+    /// shutdown — see [`Self::never_attached`].
+    client_attached: AtomicBool,
+    /// Issue #95: was a workspace ever created this run (including by
+    /// restore)? A daemon that started, restored/created nothing, and
+    /// never saw a client must not let its empty state delete a
+    /// pre-existing non-empty snapshot.
+    workspace_opened: AtomicBool,
+    /// Issue #92: daemon-global monotonic notification id sequence. One
+    /// counter shared by every pane, so a per-client last-read id is a
+    /// single high-water mark (see [`crate::notify::NotificationRecord`]).
+    next_notification_id: AtomicU64,
+    /// Issue #92: per-pane durable notification ring, fed from the same
+    /// place desktop emission happens (the `Surface` OSC watcher) and
+    /// bounded per pane by [`crate::notify::NOTIFICATION_RING_CAPACITY`].
+    notifications: Mutex<HashMap<SurfaceId, crate::notify::NotificationRing>>,
+    /// Issue #92: per-client read state — client id -> surface -> highest
+    /// notification id that client has read. Clients identify on the
+    /// control socket (`subscribe`'s optional `client` field, generated and
+    /// persisted per attach session by the CLI) or via an explicit
+    /// `notify-ack` client value. A request with no client uses the
+    /// empty-string key, so client-less `notify-ack` stays consistent.
+    /// Read state is in-memory only (session lifetime), matching the rings.
+    notification_reads: Mutex<HashMap<String, HashMap<SurfaceId, u64>>>,
 }
 
 impl Mux {
@@ -162,6 +245,11 @@ impl Mux {
             agent_detection: Mutex::new(DetectionSettings::default()),
             custom_agent_patterns: Mutex::new(Vec::new()),
             worktree_pattern: Mutex::new(None),
+            client_attached: AtomicBool::new(false),
+            workspace_opened: AtomicBool::new(false),
+            next_notification_id: AtomicU64::new(1),
+            notifications: Mutex::new(HashMap::new()),
+            notification_reads: Mutex::new(HashMap::new()),
         })
     }
 
@@ -392,19 +480,56 @@ impl Mux {
         crate::platform::session_snapshot_path(&self.session_name())
     }
 
+    /// Issue #95: a session that never saw a client AND never opened a
+    /// workspace this run is *not* an intentionally-emptied session — it is
+    /// a daemon that started and stopped, perhaps having restored nothing,
+    /// or restored and then been torn down before anyone attached. Its
+    /// empty in-memory tree says nothing about the saved snapshot, so the
+    /// shutdown guard must leave that file alone rather than delete it.
+    ///
+    /// By contrast a session that WAS attached (subscribe/attach-surface)
+    /// or had a workspace opened (including by restore) is live: if its
+    /// tree is empty at shutdown, the user/agent really did close
+    /// everything, and the snapshot should be removed so old panes do not
+    /// resurrect.
+    fn never_attached(&self) -> bool {
+        !self.client_attached.load(Ordering::Acquire)
+            && !self.workspace_opened.load(Ordering::Acquire)
+    }
+
+    /// Issue #95: record that a client attached to this session over the
+    /// control socket (`subscribe`/`attach-surface`). Once true it stays
+    /// true for the process lifetime.
+    pub(crate) fn mark_client_attached(&self) {
+        self.client_attached.store(true, Ordering::Release);
+    }
+
     fn write_snapshot(&self) {
+        self.write_snapshot_to(&self.snapshot_path());
+    }
+
+    /// Issue #95: [`Self::write_snapshot`] against an explicit path, so the
+    /// empty-session shutdown guard is testable without touching the real
+    /// per-user state dir.
+    fn write_snapshot_to(&self, path: &Path) {
         let snapshot = self.with_state(crate::persist::capture);
-        let path = self.snapshot_path();
         let result = if snapshot.is_empty() {
-            // An intentionally-emptied session shouldn't resurrect old
-            // panes next time it starts.
-            match std::fs::remove_file(&path) {
+            if self.never_attached() {
+                // Do NOT delete a pre-existing snapshot: nothing this run
+                // gives us the right to. A daemon that started, restored
+                // nothing (or had no config), and shut down before any
+                // client attached leaves the saved session intact.
+                return;
+            }
+            // An intentionally-emptied LIVE session shouldn't resurrect
+            // old panes next time it starts.
+            match std::fs::remove_file(path) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(e),
             }
         } else {
-            snapshot.save(&path)
+            snapshot.save(path)
         };
         if let Err(e) = result {
             self.emit(MuxEvent::Status(format!("session snapshot write failed: {e}")));
@@ -417,8 +542,62 @@ impl Mux {
     /// its recorded cwd (see `persist.rs` for why commands aren't
     /// restored). Call once, right after [`Self::new`], before any other
     /// mutation — it assumes an empty tree.
+    ///
+    /// Issue #87: this is a trust boundary. Before anything is launched,
+    /// the snapshot is `stat`ed and the pure
+    /// [`crate::platform::snapshot_trust_decision`] rules on it. A
+    /// missing file is the ordinary first-run case (silent no-op); a
+    /// foreign owner, a lookup error, or group/other-readable mode is a
+    /// refusal that logs a structured error and launches *nothing*.
     pub fn restore_session(self: &Arc<Self>) {
-        let Some(snapshot) = crate::persist::SessionSnapshot::load(&self.snapshot_path()) else {
+        let path = self.snapshot_path();
+        let decision = crate::platform::snapshot_trust_decision(
+            std::fs::metadata(&path),
+            crate::platform::euid(),
+        );
+        self.restore_session_decided(decision, &path);
+    }
+
+    /// Executes an already-computed [`crate::platform::SnapshotTrustDecision`].
+    /// Split out from [`Self::restore_session`] so the refusal paths —
+    /// and their zero-launch guarantee — are testable without needing a
+    /// second uid or a real foreign-owned file.
+    fn restore_session_decided(
+        self: &Arc<Self>,
+        decision: crate::platform::SnapshotTrustDecision,
+        path: &std::path::Path,
+    ) {
+        use crate::platform::SnapshotTrustDecision as D;
+        match decision {
+            D::Accept => {}
+            D::Absent => return,
+            refused => {
+                let message = match &refused {
+                    D::RejectForeignOwner { uid } => format!(
+                        "refusing to restore session snapshot {}: owned by uid {uid}, not this process",
+                        path.display()
+                    ),
+                    D::RejectWorldReadable { mode } => format!(
+                        "refusing to restore session snapshot {}: permissions {:o} are more permissive than 0600",
+                        path.display(),
+                        mode & 0o7777
+                    ),
+                    D::RejectLookupError => format!(
+                        "refusing to restore session snapshot {}: ownership lookup failed",
+                        path.display()
+                    ),
+                    D::Accept | D::Absent => unreachable!("handled above"),
+                };
+                // Same reasoning as the per-workspace error below:
+                // restore_session runs before the control socket is even
+                // listening, so eprintln! is the only way a headless
+                // daemon's refusal is visible anywhere.
+                eprintln!("mtyx: {message}");
+                self.emit(MuxEvent::Status(message));
+                return;
+            }
+        }
+        let Some(snapshot) = crate::persist::SessionSnapshot::load(path) else {
             return;
         };
         let (workspaces, active_workspace) = crate::persist::workspaces(&snapshot);
@@ -954,6 +1133,10 @@ reattaching to remote session {session_id} on {host} \
         surface: Arc<Surface>,
         name: Option<String>,
     ) -> Arc<Surface> {
+        // Issue #95: opening a workspace (new, remote, or a restore) makes
+        // this a live session, so an empty tree at shutdown means the user
+        // really emptied it.
+        self.workspace_opened.store(true, Ordering::Release);
         let (pane_id, pane) = self.make_pane(surface.id);
         let screen_id = self.next_id();
         let ws_id = self.next_id();
@@ -1801,6 +1984,148 @@ reattaching to remote session {session_id} on {host} \
         Some(report)
     }
 
+    // ---- Issue #92: durable per-pane notifications + per-client read state.
+
+    /// Allocate the next daemon-global monotonic notification id.
+    fn next_notification_id(&self) -> u64 {
+        self.next_notification_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Record a desktop notification for `surface` in its per-pane ring
+    /// (issue #92). Returns the stored record. This is the durable side
+    /// channel: it must be called alongside the unchanged
+    /// `MuxEvent::OscNotification` desktop emission (see `surface.rs`),
+    /// never instead of it.
+    ///
+    /// The ring is bounded at
+    /// [`crate::notify::NOTIFICATION_RING_CAPACITY`]: pushing into a full
+    /// ring evicts the oldest record. Because ids are monotonic and a
+    /// client's read mark only moves forward, eviction only ages out
+    /// notifications a lagging client could no longer selectively miss —
+    /// it silently drops the oldest, which is the documented bound.
+    pub fn record_notification(
+        self: &Arc<Self>,
+        surface: SurfaceId,
+        title: String,
+        body: String,
+    ) -> crate::notify::NotificationRecord {
+        let record = crate::notify::NotificationRecord {
+            id: self.next_notification_id(),
+            surface,
+            title,
+            body,
+            timestamp_ms: crate::notify::now_ms(),
+        };
+        let mut rings = self.notifications.lock().unwrap();
+        rings
+            .entry(surface)
+            .or_insert_with(crate::notify::NotificationRing::new)
+            .push(record.clone());
+        record
+    }
+
+    /// The stored notifications for one pane, oldest first (issue #92).
+    /// Empty when the pane never emitted any or its ring aged out.
+    pub fn notifications_for(&self, surface: SurfaceId) -> Vec<crate::notify::NotificationRecord> {
+        let rings = self.notifications.lock().unwrap();
+        rings.get(&surface).map(|ring| ring.records().cloned().collect()).unwrap_or_default()
+    }
+
+    /// All stored notifications across every pane, oldest first by id
+    /// (issue #92) — the `--all` shape for a client that does not filter
+    /// by surface.
+    pub fn all_notifications(&self) -> Vec<crate::notify::NotificationRecord> {
+        let rings = self.notifications.lock().unwrap();
+        let mut records: Vec<_> = rings.values().flat_map(|ring| ring.records().cloned()).collect();
+        records.sort_by_key(|r| r.id);
+        records
+    }
+
+    /// A client's last-read notification id for one pane (issue #92).
+    /// `None` means the client has never acked anything in that pane, so
+    /// nothing is filtered out.
+    pub fn client_read_mark(&self, client: &str, surface: SurfaceId) -> Option<u64> {
+        self.notification_reads.lock().unwrap().get(client).and_then(|m| m.get(&surface).copied())
+    }
+
+    /// Notifications a client has not yet read, optionally restricted to
+    /// one pane, oldest first by id (issue #92) — the replay slice for
+    /// `subscribe`. `surface: None` covers every pane.
+    pub fn unread_notifications(
+        &self,
+        client: &str,
+        surface: Option<SurfaceId>,
+    ) -> Vec<crate::notify::NotificationRecord> {
+        let reads = self.notification_reads.lock().unwrap();
+        let marks = reads.get(client);
+        let mark_for = |s: SurfaceId| marks.and_then(|m| m.get(&s).copied()).unwrap_or(0);
+        let rings = self.notifications.lock().unwrap();
+        let mut records: Vec<_> = match surface {
+            Some(s) => rings
+                .get(&s)
+                .map(|ring| ring.unread_after(mark_for(s)).cloned().collect())
+                .unwrap_or_default(),
+            None => rings
+                .iter()
+                .flat_map(|(s, ring)| ring.unread_after(mark_for(*s)).cloned())
+                .collect(),
+        };
+        records.sort_by_key(|r| r.id);
+        records
+    }
+
+    /// Mark notifications read for `client` (issue #92). With `id: None`
+    /// the mark advances to the pane's latest stored id (ack all); with
+    /// `id: Some(n)` it advances to `max(current, n)`, so re-acking an
+    /// older id never rewinds the high-water mark while an id newer than
+    /// anything stored still advances it (the client asserts it has seen
+    /// it). `surface: None` applies to every pane that has stored
+    /// notifications. Returns the (surface, new-mark) pairs written.
+    pub fn ack_notifications(
+        &self,
+        client: &str,
+        surface: Option<SurfaceId>,
+        id: Option<u64>,
+    ) -> Vec<(SurfaceId, u64)> {
+        let latest: Vec<(SurfaceId, u64)> = {
+            let rings = self.notifications.lock().unwrap();
+            match surface {
+                Some(s) => {
+                    rings.get(&s).and_then(|r| r.latest_id()).map(|l| (s, l)).into_iter().collect()
+                }
+                None => rings.iter().filter_map(|(s, r)| r.latest_id().map(|l| (*s, l))).collect(),
+            }
+        };
+        let mut applied = Vec::new();
+        let mut reads = self.notification_reads.lock().unwrap();
+        let marks = reads.entry(client.to_string()).or_default();
+        for (s, pane_latest) in latest {
+            // `--all` (id == None) acks the whole pane; an explicit id
+            // advances to exactly that id (whether or not it is still
+            // stored), never rewinding past the existing mark below.
+            let target = id.unwrap_or(pane_latest);
+            let entry = marks.entry(s).or_insert(0);
+            if target > *entry {
+                *entry = target;
+                applied.push((s, target));
+            }
+        }
+        applied
+    }
+
+    /// Drop a surface's notification ring and every client's read mark for
+    /// it (called when the surface leaves the tree, so a long-lived daemon
+    /// does not retain rings for panes that no longer exist). Read marks
+    /// for OTHER panes are untouched, and the global id sequence is never
+    /// rewound.
+    fn forget_surface_notifications(&self, surface: SurfaceId) {
+        self.notifications.lock().unwrap().remove(&surface);
+        let mut reads = self.notification_reads.lock().unwrap();
+        for marks in reads.values_mut() {
+            marks.remove(&surface);
+        }
+    }
+
     /// Resolve an agent-verb target (issue #75): an exact match on a
     /// surface's reported agent name, else a numeric surface id, else an
     /// error. Duplicate names are ambiguous and rejected (disambiguate
@@ -1892,6 +2217,129 @@ reattaching to remote session {session_id} on {host} \
         Ok(all)
     }
 
+    /// Issue #85: one read-only readiness snapshot for a surface — the
+    /// pair of observations a headless orchestrator needs to tell a
+    /// completed spawn from a silent partial launch. Observation only:
+    /// it takes the terminal lock, reads `/proc`, and mutates nothing.
+    ///
+    /// * `prompt_seen` is true once the pane's visible screen shows a
+    ///   recognised resting prompt ([`crate::agent_state_classify`]'s
+    ///   `Idle` markers — `$ `, `# `, `pi> `, `codex>`, …) **or** the
+    ///   ambient agent detector identifies an agent (its own prompt is
+    ///   the marker). This is the "shell/agent came up" half.
+    /// * `child` is the pane PTY's process-tree child that is actually
+    ///   running — the most-recently-spawned entry of the PTY child plus
+    ///   its descendants (`agent_detect::collect_process_evidence`),
+    ///   which is the direct shell for a bare pane and the spawned
+    ///   command once `send` has run it. This is the "the spawned
+    ///   command is running" half.
+    ///
+    /// A surface is `ready` only when BOTH hold; the caller decides
+    /// when to give up (see `Command::WaitReady`).
+    pub fn surface_readiness(&self, surface: &Arc<Surface>) -> SurfaceReadiness {
+        if surface.kind() != crate::SurfaceKind::Pty {
+            return SurfaceReadiness::default();
+        }
+        // Process half: the child tree under the PTY. `collect_process_evidence`
+        // already walks the direct child + every descendant and reads
+        // comm/cmdline; a dead child leaves it empty.
+        let evidence = crate::agent_detect::collect_process_evidence(surface.child_pid());
+        let child = evidence
+            .iter()
+            // Prefer the most-recently-spawned process (the actual
+            // command once a shell has exec'd/forks it), matching
+            // `agent_detect`'s tie-break; a bare shell only ever has
+            // itself, so this degrades to the shell.
+            .max_by_key(|e| e.starttime)
+            .map(|e| ReadinessChild { pid: e.pid, comm: e.comm.clone() });
+        // Screen half: a recognised resting prompt, or an agent the
+        // detector identifies. Both reuse existing detectors rather than
+        // introducing a third prompt grammar. The pure `detect` function
+        // is called directly (NOT `detect_agent`, which caches the result
+        // and emits `TreeChanged`) so this probe stays mutation-free.
+        let screen = surface.try_with_terminal(|t| t.plain_text()).ok().and_then(|r| r.ok());
+        let prompt_seen = match screen {
+            Some(text) => {
+                let settings = self.agent_detection();
+                let detected_agent = if settings.enabled {
+                    self.agent_pattern_list()
+                        .ok()
+                        .map(|patterns| {
+                            crate::agent_detect::detect(
+                                &evidence,
+                                &text,
+                                &patterns,
+                                settings.min_confidence,
+                            )
+                            .agent
+                        })
+                        .unwrap_or_default()
+                } else {
+                    // Detection disabled by configuration: fall back to
+                    // the last cached detection, if any.
+                    surface.detected_agent().map(|d| d.agent).unwrap_or_default()
+                };
+                let named_agent = !detected_agent.is_empty() && detected_agent != "unknown";
+                // `classify_signal` is a pure function of (agent, screen)
+                // and returns `Idle` for a resting prompt of the detected
+                // agent's bucket (or `generic` shells).
+                let signal = crate::agent_state_classify::classify_signal(&detected_agent, &text);
+                named_agent
+                    || matches!(signal, crate::agent_state_classify::StateSignal::Idle)
+                    || screen_shows_shell_prompt(&text)
+            }
+            None => false,
+        };
+        SurfaceReadiness { prompt_seen, child }
+    }
+
+    /// Issue #93: the surface's *effective* lifecycle state for the
+    /// blocked-send gate, resolved under the existing authority rules.
+    ///
+    /// Precedence mirrors [`Surface::set_agent_report`]: an explicit
+    /// `socket`/`hook` report is authoritative, and a screen-derived
+    /// (`Detected`) classification only counts when no report exists
+    /// yet. A live screen classification is computed on demand so a
+    /// pane parked at an approval dialog is caught even without a hook
+    /// — the #96 classifier is conservative (never returns `Blocked`
+    /// from ambiguous or shell-only text).
+    ///
+    /// Returns `(state, source_label, seq)` where `seq` is the
+    /// per-surface state-change sequence of the report backing `state`
+    /// (`0` for a purely screen-derived state, which has no stored
+    /// sequence).
+    pub fn effective_agent_state(
+        &self,
+        surface: &Arc<Surface>,
+    ) -> (crate::AgentState, &'static str, u64) {
+        // An explicit report (any tier) wins outright: `Blocked` from a
+        // hook/socket/detected report is authoritative, and a non-blocked
+        // report keeps the pane ungated per the plan's authority rules.
+        if let Some(report) = surface.agent_report() {
+            return (report.state, report.source.as_str(), report.state_seq);
+        }
+        // No report at all: fall back to a fresh (mutation-free) screen
+        // classification. This mirrors `detect_on_surface`'s screen half
+        // but does not cache or publish anything.
+        let settings = self.agent_detection();
+        if !settings.enabled || surface.kind() != crate::SurfaceKind::Pty {
+            return (crate::AgentState::Unknown, "none", 0);
+        }
+        let Ok(patterns) = self.agent_pattern_list() else {
+            return (crate::AgentState::Unknown, "none", 0);
+        };
+        let Ok(screen) = surface.try_with_terminal(|t| t.plain_text()) else {
+            return (crate::AgentState::Unknown, "none", 0);
+        };
+        let Ok(screen) = screen else {
+            return (crate::AgentState::Unknown, "none", 0);
+        };
+        let detection =
+            crate::agent_detect::detect(&[], &screen, &patterns, settings.min_confidence);
+        let state = crate::agent_state_classify::classify_agent_state(&detection.agent, &screen);
+        (state, "detected", 0)
+    }
+
     /// Run ambient detection on one surface (issue #78 AC1): collect
     /// process + screen evidence, score it against the registry, cache
     /// the result on the surface, and emit `TreeChanged` so frontends
@@ -1904,6 +2352,24 @@ reattaching to remote session {session_id} on {host} \
         let surface =
             self.surface(surface).ok_or_else(|| anyhow::anyhow!("unknown surface {surface}"))?;
         let detection = self.detect_on_surface(&surface)?;
+        // Issue #96: publish a screen-derived (`Detected`-tier) state only
+        // when the classifier found an unambiguous `blocked`/`working`
+        // marker. The authority rules in `Surface::set_agent_report`
+        // already reject a `Detected` report while a `Socket`/`Hook`
+        // report is current, so this can never override a self-report;
+        // and the `blocked`/`working`-only gate keeps it from
+        // downgrading one to `idle`/`unknown` either.
+        if matches!(detection.screen_state, crate::AgentState::Blocked | crate::AgentState::Working)
+        {
+            self.report_agent(
+                surface.id,
+                detection.screen_state,
+                crate::AgentStateSource::Detected,
+                None,
+                None,
+                None,
+            );
+        }
         surface.set_detected_agent(detection.clone());
         self.emit(MuxEvent::TreeChanged);
         Ok(detection)
@@ -1940,6 +2406,13 @@ reattaching to remote session {session_id} on {host} \
         let screen = surface.try_with_terminal(|t| t.plain_text())??;
         let mut detection =
             crate::agent_detect::detect(&process, &screen, &patterns, settings.min_confidence);
+        // Issue #96: classify the screen text into a lifecycle state,
+        // using the agent detection just resolved (or `"unknown"` /
+        // `"generic"` when nothing matched). `screen_state` is
+        // informational for the caller; `detect_agent` publishes it as a
+        // `Detected`-tier report when it is `blocked`/`working`.
+        detection.screen_state =
+            crate::agent_state_classify::classify_agent_state(&detection.agent, &screen);
         if remote && detection.is_unknown() {
             detection.evidence =
                 "remote surface: process tree not local; no screen marker matched".to_string();
@@ -2120,6 +2593,7 @@ reattaching to remote session {session_id} on {host} \
     /// drop their render state.
     pub fn surface_exited(&self, id: SurfaceId) {
         self.close_surface(id);
+        self.forget_surface_notifications(id);
         self.emit(MuxEvent::SurfaceExited(id));
     }
 
@@ -2531,6 +3005,176 @@ mod tests {
         let opts =
             SurfaceOptions { command: Some(vec!["/bin/cat".to_string()]), ..Default::default() };
         Mux::new("test", opts)
+    }
+
+    /// Issue #85: the shell-prompt fallback. The VT plain formatter trims
+    /// trailing spaces, so a real `$ ` prompt at end of line reads back
+    /// as `$`; the fallback must still recognise it without matching
+    /// arbitrary output.
+    #[test]
+    fn shell_prompt_fallback_survives_plain_text_trim() {
+        assert!(screen_shows_shell_prompt("boot log\nready$"));
+        assert!(screen_shows_shell_prompt("root@host:/# "));
+        assert!(screen_shows_shell_prompt("user%"));
+        assert!(screen_shows_shell_prompt("pi>"));
+        assert!(screen_shows_shell_prompt("codex>"));
+        assert!(screen_shows_shell_prompt("❯"));
+        // Trailing blank rows are skipped to find the prompt line.
+        assert!(screen_shows_shell_prompt("out$\n\n  \n"));
+        // Ordinary output must not read as a prompt.
+        assert!(!screen_shows_shell_prompt("build finished in 3s"));
+        assert!(!screen_shows_shell_prompt(""));
+        assert!(!screen_shows_shell_prompt("   \n  "));
+    }
+
+    /// Issue #87: a refused snapshot decision must launch nothing. The
+    /// foreign-owner case is simulated through the pure decision function
+    /// (no second uid is available in CI): `restore_session_decided`
+    /// takes the exact refusal branch `restore_session` would, and must
+    /// leave the (empty) tree empty with zero surfaces spawned.
+    #[test]
+    fn restored_daemon_does_not_launch_on_boundary_failure() {
+        let mux = test_mux();
+        let path = std::path::PathBuf::from("/nonexistent/foreign-snapshot.json");
+        mux.restore_session_decided(
+            crate::platform::SnapshotTrustDecision::RejectForeignOwner { uid: 4242 },
+            &path,
+        );
+        mux.with_state(|s| {
+            assert_eq!(s.workspaces.len(), 0, "foreign-owned snapshot must not create a workspace");
+            assert_eq!(s.surfaces.len(), 0, "foreign-owned snapshot must spawn nothing");
+        });
+    }
+
+    /// Issue #87: the lookup-error and world-readable refusals take the
+    /// same zero-launch path.
+    #[test]
+    fn restored_daemon_refuses_on_credential_error() {
+        for decision in [
+            crate::platform::SnapshotTrustDecision::RejectLookupError,
+            crate::platform::SnapshotTrustDecision::RejectWorldReadable { mode: 0o777 },
+        ] {
+            let mux = test_mux();
+            mux.restore_session_decided(decision, &std::path::PathBuf::from("/x/snap.json"));
+            mux.with_state(|s| {
+                assert_eq!(s.workspaces.len(), 0);
+                assert_eq!(s.surfaces.len(), 0);
+            });
+        }
+    }
+
+    // ---- Issue #95: snapshot preservation (rename-aside + shutdown guard) ----
+
+    static SNAP_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// A scratch state dir laid out like the real one: `<dir>/sessions/`.
+    /// No tempfile dev-dep; the per-process counter keeps parallel runs
+    /// from colliding.
+    fn snapshot_scratch(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let n = SNAP_DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "mtyx_mux_snapshot_{}_{}_{}",
+            std::process::id(),
+            n,
+            label
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).expect("create sessions dir");
+        (dir, sessions.join("main.json"))
+    }
+
+    /// A truncated `sessions/main.json` is renamed aside on the next
+    /// restore, never deleted, and the session still starts fresh (no
+    /// workspaces restored).
+    #[test]
+    fn truncated_state_is_preserved_not_deleted() {
+        let (dir, path) = snapshot_scratch("truncated");
+        let torn = b"{\"workspaces\": [{\"name\": \"work\"";
+        std::fs::write(&path, torn).unwrap();
+
+        let mux = test_mux();
+        mux.restore_session_decided(crate::platform::SnapshotTrustDecision::Accept, &path);
+
+        assert!(!path.exists(), "corrupt snapshot must be moved aside, not left to be overwritten");
+        mux.with_state(|s| {
+            assert_eq!(s.workspaces.len(), 0, "session must start fresh");
+            assert_eq!(s.surfaces.len(), 0);
+        });
+
+        let backups: Vec<_> = std::fs::read_dir(dir.join("session-backups"))
+            .expect("backup dir exists")
+            .flatten()
+            .collect();
+        assert_eq!(backups.len(), 1, "one recovery copy expected");
+        let name = backups[0].file_name().to_string_lossy().into_owned();
+        assert!(name.starts_with("main.") && name.ends_with(".json"), "got {name}");
+        assert_eq!(
+            std::fs::read(backups[0].path()).unwrap(),
+            torn,
+            "the torn bytes must be preserved byte-for-byte"
+        );
+    }
+
+    /// Simulated `kill -9` mid-write (a partially written canonical
+    /// snapshot): the next load backs those exact bytes up, so nothing is
+    /// silently lost, and reports nothing to restore.
+    #[test]
+    fn kill9_mid_write_recovers_from_backup() {
+        let (dir, path) = snapshot_scratch("kill9");
+        let partial = b"{\"workspaces\": [{\"screens\": [{\"layout\": {\"Sp";
+        std::fs::write(&path, partial).unwrap();
+
+        assert!(
+            crate::persist::SessionSnapshot::load(&path).is_none(),
+            "a torn write must not be parsed as a session"
+        );
+        assert!(!path.exists());
+
+        let backups: Vec<_> = std::fs::read_dir(dir.join("session-backups"))
+            .expect("backup dir exists")
+            .flatten()
+            .collect();
+        assert_eq!(backups.len(), 1, "the torn write is recoverable from exactly one copy");
+        assert_eq!(
+            std::fs::read(backups[0].path()).unwrap(),
+            partial,
+            "recovery copy holds the exact pre-crash bytes"
+        );
+    }
+
+    /// A fresh daemon that restores nothing, never attaches, and shuts down
+    /// must leave a pre-existing non-empty snapshot intact — it is not an
+    /// intentionally-emptied session.
+    #[test]
+    fn shutdown_does_not_overwrite_nonempty_with_empty() {
+        let (_dir, path) = snapshot_scratch("shutdown_guard");
+        let saved = b"{\"workspaces\":[{\"name\":\"work\"}],\"active_workspace\":0}";
+        std::fs::write(&path, saved).unwrap();
+
+        let mux = test_mux();
+        // No client attached, no workspace opened: the never-attached case.
+        mux.write_snapshot_to(&path);
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            saved,
+            "a never-attached daemon must not delete or truncate the saved snapshot"
+        );
+    }
+
+    /// The complement: an intentionally-emptied LIVE session (a client
+    /// attached, then everything closed) still deletes the snapshot, so old
+    /// panes do not resurrect.
+    #[test]
+    fn attached_emptied_session_still_removes_snapshot() {
+        let (_dir, path) = snapshot_scratch("shutdown_attached_empty");
+        std::fs::write(&path, b"{\"workspaces\":[{\"name\":\"work\"}]}").unwrap();
+
+        let mux = test_mux();
+        mux.mark_client_attached();
+        mux.write_snapshot_to(&path);
+        assert!(!path.exists(), "an attached, emptied session should drop its snapshot");
     }
 
     fn seed_split_ratio_tree(mux: &Mux) -> (PaneId, PaneId, PaneId) {
@@ -3060,6 +3704,64 @@ mod tests {
         assert!(mux.list_agents(Some(surface), Some(AgentState::Idle)).len() == 1);
         assert!(mux.list_agents(Some(surface), Some(AgentState::Working)).is_empty());
         assert!(mux.list_agents(Some(surface + 1), None).is_empty());
+    }
+
+    /// Issue #96 AC3: the `Detected` tier stays the lowest authority. A
+    /// screen-derived report is rejected while a `Socket` or `Hook`
+    /// report is current, and a `Detected` report can itself be upgraded
+    /// by either.
+    #[test]
+    fn report_agent_detected_is_lowest_authority_and_never_overrides_reports() {
+        let mux = test_mux();
+        mux.new_workspace(None, None).unwrap();
+        let surface = mux.with_state(|s| {
+            let pane = s.workspaces[0].screens[0].active_pane;
+            s.panes[&pane].tabs[0]
+        });
+
+        // A Detected report applies on a fresh pane…
+        let report = mux
+            .report_agent(
+                surface,
+                AgentState::Blocked,
+                AgentStateSource::Detected,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(report.state, AgentState::Blocked);
+        assert_eq!(report.source, AgentStateSource::Detected);
+
+        // …and a Socket report overrides it.
+        let report = mux
+            .report_agent(surface, AgentState::Working, AgentStateSource::Socket, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Working);
+        assert_eq!(report.source, AgentStateSource::Socket);
+
+        // A later Detected report cannot downgrade the socket report.
+        let report = mux
+            .report_agent(surface, AgentState::Idle, AgentStateSource::Detected, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Working, "detected must not override a socket report");
+        assert_eq!(report.source, AgentStateSource::Socket);
+
+        // Same against a hook report.
+        mux.report_agent(surface, AgentState::Blocked, AgentStateSource::Hook, None, None, None)
+            .unwrap();
+        let report = mux
+            .report_agent(
+                surface,
+                AgentState::Working,
+                AgentStateSource::Detected,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(report.state, AgentState::Blocked);
+        assert_eq!(report.source, AgentStateSource::Hook);
     }
 
     #[test]
@@ -3677,5 +4379,85 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    // ---- Issue #92: durable notifications + per-client read state ----
+
+    /// AC1 (state half): records are stored per pane, and a client that
+    /// never acked sees all of them; acking moves the mark so a later read
+    /// sees nothing. Ids are daemon-global and strictly increasing.
+    #[test]
+    fn unread_and_ack_round_trip() {
+        let mux = test_mux();
+        let a = mux.record_notification(10, String::new(), "first".into());
+        let b = mux.record_notification(10, "T".into(), "second".into());
+        let other_pane = mux.record_notification(99, String::new(), "elsewhere".into());
+        assert!(a.id < b.id && b.id < other_pane.id, "ids must be monotonic globally");
+
+        assert_eq!(mux.notifications_for(10).len(), 2);
+        let unread = mux.unread_notifications("alice", Some(10));
+        assert_eq!(
+            unread.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        // A different client's read state is independent.
+        assert_eq!(mux.unread_notifications("bob", Some(10)).len(), 2);
+
+        let applied = mux.ack_notifications("alice", Some(10), None);
+        assert_eq!(applied, vec![(10, b.id)]);
+        assert!(
+            mux.unread_notifications("alice", Some(10)).is_empty(),
+            "acked client sees nothing"
+        );
+        assert_eq!(mux.unread_notifications("bob", Some(10)).len(), 2, "other client unaffected");
+        // Bob's pane is still unread for alice too.
+        assert_eq!(mux.unread_notifications("alice", None).len(), 1);
+    }
+
+    /// AC1: an explicit id acks only up to that id (a later record still
+    /// replays), and re-acking an older id never rewinds the mark.
+    #[test]
+    fn partial_ack_and_no_rewind() {
+        let mux = test_mux();
+        let first = mux.record_notification(1, String::new(), "a".into());
+        let second = mux.record_notification(1, String::new(), "b".into());
+        assert_eq!(mux.ack_notifications("c", Some(1), Some(first.id)), vec![(1, first.id)]);
+        let unread: Vec<_> =
+            mux.unread_notifications("c", Some(1)).into_iter().map(|r| r.id).collect();
+        assert_eq!(unread, vec![second.id]);
+        // Re-ack the older id: the mark must not move backwards.
+        assert!(mux.ack_notifications("c", Some(1), Some(first.id)).is_empty());
+        assert_eq!(mux.client_read_mark("c", 1), Some(first.id));
+        assert_eq!(mux.unread_notifications("c", Some(1)).len(), 1);
+    }
+
+    /// AC2 (ring bound, through the mux): more than the cap keeps only
+    /// the newest records; the oldest ids are gone.
+    #[test]
+    fn ring_is_bounded_at_capacity() {
+        let mux = test_mux();
+        let cap = crate::notify::NOTIFICATION_RING_CAPACITY;
+        let mut last_id = 0;
+        for i in 0..(cap + 25) {
+            last_id = mux.record_notification(5, String::new(), format!("n{i}")).id;
+        }
+        let stored = mux.notifications_for(5);
+        assert_eq!(stored.len(), cap, "ring must be capped at {cap}");
+        assert_eq!(stored.last().unwrap().id, last_id, "newest record retained");
+        assert_eq!(stored.first().unwrap().body, "n25".to_string(), "oldest 25 records evicted");
+    }
+
+    /// A pane whose surface exits drops its ring and every client's read
+    /// mark for it; other panes are untouched.
+    #[test]
+    fn surface_exit_forgets_ring_and_marks() {
+        let mux = test_mux();
+        mux.record_notification(7, String::new(), "x".into());
+        mux.record_notification(8, String::new(), "y".into());
+        mux.ack_notifications("d", Some(7), None);
+        mux.forget_surface_notifications(7);
+        assert!(mux.notifications_for(7).is_empty());
+        assert_eq!(mux.client_read_mark("d", 7), None);
+        assert_eq!(mux.notifications_for(8).len(), 1);
     }
 }

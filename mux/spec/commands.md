@@ -1,6 +1,6 @@
 # Command Contract
 
-This file specifies the JSON command contract for the mtyx protocol. Implemented commands match protocol v6 in `mux/crates/mux-core/src/server.rs`. Proposed commands are future protocol v7 design.
+This file specifies the JSON command contract for the mtyx protocol. Implemented commands match protocol v7 in `mux/crates/mux-core/src/server.rs`. Proposed commands are future protocol design (protocol 7 shipped the `identify` capabilities record and confirmed/receipted `send`, issue #88).
 
 ## Notation
 
@@ -96,12 +96,14 @@ The `dead` pane variant is serialized by the v5 server only if the tree referenc
 
 Returns process and protocol metadata for the connected mux server. Clients use this command to verify that the socket endpoint is mtyx and to check feature compatibility.
 
+Since protocol 7 (issue #88) the result also carries a `capabilities` record for feature negotiation. The one defined capability is `input-ack` (confirmed/receipted `send`, see [`send`](#send)): a client wanting confirmed input must gate on `capabilities["input-ack"] == true` and refuse with a structured `legacy_host_receipt_rejected`-style error against a daemon lacking it, never silently downgrade. The bundled CLI performs this pre-flight automatically.
+
 Params: none.
 
 Result:
 
 ```text
-object{app:"mtyx",version:string,protocol:uint32,session:string,pid:uint32}
+object{app:"mtyx",version:string,protocol:uint32,capabilities:object{input-ack:bool},session:string,pid:uint32}
 ```
 
 Errors:
@@ -124,7 +126,7 @@ Example:
 
 ```json
 {"id":1,"cmd":"identify"}
-{"id":1,"ok":true,"data":{"app":"mtyx","version":"0.1.0","protocol":5,"session":"main","pid":12345}}
+{"id":1,"ok":true,"data":{"app":"mtyx","version":"0.1.0","protocol":7,"capabilities":{"input-ack":true},"session":"main","pid":12345}}
 ```
 
 ### list-workspaces
@@ -246,40 +248,55 @@ Example:
 
 Writes input to a PTY surface. `text`, when present, is UTF-8 encoded and written as bytes. `bytes`, when present, is standard base64 decoded and written as raw bytes. If both are present, v5 writes `text` first and `bytes` second. If neither is present, v5 returns success and writes nothing.
 
+Since protocol 7 (issue #93) this verb is the *send* half of the agent lifecycle contract: `send` refuses a pane whose effective agent state is `blocked` (structured `agent_blocked`, nothing written) unless `force` is true, and `wait_activity_ms` makes the reply contingent on an observed transition into `working`/`blocked`. The sibling spawn-readiness half is [`wait-ready`](#wait-ready) (issue #85), which an orchestrator calls before its first send.
+
 Params:
 
-| Name      | JSON type | Required/default | Constraints                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| --------- | --------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `surface` | `Id`      | required         | Must identify a live PTY surface                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `text`    | `string`  | default null     | Written before `bytes` when both are present                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `bytes`   | `Base64`  | default null     | Decoded with standard base64                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `shell`   | `string`  | default null     | One of `auto`, `fish`, `bash`, `zsh`, `sh`, `nu`, `raw` (default `raw` = verbatim passthrough, unchanged from pre-#35). `auto` resolves the pane's shell from `/proc/<pid>/cmdline` on Linux and falls back to `raw` on lookup failure or non-Linux. For a known shell, a leading `\n` is prefixed to `text` when it starts with a shell metacharacter (`$`, `!`, quote, bracket, `~`, `#`) or contains an unclosed quote, so a pasted `$ pwd` is typed literally into a fish pane (issue #35). `bytes` is never transformed. |
+| Name         | JSON type | Required/default | Constraints                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------------ | --------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `surface`    | `Id`      | required         | Must identify a live PTY surface                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `text`       | `string`  | default null     | Written before `bytes` when both are present                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `bytes`      | `Base64`  | default null     | Decoded with standard base64                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `shell`      | `string`  | default null     | One of `auto`, `fish`, `bash`, `zsh`, `sh`, `nu`, `raw` (default `raw` = verbatim passthrough, unchanged from pre-#35). `auto` resolves the pane's shell from `/proc/<pid>/cmdline` on Linux and falls back to `raw` on lookup failure or non-Linux. For a known shell, a leading `\n` is prefixed to `text` when it starts with a shell metacharacter (`$`, `!`, quote, bracket, `~`, `#`) or contains an unclosed quote, so a pasted `$ pwd` is typed literally into a fish pane (issue #35). `bytes` is never transformed. |
+| `confirm`    | `bool`    | default null     | Since protocol 7 (issue #88): request a RECEIPT. `true` means the response returns success only after the daemon observes the input consumed — the practical receipt is bytes written to the PTY AND the surface echoed/advanced (the reader thread applied output) or the child exited, within `timeout_ms`. This is a documented heuristic, not a byte-exact consumption proof. Absent/false keeps the pre-#88 fire-and-forget behavior. Concurrent confirmed sends to one surface resolve in submission order (per-surface FIFO). |
+| `timeout_ms` | `uint64`  | default 5000     | Receipt timeout for `confirm: true`. Capped at 60000; `0` is rejected. The budget covers both the FIFO queue wait and the receipt wait. Ignored when `confirm` is not `true`.                                                                                                                                                                                                                                                                                    |
+| `force`      | `bool`    | default null     | Since protocol 7 (issue #93): bypass the blocked-send gate. Absent/false means a surface whose *effective* agent state is `blocked` (an explicit hook/socket report, or the #96 screen classifier's `detected`-tier `blocked`) is refused with the structured `agent_blocked` error and **no bytes are written**. `true` restores the pre-#93 raw write. `unknown` state (e.g. a plain shell pane with no report) is **not** gated, so every existing caller keeps working. |
+| `wait_activity_ms` | `uint64` | default null | Since protocol 7 (issue #93): observed-transition success. When present, the reply is sent only after the target agent is seen to transition (a strictly-newer per-surface `state_seq`) into `working`/`blocked` at/after this call, or `wait_activity_ms` elapses. A pane that was already `working` before the send does NOT satisfy it. Capped at 600000. Absent keeps the fire-and-forget reply. |
 
 Result:
 
 ```text
-object{}
+object{}                      // unconfirmed (pre-#88 shape, unchanged)
+object{confirmed:true}        // confirmed send that received its receipt
+object{confirmed:false,activity_observed:bool,state:string|null}
+                              // wait_activity_ms set: whether a working/blocked
+                              // transition was observed, and which state
 ```
 
 Errors:
 
-| Error                                                     | Condition                            |
-| --------------------------------------------------------- | ------------------------------------ |
-| `unknown surface <id>`                                    | Surface id does not exist            |
-| `browser surface does not support PTY/VT socket commands` | Surface is a browser                 |
-| base64 decode error                                       | `bytes` is not valid standard base64 |
-| IO error string                                           | PTY write fails                      |
-| `bad request: ...`                                        | Missing `surface` or wrong JSON type |
+| Error                                                     | Condition                                                     |
+| --------------------------------------------------------- | ------------------------------------------------------------- |
+| `unknown surface <id>`                                    | Surface id does not exist                                     |
+| `browser surface does not support PTY/VT socket commands` | Surface is a browser                                          |
+| base64 decode error                                       | `bytes` is not valid standard base64                          |
+| IO error string                                           | PTY write fails                                               |
+| `bad request: ...`                                        | Missing `surface` or wrong JSON type                          |
+| `oversized_input: ...` (code `oversized_input`)           | Confirmed payload above 1 MiB (`MAX_CONFIRMED_SEND_BYTES`)    |
+| `input_ack_timeout: ...` (code `input_ack_timeout`)       | No receipt within `timeout_ms` (or the FIFO turn never came)  |
+| `agent_blocked: ...` (code `agent_blocked`)              | Effective agent state is `blocked` and `force` is not `true` (issue #93); nothing is written |
+
+Since protocol 7, structured errors also carry a machine-readable `"code"` field on the error response (the `error` string keeps the `<code>: ` prefix for string-matching callers). `oversized_input`, `input_ack_timeout`, and `agent_blocked` are the codes `send` can emit; `legacy_host_receipt_rejected` is the client-side code for the capability gate refusal (see [`identify`](#identify)).
 
 CLI mapping:
 
-| Item         | Value                                                                |
-| ------------ | -------------------------------------------------------------------- |
-| Verb         | `send`                                                               |
-| Flags        | `--surface <id> [--text <text>] [--bytes <base64>] [--shell <mode>]` |
-| Plain stdout | no output                                                            |
-| JSON stdout  | exact result object                                                  |
-| Exit codes   | common                                                               |
+| Item         | Value                                                                                          |
+| ------------ | ---------------------------------------------------------------------------------------------- |
+| Verb         | `send`                                                                                         |
+| Flags        | `--surface <id> [--text <text>] [--bytes <base64>] [--shell <mode>] [--no-confirm] [--timeout-ms N] [--force] [--wait] [--wait-timeout-ms N]` |
+| Plain stdout | no output                                                                                      |
+| JSON stdout  | exact result object                                                                            |
+| Exit codes   | common; additionally exit 3 on `agent_blocked`; exit 1 on `input_ack_timeout` / `oversized_input` / `legacy_host_receipt_rejected` |
 
 When neither `--text` nor `--bytes` is supplied, the CLI reads stdin as text and sends it as `text`.
 
@@ -2417,7 +2434,7 @@ CLI mapping:
 | status | implemented           |
 | since  | protocol 6 (issue #75; additive) |
 
-Blocks until the target agent's reported state reaches `state`, then returns the matched report plus the pane's current text (the read payload). Herdr semantics: if the state already matches, return immediately. `timeout_ms: 0` is a single immediate check. Timeout expiry is the error `timeout waiting for agent status <state>` (CLI exit 1). If the target surface exits while waiting, the wait fails immediately with `surface <id> exited while waiting for agent status <state>` instead of parking until the deadline. Timeouts are capped at 600 000 ms server-side so a leaked waiter thread can't park on its connection forever. Blocking holds only this command's own connection thread; the event channel is unbounded, so reporters never block.
+Blocks until the target agent's reported state reaches `state`, then returns the matched report plus the pane's current text (the read payload). Herdr semantics: if the state already matches, return immediately. `timeout_ms: 0` is a single immediate check. Issue #93 adds `require_transition`: when `true`, a cached state that already matches does NOT satisfy the wait — only an observed transition (a strictly-newer per-surface `state_seq`) at/after the call does. Absent/false keeps the pre-#93 immediate-match behaviour. Timeout expiry is the error `timeout waiting for agent status <state>` (CLI exit 1). If the target surface exits while waiting, the wait fails immediately with `surface <id> exited while waiting for agent status <state>` instead of parking until the deadline. Timeouts are capped at 600 000 ms server-side so a leaked waiter thread can't park on its connection forever. Blocking holds only this command's own connection thread; the event channel is unbounded, so reporters never block.
 
 Params:
 
@@ -2426,6 +2443,7 @@ Params:
 | `target`     | `string`  | required         | Agent name or numeric surface id                          |
 | `state`      | `string`  | required         | `"idle"`, `"working"`, `"blocked"`, `"done"`, `"unknown"` |
 | `timeout_ms` | `uint64`  | required         | `0` = single immediate check; max 600 000                 |
+| `require_transition` | `bool` | default null | Issue #93: require an observed transition at/after the call, not a pre-existing cached match |
 
 Result:
 
@@ -2440,7 +2458,7 @@ CLI mapping:
 | Item         | Value                                                                                       |
 | ------------ | ------------------------------------------------------------------------------------------- |
 | Verb         | `wait-agent-status`                                                                         |
-| Flags        | `--target <name-or-id> --status idle | working | blocked | done | unknown --timeout <ms>`   |
+| Flags        | `--target <name-or-id> --status idle | working | blocked | done | unknown --timeout <ms> [--require-transition]`   |
 | Plain stdout | the read payload (text)                                                                     |
 | JSON stdout  | exact result object                                                                         |
 | Exit codes   | common; the client extends its socket read timeout to `--timeout + 5 s` so long waits aren't killed by the default 10 s transport timeout |
@@ -2450,6 +2468,45 @@ Example:
 ```json
 {"id":109,"cmd":"wait-agent-status","target":"worker-1","state":"idle","timeout_ms":300000}
 {"id":109,"ok":true,"data":{"matched":true,"surface":4,"state":"idle","agent":"worker-1","message":"done for now","updated_at_ms":1710000005000,"elapsed_ms":412,"text":"$ "}}
+```
+
+### wait-ready
+
+| Field  | Value            |
+| ------ | ---------------- |
+| name   | `wait-ready`     |
+| status | implemented      |
+| since  | protocol 7       |
+
+Issue #85: block until a surface is *ready* — its visible screen shows a recognised prompt (a shell prompt or an identified agent) **and** its PTY has a running process-tree child — or `timeout_ms` elapses. Read-only observation: it never writes to the pane or mutates mux state. This is the post-spawn health check for headless orchestrators, which otherwise cannot distinguish a completed launch from a silent partial one (`send` succeeds once bytes reach the PTY buffer).
+
+A timeout is **not** an error: the reply is `ok:true` with `ready:false`, so the caller reads the structured result. The `mtyx` CLI maps `ready:false` to exit 1 while still printing the JSON payload.
+
+Params:
+
+| Name         | JSON type | Required/default          | Constraints                                  |
+| ------------ | --------- | ------------------------- | -------------------------------------------- |
+| `surface`    | `Id`      | required                  | PTY surface to observe (browser surfaces error) |
+| `timeout_ms` | `u64`     | default 5000              | milliseconds; `0` is a single immediate check; capped at 600000 |
+
+Result:
+
+```text
+object{ready:bool,surface:Id,prompt_seen:bool,child:object{pid:u32,comm:string}|null,elapsed_ms:u64}
+```
+
+Example (ready):
+
+```json
+{"id":110,"cmd":"wait-ready","surface":4,"timeout_ms":5000}
+{"id":110,"ok":true,"data":{"ready":true,"surface":4,"prompt_seen":true,"child":{"pid":48213,"comm":"fish"},"elapsed_ms":128}}
+```
+
+Example (timeout):
+
+```json
+{"id":111,"cmd":"wait-ready","surface":4,"timeout_ms":300}
+{"id":111,"ok":true,"data":{"ready":false,"surface":4,"prompt_seen":false,"child":null,"elapsed_ms":301}}
 ```
 
 ### pane-worktree-create

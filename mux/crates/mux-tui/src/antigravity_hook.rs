@@ -40,7 +40,9 @@ pub fn run(args: &[String]) -> i32 {
         Some("install-hooks") => run_install(uninstall, global),
         Some("install-skill") => run_install_skill(uninstall, global),
         _ => {
-            eprintln!("mtyx: usage: mtyx antigravity <install-hooks|install-skill> [--uninstall] [--global]");
+            eprintln!(
+                "mtyx: usage: mtyx antigravity <install-hooks|install-skill> [--uninstall] [--global]"
+            );
             2
         }
     }

@@ -7,8 +7,9 @@
 
 use std::io::{Read, Write};
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use ghostty_vt::{Callbacks, RenderState, Rgb, Terminal};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -242,6 +243,12 @@ pub struct AgentReport {
     /// applied report; absent means cleared.
     pub message: Option<String>,
     pub updated_at_ms: u64,
+    /// Issue #93: monotonic per-surface state-change sequence. Bumped on
+    /// every APPLIED report (rejected lower-authority reports leave it
+    /// unchanged), so a waiter can require an *observed transition*
+    /// strictly after it started rather than merely observing that the
+    /// cached state already equals the target. Never decreases.
+    pub state_seq: u64,
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -317,6 +324,16 @@ impl Deref for Surface {
 pub struct PtySurface {
     pub(crate) meta: SurfaceMeta,
     term: Mutex<Terminal>,
+    /// Issue #89: serialises everything that touches the PTY byte
+    /// stream — input writes (`writer`) and window resizes (`master`).
+    /// On ConPTY a resize applied concurrently with an input write can
+    /// tear the control stream, so both paths take this lock first.
+    ///
+    /// Lock order is always `io_lock` → (`term` / `writer` / `master`).
+    /// Never acquire it while already holding one of those. The reader
+    /// thread takes `term` without it and only reaches `write_bytes`
+    /// after releasing `term`, so there is no cycle.
+    io_lock: Mutex<()>,
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send>>,
@@ -328,6 +345,21 @@ pub struct PtySurface {
     /// Set when output arrived since the last render; cleared by the
     /// frontend when it draws.
     dirty: AtomicBool,
+    /// Monotonic count of output chunks the reader thread has applied to
+    /// the VT (issue #88). A confirmed send snapshots this BEFORE writing
+    /// its input and treats any later bump — the shell echoing the input,
+    /// a program advancing the screen — as the practical receipt that the
+    /// child consumed the bytes. This is a heuristic receipt (see
+    /// [`Surface::write_bytes_confirmed`]), not a byte-exact consumption
+    /// proof.
+    output_epoch: AtomicU64,
+    /// Confirmed-input FIFO state (issue #88): tickets are handed out in
+    /// submission order and a confirmed send only writes while holding its
+    /// turn, so concurrent confirmed sends to one surface resolve in
+    /// submission order. Plain `write_bytes` bypasses the gate entirely.
+    ack_gate: Mutex<AckGateState>,
+    /// Wakes gate waiters when the queue advances past a ticket.
+    ack_turn: Condvar,
     title: Mutex<String>,
     pwd: Mutex<Option<String>>,
     /// Working directory the child was spawned in. Fixed at spawn time;
@@ -350,6 +382,11 @@ pub struct PtySurface {
     /// capture time (`layout_doc::capture_tab`).
     spawn_env: Vec<(String, String)>,
     agent: Mutex<Option<AgentReport>>,
+    /// Issue #93: monotonic state-change sequence, bumped whenever an
+    /// agent report is APPLIED (see [`Surface::set_agent_report`]). Read
+    /// without the `agent` lock so a waiter can snapshot "the seq at call
+    /// start" cheaply; only ever increases.
+    state_seq: std::sync::atomic::AtomicU64,
     size: Mutex<(u16, u16)>,
     /// Live output subscribers (attach streams). Guarded by the terminal
     /// lock ordering: the reader thread broadcasts while holding the
@@ -362,6 +399,78 @@ pub struct PtySurface {
 impl std::fmt::Debug for Surface {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Surface").field("id", &self.id).field("kind", &self.kind()).finish()
+    }
+}
+
+/// Confirmed-input FIFO state for one PTY surface (issue #88). Guarded by
+/// [`PtySurface::ack_gate`]; `current` names the ticket currently allowed
+/// to write.
+#[derive(Default)]
+struct AckGateState {
+    next_ticket: u64,
+    current: u64,
+    /// Tickets abandoned by senders whose wait-for-turn deadline elapsed
+    /// (nothing was written for them). Skipped over when the queue
+    /// advances so an abandoned head cannot stall later senders.
+    abandoned: Vec<u64>,
+}
+
+impl AckGateState {
+    fn take_ticket(&mut self) -> u64 {
+        let ticket = self.next_ticket;
+        self.next_ticket += 1;
+        ticket
+    }
+
+    /// Release `ticket`'s turn and advance the queue past it and any
+    /// tickets abandoned behind it.
+    fn advance_past(&mut self, ticket: u64) {
+        debug_assert_eq!(self.current, ticket);
+        self.current = self.current.max(ticket) + 1;
+        while let Some(pos) = self.abandoned.iter().position(|&t| t == self.current) {
+            self.abandoned.swap_remove(pos);
+            self.current += 1;
+        }
+    }
+}
+
+/// Why a confirmed (receipted) input write failed (issue #88).
+#[derive(Debug)]
+pub enum ConfirmedSendError {
+    /// The input WAS written to the PTY, but no receipt — surface output
+    /// (echo/screen advance) or child exit — was observed within the
+    /// timeout. Delivery is unproven, not failed.
+    AckTimeout {
+        waited_ms: u64,
+    },
+    /// The send never reached its turn on the surface's confirmed-input
+    /// FIFO before the deadline (queue pressure from earlier confirmed
+    /// sends); nothing was written for this request.
+    QueueTimeout {
+        waited_ms: u64,
+    },
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for ConfirmedSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfirmedSendError::AckTimeout { waited_ms } => {
+                write!(f, "no input receipt (surface output or child-drain) within {waited_ms}ms")
+            }
+            ConfirmedSendError::QueueTimeout { waited_ms } => {
+                write!(f, "confirmed-input queue did not reach this send within {waited_ms}ms")
+            }
+            ConfirmedSendError::Io(err) => write!(f, "pty write failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfirmedSendError {}
+
+impl From<std::io::Error> for ConfirmedSendError {
+    fn from(err: std::io::Error) -> Self {
+        ConfirmedSendError::Io(err)
     }
 }
 
@@ -482,12 +591,16 @@ impl Surface {
         let surface = Arc::new(Surface::Pty(PtySurface {
             meta: SurfaceMeta { id, name: Mutex::new(None), detected_agent: Mutex::new(None) },
             term: Mutex::new(term),
+            io_lock: Mutex::new(()),
             writer: Mutex::new(writer),
             master: Mutex::new(pty.master),
             killer: Mutex::new(killer),
             child_pid,
             dead: AtomicBool::new(false),
             dirty: AtomicBool::new(false),
+            output_epoch: AtomicU64::new(0),
+            ack_gate: Mutex::new(AckGateState::default()),
+            ack_turn: Condvar::new(),
             title: Mutex::new(String::new()),
             pwd: Mutex::new(None),
             initial_cwd,
@@ -495,6 +608,7 @@ impl Surface {
             spawn_command: opts.command.clone().filter(|argv| !argv.is_empty()),
             spawn_env: opts.extra_env.clone(),
             agent: Mutex::new(None),
+            state_seq: std::sync::atomic::AtomicU64::new(0),
             size: Mutex::new((opts.cols, opts.rows)),
             taps: Mutex::new(Vec::new()),
         }));
@@ -518,6 +632,11 @@ impl Surface {
                     {
                         let mut term = pty.term.lock().unwrap();
                         term.vt_write(&buf[..n]);
+                        // Issue #88 receipt signal: every chunk the reader
+                        // thread applies advances the output epoch, so a
+                        // confirmed send waiting on `output_epoch` sees
+                        // echoes/screen advances promptly.
+                        pty.output_epoch.fetch_add(1, Ordering::Release);
                         {
                             let mut taps = pty.taps.lock().unwrap();
                             if !taps.is_empty() {
@@ -547,6 +666,11 @@ impl Surface {
                                     None,
                                     None,
                                 );
+                                // Issue #92: durable record, fed from the SAME
+                                // place as the (unchanged) ephemeral desktop
+                                // emission below, so a client attaching later can
+                                // replay it.
+                                mux.record_notification(surface.id, title.clone(), body.clone());
                                 mux.emit(MuxEvent::OscNotification {
                                     surface: surface.id,
                                     title,
@@ -611,9 +735,116 @@ impl Surface {
                 "browser surface does not accept PTY bytes",
             ));
         };
+        // Issue #89: take the shared stream lock so an input write can
+        // never interleave with a resize of the same PTY.
+        let _stream = pty.io_lock.lock().unwrap();
         let mut writer = pty.writer.lock().unwrap();
         writer.write_all(bytes)?;
         writer.flush()
+    }
+
+    /// Confirmed (receipted) input write (issue #88). Writes `bytes` to
+    /// the PTY and returns success only after observing a practical
+    /// receipt that the child consumed them, within `timeout`:
+    ///
+    /// - the surface produced output after the write (the reader thread
+    ///   applied a chunk: the shell echoed the input, or a program
+    ///   advanced the screen), **or**
+    /// - the child exited (it cannot exit without draining its input
+    ///   queue first for anything it was going to act on).
+    ///
+    /// This is deliberately a HEURISTIC receipt, not a byte-exact
+    /// consumption proof: the epoch is snapshotted immediately before
+    /// the write and any later output counts, so output merely coincident
+    /// with the send (a busy pane) can also satisfy it. The alternative —
+    /// proving the tty input queue drained — has no portable kernel
+    /// interface and is not attempted.
+    ///
+    /// Ordering: the write happens under this surface's confirmed-input
+    /// FIFO ticket, so concurrent confirmed sends to one surface resolve
+    /// in submission (ticket) order. Unconfirmed [`Surface::write_bytes`]
+    /// bypasses the gate and is unchanged from pre-#88 behavior. The
+    /// overall `timeout` budget covers BOTH the queue wait and the
+    /// receipt wait; on a queue-timeout nothing is written.
+    pub fn write_bytes_confirmed(
+        &self,
+        bytes: &[u8],
+        timeout: Duration,
+    ) -> Result<(), ConfirmedSendError> {
+        let Some(pty) = self.as_pty() else {
+            return Err(ConfirmedSendError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "browser surface does not accept PTY bytes",
+            )));
+        };
+        let start = Instant::now();
+        let deadline = start + timeout;
+
+        // 1. Take a ticket (submission order) and wait for our turn.
+        let ticket = {
+            let mut state = pty.ack_gate.lock().unwrap();
+            state.take_ticket()
+        };
+        {
+            let mut state = pty.ack_gate.lock().unwrap();
+            while state.current < ticket {
+                let now = Instant::now();
+                if now >= deadline {
+                    state.abandoned.push(ticket);
+                    drop(state);
+                    pty.ack_turn.notify_all();
+                    return Err(ConfirmedSendError::QueueTimeout {
+                        waited_ms: start.elapsed().as_millis() as u64,
+                    });
+                }
+                let (guard, _) =
+                    pty.ack_turn.wait_timeout(state, deadline - now).map_err(|_| {
+                        ConfirmedSendError::Io(std::io::Error::other("ack gate poisoned"))
+                    })?;
+                state = guard;
+            }
+        }
+
+        // 2. We hold the turn: snapshot the epoch, write, await receipt.
+        //    Baseline BEFORE the write so an echo that races back while
+        //    the write returns still counts (a baseline taken after could
+        //    already include the echo and then never advance again).
+        let result = (|| {
+            let baseline = pty.output_epoch.load(Ordering::Acquire);
+            {
+                // Issue #89: same shared stream lock as `write_bytes` /
+                // `resize`, held only for the write, not the receipt wait.
+                let _stream = pty.io_lock.lock().unwrap();
+                let mut writer = pty.writer.lock().unwrap();
+                writer.write_all(bytes)?;
+                writer.flush()?;
+            }
+            loop {
+                if pty.dead.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                if pty.output_epoch.load(Ordering::Acquire) > baseline {
+                    return Ok(());
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(ConfirmedSendError::AckTimeout {
+                        waited_ms: start.elapsed().as_millis() as u64,
+                    });
+                }
+                std::thread::sleep((deadline - now).min(Duration::from_millis(2)));
+            }
+        })();
+
+        // 3. Release the turn whether or not the receipt arrived (the
+        //    bytes are already written; a timeout must not wedge the
+        //    queue for later senders).
+        {
+            let mut state = pty.ack_gate.lock().unwrap();
+            state.advance_past(ticket);
+        }
+        pty.ack_turn.notify_all();
+        result
     }
 
     /// Direct PTY child PID (the pane's shell process). Used by
@@ -745,6 +976,19 @@ impl Surface {
         self.as_pty().and_then(|pty| pty.agent.lock().unwrap().clone())
     }
 
+    /// Issue #93: the surface's current agent-state sequence, bumped on
+    /// every APPLIED report. Snapshot this before a send/wait and require
+    /// the resulting report's [`AgentReport::state_seq`] to be strictly
+    /// greater, so a waiter proves an *observed transition* rather than
+    /// merely reading a cached state that predates its own call. Returns
+    /// `0` for a surface that has never had a report (and for non-PTY
+    /// surfaces, which never carry agent state).
+    pub fn agent_state_seq(&self) -> u64 {
+        self.as_pty()
+            .map(|pty| pty.state_seq.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
     /// Applies a new agent-state report under the authority rules from
     /// `spec/commands.md`: a hook report always applies; a socket report
     /// is rejected while the current source is a hook report. Returns the
@@ -769,8 +1013,21 @@ impl Surface {
         let accept = current.as_ref().map_or(true, |existing| source >= existing.source);
         if accept {
             let agent = agent.or_else(|| current.as_ref().and_then(|r| r.agent.clone()));
-            let report =
-                AgentReport { state, source, session, agent, message, updated_at_ms: now_ms() };
+            // Issue #93: every applied report advances the sequence, so a
+            // waiter can require a strictly-newer report. `fetch_add`
+            // returns the prior value, so the report's seq is prior + 1
+            // and always strictly greater than a snapshot taken before
+            // this call.
+            let state_seq = pty.state_seq.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+            let report = AgentReport {
+                state,
+                source,
+                session,
+                agent,
+                message,
+                updated_at_ms: now_ms(),
+                state_seq,
+            };
             *current = Some(report.clone());
             Some((report, true))
         } else {
@@ -961,6 +1218,11 @@ impl PtySurface {
             }
             *size = (cols, rows);
         }
+        // Issue #89: serialise the resize against input writes. Held
+        // across the term lock + attach marker below so a racing
+        // `write_bytes` cannot slip between the PTY resize and the VT
+        // resize (which would tear the ConPTY control stream).
+        let _stream = self.io_lock.lock().unwrap();
         // Hold the terminal lock while resizing and while sending the
         // attach marker, so attach mirrors observe bytes and resizes in
         // the exact order the server terminal applied them.
@@ -1013,5 +1275,32 @@ mod tests {
             .unwrap_or((120, 40));
         let opts = SurfaceOptions::default();
         assert_eq!((opts.cols, opts.rows), expected);
+    }
+
+    /// Issue #88: the confirmed-input FIFO hands out tickets in submission
+    /// order and `advance_past` walks exactly one live ticket at a time,
+    /// skipping tickets abandoned by queue-timeouts so an abandoned head
+    /// cannot stall later senders. This is the mechanism behind
+    /// `input_ack_ordering` (tests/input_ack.rs).
+    #[test]
+    fn ack_gate_advances_in_ticket_order_and_skips_abandoned() {
+        let mut gate = AckGateState::default();
+        let t0 = gate.take_ticket();
+        let t1 = gate.take_ticket();
+        let t2 = gate.take_ticket();
+        assert_eq!((t0, t1, t2), (0, 1, 2));
+        assert_eq!(gate.current, 0, "first ticket holds the turn");
+
+        // Ticket 1 gives up while 0 still holds the turn (queue-timeout).
+        gate.abandoned.push(t1);
+        gate.advance_past(t0);
+        assert_eq!(gate.current, t2, "abandoned ticket 1 is skipped, 2 is next");
+        assert!(gate.abandoned.is_empty());
+
+        // The queue keeps advancing one ticket at a time.
+        gate.advance_past(t2);
+        assert_eq!(gate.current, 3);
+        let t3 = gate.take_ticket();
+        assert_eq!(t3, 3);
     }
 }

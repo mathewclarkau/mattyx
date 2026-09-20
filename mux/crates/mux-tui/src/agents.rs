@@ -27,7 +27,9 @@ pub fn run(args: &[String]) -> i32 {
         Some("list") => run_list(args),
         Some("install") => run_install_command(REGISTRY, args),
         _ => {
-            eprintln!("mtyx: usage: mtyx agents <list|install --all|install --only <agent>> [--uninstall] [--global]");
+            eprintln!(
+                "mtyx: usage: mtyx agents <list|install --all|install --only <agent>> [--uninstall] [--global]"
+            );
             2
         }
     }

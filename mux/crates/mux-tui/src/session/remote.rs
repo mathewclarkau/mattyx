@@ -20,7 +20,10 @@ use serde_json::{json, Value};
 
 use super::tree::{parse_tree, TreeView};
 
-const SUPPORTED_PROTOCOL_VERSION: u64 = 6;
+/// Issue #88 bumped the protocol to 7 (input-ACK capability for
+/// confirmed `send`); the attach client itself does not use confirmed
+/// input but pins the shipped-together version.
+const SUPPORTED_PROTOCOL_VERSION: u64 = 7;
 #[derive(Clone)]
 struct RemoteBrowserFrame {
     frame: BrowserFrame,
@@ -223,7 +226,7 @@ impl RemoteSession {
         let protocol = ident.get("protocol").and_then(|v| v.as_u64()).unwrap_or(0);
         if protocol != SUPPORTED_PROTOCOL_VERSION {
             anyhow::bail!(
-                "unsupported mtyx protocol {protocol}; this client requires protocol 6 because attach-stream resize markers are authoritative; restart the mtyx server"
+                "unsupported mtyx protocol {protocol}; this client requires protocol 7 because attach-stream resize markers are authoritative; restart the mtyx server"
             );
         }
         session.request(json!({"cmd": "subscribe"}))?;
@@ -401,11 +404,22 @@ impl RemoteSession {
                 // message ride the same event. Absent on older servers.
                 let agent = value.get("agent").and_then(|v| v.as_str()).map(str::to_string);
                 let message = value.get("message").and_then(|v| v.as_str()).map(str::to_string);
+                // Issue #93: the observed-transition sequence rides the
+                // event too; 0 when an older server omits it.
+                let state_seq = value.get("state_seq").and_then(|v| v.as_u64()).unwrap_or(0);
                 self.tree_stale.store(true, Ordering::Release);
                 self.emit(MuxEvent::AgentStateChanged {
                     surface: id,
                     previous,
-                    report: AgentReport { state, source, session, agent, message, updated_at_ms },
+                    report: AgentReport {
+                        state,
+                        source,
+                        session,
+                        agent,
+                        message,
+                        updated_at_ms,
+                        state_seq,
+                    },
                 });
             }
             Some("osc-notification") => {

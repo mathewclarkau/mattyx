@@ -890,6 +890,74 @@ fn session_persists_layout_and_cwd_across_simulated_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Issue #87: a snapshot written by `save` must be 0600 and its
+/// `sessions/` dir 0700, whatever the ambient umask.
+#[test]
+#[cfg(unix)]
+fn snapshot_file_is_0600_and_dir_is_0700() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = PERSIST_ENV_LOCK.lock().unwrap();
+    let dir = std::env::temp_dir().join(format!("mux-persist-perms-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("XDG_STATE_HOME", &dir);
+
+    let session = unique_session("persist-perms");
+    {
+        let mux = Mux::new(session.clone(), shell_opts("sleep 30"));
+        mux.enable_persistence();
+        mux.new_workspace(Some("perms-ws".to_string()), None).unwrap();
+        mux.shutdown(); // writes a final, guaranteed snapshot
+    }
+
+    let path = mux_core::platform::session_snapshot_path(&session);
+    assert!(path.exists(), "snapshot missing at {}", path.display());
+    let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(file_mode, 0o600, "snapshot file must be 0600, got {file_mode:o}");
+    let dir_mode = std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(dir_mode, 0o700, "sessions dir must be 0700, got {dir_mode:o}");
+
+    std::env::remove_var("XDG_STATE_HOME");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #87: a snapshot whose mode was loosened to 0777 must be refused
+/// whole — the restore launches nothing, leaving an empty tree.
+#[test]
+#[cfg(unix)]
+fn restored_daemon_rejects_world_readable_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = PERSIST_ENV_LOCK.lock().unwrap();
+    let dir = std::env::temp_dir().join(format!("mux-persist-0777-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("XDG_STATE_HOME", &dir);
+
+    let session = unique_session("persist-0777");
+    {
+        let mux = Mux::new(session.clone(), shell_opts("sleep 30"));
+        mux.enable_persistence();
+        mux.new_workspace(Some("world-readable-ws".to_string()), None).unwrap();
+        mux.shutdown();
+    }
+
+    let path = mux_core::platform::session_snapshot_path(&session);
+    assert!(path.exists());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let mux2 = Mux::new(session.clone(), shell_opts("sleep 30"));
+    mux2.restore_session();
+    mux2.with_state(|s| {
+        assert_eq!(s.workspaces.len(), 0, "0777 snapshot must not be restored");
+    });
+
+    mux2.shutdown();
+    std::env::remove_var("XDG_STATE_HOME");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Issue #28 acceptance: spawning a background `sleep` under a pane shell,
 /// then shutting down the mux, leaves zero leftover processes from that tree.
 #[test]
@@ -934,4 +1002,161 @@ fn shutdown_kills_background_grandchild_sleep() {
     let leftover: Vec<u32> =
         watched.into_iter().filter(|&pid| mux_core::process::is_alive(pid)).collect();
     assert!(leftover.is_empty(), "leftover sleep PIDs after mux.shutdown(): {leftover:?}");
+}
+
+/// Issue #89: a resize of a PTY must not interleave with an input write.
+///
+/// Both paths now take the surface's `io_lock`, so a full token written
+/// by `write_bytes` can never have a `TIOCSWINSZ` (or a VT resize)
+/// squeezed into the middle of it. Before the fix the two paths used
+/// disjoint locks (`writer` vs `term`+`master`); on ConPTY that tears the
+/// control stream.
+///
+/// What this test DOES prove on Linux: 10k writes racing 10k resizes on
+/// one surface complete without error, deadlock, lost bytes, or
+/// reordering — i.e. the shared-lock structure is coherent (a wrong lock
+/// order here, say `writer`→`term` in one path and `term`→`writer` in
+/// the other, would deadlock or drop tokens).
+///
+/// What it CANNOT prove on Linux: the ConPTY tear itself. On Linux a
+/// `TIOCSWINSZ` ioctl is atomic w.r.t. the byte stream, so the pre-#89
+/// code also passes this test (verified by temporarily reverting the
+/// `io_lock` acquisition in `write_bytes`/`resize`). The Windows-only
+/// corruption is reproducible only against a ConPTY; this test is the
+/// portable half of the guard and is paired with the `#[cfg(windows)]`
+/// path tests in `platform.rs`.
+///
+/// The child is `stty -echo; cat`, so the ONLY bytes the reader thread
+/// sees are `cat`'s exact copy of our input (no line-discipline echo).
+/// Every token is a fixed-width `w%07d\n`, so scrolling/wrapping cannot
+/// manufacture a false match; the pty's ONLCR translation is normalised
+/// away before matching.
+#[test]
+fn resize_input_race_does_not_tear_vt_output() {
+    const ITERS: usize = 10_000;
+
+    let mux = Mux::new(unique_session("resize-input-race"), shell_opts("stty -echo; cat"));
+    let surface = mux.new_workspace(None, None).unwrap();
+
+    // Attach BEFORE the racing starts so every raced byte is observed.
+    let attach = surface.attach_stream().unwrap();
+    assert!(attach.cols > 0 && attach.rows > 0);
+
+    // Warm-up: `stty -echo` may run after our first bytes land and (on
+    // some ttys) flush pending input, and the shell reads stdin until it
+    // execs `cat`. Keep nudging until the echo of a probe line proves the
+    // `cat` read loop is live, then start the race. The probe bytes are
+    // prepended to the observed stream, not counted as a token.
+    let stream = attach.stream;
+    let mut seen: Vec<u8> = Vec::new();
+    let warm_deadline = Instant::now() + Duration::from_secs(15);
+    let mut warm_live = false;
+    while Instant::now() < warm_deadline {
+        surface.write_bytes(b"warmup-probe\n").unwrap();
+        let drain_deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < drain_deadline {
+            match stream.recv_timeout(Duration::from_millis(20)) {
+                Ok(AttachFrame::Output(chunk)) => seen.extend_from_slice(&chunk),
+                Ok(AttachFrame::Resized { .. }) => {}
+                Err(_) => break,
+            }
+        }
+        if seen.windows(b"warmup-probe".len()).any(|w| w == b"warmup-probe") {
+            warm_live = true;
+            break;
+        }
+    }
+    assert!(warm_live, "`cat` never echoed the warm-up probe; cannot race input writes");
+
+    let writer_surface = surface.clone();
+    let resizer_mux = mux.clone();
+    let resizer_id = surface.id;
+
+    // Collector: append every `Output` chunk. Stops only once both
+    // hammers are done AND the stream has been quiet for 300ms, so a
+    // late echo is never mistaken for a torn stream.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let collector_done = done.clone();
+
+    let collector = std::thread::spawn(move || {
+        let mut bytes = seen;
+        loop {
+            match stream.recv_timeout(Duration::from_millis(300)) {
+                Ok(AttachFrame::Output(chunk)) => bytes.extend_from_slice(&chunk),
+                // A resize carries a replay, not new output bytes.
+                Ok(AttachFrame::Resized { .. }) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if collector_done.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        bytes
+    });
+
+    let writer = std::thread::spawn(move || {
+        let mut errors = 0usize;
+        for n in 0..ITERS {
+            let token = format!("w{n:07}\n");
+            if writer_surface.write_bytes(token.as_bytes()).is_err() {
+                errors += 1;
+            }
+        }
+        errors
+    });
+
+    let resizer = std::thread::spawn(move || {
+        let mut errors = 0usize;
+        for n in 0..ITERS {
+            // Alternate between two valid geometries; every call is a
+            // real change, so each one takes the resize path.
+            let (cols, rows) = if n % 2 == 0 { (90, 30) } else { (80, 24) };
+            if resizer_mux.resize_surface(resizer_id, cols, rows).is_err() {
+                errors += 1;
+            }
+        }
+        errors
+    });
+
+    let write_errors = writer.join().expect("writer thread panicked");
+    let resize_errors = resizer.join().expect("resizer thread panicked");
+    assert_eq!(write_errors, 0, "write_bytes returned an error under resize contention");
+    assert_eq!(resize_errors, 0, "resize_surface returned an error under write contention");
+
+    // Let the tail of the echo drain, then stop the collector.
+    std::thread::sleep(Duration::from_secs(2));
+    done.store(true, Ordering::Release);
+    let seen = collector.join().expect("collector thread panicked");
+    mux.close_surface(resizer_id);
+
+    // Every token must appear byte-intact and in submission order. A
+    // torn/interleaved PTY stream would leave a partial token prefix
+    // (e.g. `w0000` followed by a resize artifact) or drop a token.
+    //
+    // The pty's ONLCR translation turns each token's `\n` into `\r\n`, so
+    // strip CRs before matching — that normalisation cannot mask a torn
+    // token (a torn write loses/duplicates digits, not the terminator).
+    let text = String::from_utf8_lossy(&seen).replace('\r', "");
+    let mut cursor = 0usize;
+    let mut found = 0usize;
+    for n in 0..ITERS {
+        let token = format!("w{n:07}\n");
+        match text[cursor..].find(&token) {
+            Some(offset) => {
+                cursor += offset + token.len();
+                found += 1;
+            }
+            None => {
+                // A miss here is a real serialization fault under this
+                // harness: `cat` echoes every byte it read, in order.
+                panic!(
+                    "token {token:?} missing or torn in the PTY output stream \
+                     (found {found}/{ITERS} before the gap)"
+                );
+            }
+        }
+    }
+    assert_eq!(found, ITERS, "all {ITERS} tokens must survive the resize race intact");
 }

@@ -207,20 +207,65 @@ jobs:
         if: runner.os != 'Windows'
         run: chmod +x "dist/mtyx-${{ matrix.zig_os }}-${{ matrix.arch }}${{ matrix.exe_suffix }}"
 
+      - name: Generate sha256 sidecar
+        # Issue #90: every shipped artifact gets a `<asset>.sha256`
+        # sidecar. scripts/sha256.sh papers over the fact that the four
+        # runner families disagree on which sha256 tool exists
+        # (sha256sum on Linux/Git Bash, shasum on macOS).
+        run: |
+          set -euo pipefail
+          bash scripts/sha256.sh gen \
+            "dist/mtyx-${{ matrix.zig_os }}-${{ matrix.arch }}${{ matrix.exe_suffix }}"
+
+      - name: Verify sha256 sidecar before upload
+        # Verify here, in the *build* leg, so a corrupt/truncated
+        # artifact fails the release before it is ever uploaded — for
+        # draft and unpublished builds too (no condition on tag).
+        run: |
+          set -euo pipefail
+          bash scripts/sha256.sh verify dist
+
       - uses: actions/upload-artifact@v4
         with:
           name: mtyx-${{ matrix.zig_os }}-${{ matrix.arch }}
           path: dist/mtyx-${{ matrix.zig_os }}-${{ matrix.arch }}${{ matrix.exe_suffix }}
+
+      - uses: actions/upload-artifact@v4
+        # Sidecars ride in their own artifact. A separate step (rather
+        # than widening the binary artifact's `path:`) keeps this change
+        # purely additive to the shipped release flow; the release job's
+        # `download-artifact` already merges every artifact into dist/,
+        # so the sidecar lands next to the binary there.
+        with:
+          name: mtyx-${{ matrix.zig_os }}-${{ matrix.arch }}-sha256
+          path: dist/mtyx-${{ matrix.zig_os }}-${{ matrix.arch }}${{ matrix.exe_suffix }}.sha256
 
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        # Needed only so the additive checksum-verification step below
+        # can reuse scripts/sha256.sh (identical logic to the build
+        # legs). The build matrix already produced every byte we publish.
+        with:
+          submodules: false
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      - name: Verify sha256 sidecars before publish
+        # Issue #90: gate publication on the checksums matching the
+        # downloaded bytes, so the release can never ship an asset whose
+        # sidecar disagrees. This step is unconditional within the
+        # release job (which itself only runs for tag builds), and an
+        # empty sidecar set is an error rather than a silent skip.
+        run: |
+          set -euo pipefail
+          bash scripts/sha256.sh verify dist
 
       - name: Create release
         uses: softprops/action-gh-release@v2

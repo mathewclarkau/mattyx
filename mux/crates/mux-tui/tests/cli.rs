@@ -5,6 +5,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::symlink;
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
@@ -214,6 +215,134 @@ fn send_shell_flag_validates_and_accepts() {
     assert!(ok.stdout.is_empty(), "send should be quiet on success");
     let screen = wait_for_screen(&server, surface, "shell-flag-ok");
     assert!(screen.contains("shell-flag-ok"), "screen did not contain marker; got {screen:?}");
+}
+
+// --- Confirmed (receipted) input — issue #88 ---
+
+/// Confirmed send is the CLI DEFAULT (no --confirm flag needed): against
+/// a live echoing shell the command exits 0 only after the daemon's
+/// receipt (the shell consumed and echoed the input).
+#[test]
+fn send_confirm_default_exits_zero_on_receipt() {
+    let server = HeadlessServer::start("send-confirm");
+    let workspace = cli(&server, &["new-workspace", "--name", "send-confirm"]);
+    assert_success(&workspace);
+    let surface = String::from_utf8(workspace.stdout).unwrap().trim().parse::<u64>().unwrap();
+
+    let ok = cli(
+        &server,
+        &["send", "--surface", &surface.to_string(), "--text", "echo confirm-marker\n"],
+    );
+    assert_success(&ok);
+    assert!(ok.stdout.is_empty(), "send should be quiet on success");
+    let screen = wait_for_screen(&server, surface, "confirm-marker");
+    assert!(screen.contains("confirm-marker"), "screen did not contain marker; got {screen:?}");
+}
+
+/// A confirmed send against a pane that neither echoes nor exits
+/// (tty echo off, `cat` draining to /dev/null) must exit nonzero with
+/// the structured `input_ack_timeout` error after --timeout-ms, and
+/// `--no-confirm` must keep the pre-#88 fire-and-forget behavior
+/// (immediate exit 0).
+#[test]
+fn send_confirm_ack_timeout_exits_nonzero_and_no_confirm_opts_out() {
+    let server = HeadlessServer::start("send-ack-timeout");
+    // An echo-free consumer: tty echo off, cat drains stdin to /dev/null.
+    let tab = cli(
+        &server,
+        &["new-tab", "--exec", "--", "/bin/sh", "-c", "stty -echo; exec cat > /dev/null"],
+    );
+    assert_success(&tab);
+    let surface = String::from_utf8(tab.stdout).unwrap().trim().parse::<u64>().unwrap();
+    // Let the exec'd cat land before the confirmed send, or the tty line
+    // discipline would still echo the input and produce a receipt.
+    std::thread::sleep(Duration::from_millis(1_000));
+
+    let started = Instant::now();
+    let bad = cli(
+        &server,
+        &["send", "--surface", &surface.to_string(), "--text", "silent\n", "--timeout-ms", "400"],
+    );
+    assert_eq!(
+        bad.status.code(),
+        Some(1),
+        "confirmed send must exit 1 on ACK timeout, got {bad:?}"
+    );
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    assert!(stderr.contains("input_ack_timeout"), "stderr: {stderr}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(400),
+        "exit must wait out the receipt timeout, took {:?}",
+        started.elapsed()
+    );
+
+    let escaped = cli(
+        &server,
+        &["send", "--surface", &surface.to_string(), "--text", "silent2\n", "--no-confirm"],
+    );
+    assert_success(&escaped);
+}
+
+/// Issue #88: a confirmed send against a legacy (protocol 6, no
+/// input-ACK capability) daemon is refused with the structured
+/// `legacy_host_receipt_rejected` error — never a silent downgrade to
+/// fire-and-forget. The fake daemon answers identify exactly as a v6
+/// server did (no `capabilities` record).
+#[test]
+fn send_confirm_rejected_against_legacy_daemon() {
+    let dir = unique_temp_dir("send-legacy");
+    fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("legacy.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let read_half = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let mut stream = stream;
+        writeln!(
+            stream,
+            r#"{{"id":1,"ok":true,"data":{{"app":"mtyx","version":"0.0.0","protocol":6,"session":"main","pid":1}}}}"#
+        )
+        .unwrap();
+        // Hold the connection open so the client reads our response
+        // rather than an EOF.
+        std::thread::sleep(Duration::from_millis(2_000));
+    });
+
+    let out = Command::new(bin())
+        .args(["send", "--socket"])
+        .arg(&socket)
+        .args(["--surface", "1", "--text", "hi"])
+        .env_remove("MTYX_MUX_SOCKET")
+        .env_remove("CMUX_MUX_SOCKET")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "legacy confirmed send must exit 1: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("legacy_host_receipt_rejected"), "stderr: {stderr}");
+    assert!(stderr.contains("--no-confirm"), "stderr must name the remedy: {stderr}");
+
+    // --no-confirm skips the pre-flight entirely, so against this
+    // one-shot fake daemon the send surfaces as a transport error
+    // (exit 3) — distinct from the capability rejection above.
+    let raw = Command::new(bin())
+        .args(["send", "--socket"])
+        .arg(&socket)
+        .args(["--surface", "1", "--text", "hi", "--no-confirm"])
+        .env_remove("MTYX_MUX_SOCKET")
+        .env_remove("CMUX_MUX_SOCKET")
+        .output()
+        .unwrap();
+    assert_eq!(
+        raw.status.code(),
+        Some(3),
+        "unconfirmed send must bypass the gate (transport error against the fake): {raw:?}"
+    );
+
+    server.join().unwrap();
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -778,6 +907,51 @@ fn wait_agent_status_returns_immediately_when_state_matches() {
     assert_eq!(value["message"].as_str(), Some("all green"));
     assert!(value["elapsed_ms"].as_u64().unwrap() < 2000, "should be immediate");
     assert!(value["text"].as_str().is_some(), "payload includes the read payload");
+}
+
+#[test]
+fn send_blocked_refuses_with_exit_3_and_no_input() {
+    // Issue #93: a blocked pane refuses `send` with the structured
+    // `agent_blocked` error and CLI exit 3, and writes nothing; `--force`
+    // bypasses the gate (exit 0).
+    let server = HeadlessServer::start("send-blocked");
+    let workspace = cli(&server, &["new-workspace", "--name", "blocked-send"]);
+    assert_success(&workspace);
+    let surface = String::from_utf8(workspace.stdout).unwrap().trim().parse::<u64>().unwrap();
+    let surface_str = surface.to_string();
+
+    let report = cli(
+        &server,
+        &["report-agent", "--surface", &surface_str, "--state", "blocked", "--source", "hook"],
+    );
+    assert_success(&report);
+
+    let send = cli(&server, &["--json", "send", "--surface", &surface_str, "--text", "hi"]);
+    assert_eq!(
+        send.status.code(),
+        Some(3),
+        "blocked send must exit 3; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&send.stdout),
+        String::from_utf8_lossy(&send.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&send.stdout).unwrap();
+    assert_eq!(value["ok"], serde_json::json!(false), "envelope: {value}");
+    assert_eq!(value["error"]["code"], serde_json::json!(3), "exit code in envelope: {value}");
+    assert!(
+        value["error"]["message"].as_str().unwrap_or("").contains("agent_blocked"),
+        "message must name the code: {value}"
+    );
+
+    // --force bypasses the gate and the byte lands.
+    let forced = cli(
+        &server,
+        &["--json", "send", "--surface", &surface_str, "--text", "hi", "--force", "--no-confirm"],
+    );
+    assert_success(&forced);
+    // A successful `send` prints only the (empty) data payload under
+    // `--json`; the exit status is the contract.
+    let forced_value: serde_json::Value = serde_json::from_slice(&forced.stdout).unwrap();
+    assert!(forced_value.is_object(), "forced send payload: {forced_value}");
 }
 
 #[test]
@@ -2275,12 +2449,23 @@ fn pane_worktree_create_failure_returns_exit_1_and_cwd_unchanged() {
     assert_eq!(
         failed.status.code(),
         Some(1),
-        "git failure must surface as exit 1 (AC7), got {:?}\nstderr: {}",
+        "git failure must surface as exit 1 (AC7), got {:?}\nstdout:\n{}\nstderr: {}",
         failed.status.code(),
+        String::from_utf8_lossy(&failed.stdout),
         String::from_utf8_lossy(&failed.stderr)
     );
-    assert!(String::from_utf8_lossy(&failed.stderr).contains("not a valid branch name"));
-    assert!(failed.stdout.is_empty(), "no JSON on failure");
+    // Issue #98: under --json a server-reported error is the structured
+    // {"ok":false,"error":{...}} envelope on stdout (was: bare stderr
+    // string) — the git failure text rides error.message.
+    let envelope: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap_or_else(|e| {
+        panic!("envelope not JSON ({e}): {}", String::from_utf8_lossy(&failed.stdout))
+    });
+    assert_eq!(envelope["ok"].as_bool(), Some(false));
+    assert_eq!(envelope["error"]["code"].as_i64(), Some(1));
+    assert!(envelope["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("not a valid branch name"));
 
     // Pane cwd unchanged (AC7) and no record was kept.
     assert_eq!(pane_cwds(&server), before, "pane cwd must be unchanged after failure");
@@ -3608,7 +3793,11 @@ fn rename_makes_old_socket_unreachable_and_keeps_protocol() {
     let v: serde_json::Value = serde_json::from_slice(&id_new.stdout).unwrap();
     assert_eq!(v["session"].as_str(), Some("bar"));
     assert_eq!(v["pid"].as_u64(), Some(daemon_pid as u64));
-    assert_eq!(v["protocol"].as_u64(), Some(6), "rename must not bump the protocol version");
+    assert_eq!(
+        v["protocol"].as_u64(),
+        Some(mux_core::server::PROTOCOL_VERSION as u64),
+        "rename must not bump the protocol version"
+    );
 
     // Old path is gone -> connect fails with exit 3 (transport convention).
     let id_old = run_against(&old_sock, &dir, &["identify"]);
@@ -3868,7 +4057,7 @@ fn identify_reports_new_name_after_rename() {
     assert_success(&id);
     let v: serde_json::Value = serde_json::from_slice(&id.stdout).unwrap();
     assert_eq!(v["session"].as_str(), Some("bar"));
-    assert_eq!(v["protocol"].as_u64(), Some(6));
+    assert_eq!(v["protocol"].as_u64(), Some(mux_core::server::PROTOCOL_VERSION as u64));
 
     let _ = child.kill();
     let _ = child.wait();
@@ -4401,6 +4590,170 @@ fn layout_export_refuses_symlinked_output() {
     assert_eq!(fs::read_to_string(&target).unwrap(), "", "the symlink target must be untouched");
 }
 
+// -- issue #84: screenshot -------------------------------------------------
+
+/// AC1: `screenshot --surface <id> <file>` exits 0, prints the written
+/// path, and the file's bytes are exactly `read-screen --surface <id>`
+/// stdout (the request is the same read-screen round-trip). The
+/// `--output <file>` flag form writes the identical bytes.
+#[test]
+fn screenshot_writes_read_screen_bytes_to_file() {
+    let server = HeadlessServer::start("screenshot");
+    let ws = cli(&server, &["new-workspace", "--name", "shot"]);
+    assert_success(&ws);
+    let surface: u64 = String::from_utf8(ws.stdout).unwrap().trim().parse().unwrap();
+
+    // Distinctive bytes on the pane so the capture is not incidental.
+    let marker = format!("SHOTMARK_{}", std::process::id());
+    let send = cli(
+        &server,
+        &["send", "--surface", &surface.to_string(), "--text", &format!("printf '{marker}\\n'\n")],
+    );
+    assert_success(&send);
+    let screen = wait_for_screen(&server, surface, &marker);
+    assert!(screen.contains(&marker), "screen did not contain marker; got {screen:?}");
+    // Let the shell settle (next prompt) so both captures below see the
+    // same static screen.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let read = cli(&server, &["read-screen", "--surface", &surface.to_string()]);
+    assert_success(&read);
+    assert!(!read.stdout.is_empty(), "read-screen should have captured the pane");
+
+    // Positional form.
+    let out = server.dir.join("shot.txt");
+    let shot =
+        cli(&server, &["screenshot", "--surface", &surface.to_string(), out.to_str().unwrap()]);
+    assert_success(&shot);
+    assert_eq!(
+        String::from_utf8_lossy(&shot.stdout).trim(),
+        out.display().to_string(),
+        "plain mode prints the written path"
+    );
+    assert_eq!(
+        fs::read(&out).unwrap(),
+        read.stdout,
+        "screenshot file must equal read-screen stdout byte for byte"
+    );
+    assert!(
+        !out.with_extension("txt.tmp").exists(),
+        "the staged tmp file must be renamed away, not left behind"
+    );
+
+    // --output flag form writes the identical bytes.
+    let flagged = server.dir.join("shot-flag.txt");
+    let shot2 = cli(
+        &server,
+        &["screenshot", "--surface", &surface.to_string(), "--output", flagged.to_str().unwrap()],
+    );
+    assert_success(&shot2);
+    assert_eq!(fs::read(&flagged).unwrap(), read.stdout, "--output form must write the same bytes");
+}
+
+/// AC2: the write is staged (tmp) then renamed, never written straight
+/// to the target. Pre-creating a DIRECTORY at the predicted tmp path
+/// makes the staging write fail (remove_file cannot clear a directory);
+/// a tmp+rename writer must then fail nonzero and leave the target's
+/// old bytes untouched, while a direct-to-target writer would have
+/// clobbered them.
+#[test]
+fn screenshot_write_is_staged_then_renamed() {
+    let server = HeadlessServer::start("screenshot-atomic");
+    let ws = cli(&server, &["new-workspace", "--name", "shot-atomic"]);
+    assert_success(&ws);
+    let surface: u64 = String::from_utf8(ws.stdout).unwrap().trim().parse().unwrap();
+
+    let out = server.dir.join("shot.txt");
+    fs::write(&out, "previous capture").unwrap();
+    // Block the predicted staging path with a directory.
+    fs::create_dir_all(out.with_extension("txt.tmp")).unwrap();
+
+    let shot =
+        cli(&server, &["screenshot", "--surface", &surface.to_string(), out.to_str().unwrap()]);
+    assert_ne!(
+        shot.status.code(),
+        Some(0),
+        "a blocked staging path must fail the write, got success\nstdout:\n{}",
+        String::from_utf8_lossy(&shot.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&shot.stderr).contains("writing"),
+        "stderr should name the failed write, got: {}",
+        String::from_utf8_lossy(&shot.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&out).unwrap(),
+        "previous capture",
+        "the target must keep its old bytes when the staged write fails"
+    );
+}
+
+/// AC2: a symlinked output path is refused with a nonzero exit and the
+/// symlink's target is untouched (fs::write would clobber through the
+/// link) — same discipline as layout-export.
+#[test]
+fn screenshot_refuses_symlinked_output() {
+    let server = HeadlessServer::start("screenshot-symlink");
+    let ws = cli(&server, &["new-workspace", "--name", "shot-symlink"]);
+    assert_success(&ws);
+    let surface: u64 = String::from_utf8(ws.stdout).unwrap().trim().parse().unwrap();
+
+    let target = server.dir.join("real-target.txt");
+    fs::write(&target, "").unwrap();
+    let link = server.dir.join("link.txt");
+    symlink(&target, &link).unwrap();
+
+    let shot =
+        cli(&server, &["screenshot", "--surface", &surface.to_string(), link.to_str().unwrap()]);
+    assert_eq!(
+        shot.status.code(),
+        Some(1),
+        "symlinked output must be refused (exit 1), got {:?}\nstderr: {}",
+        shot.status.code(),
+        String::from_utf8_lossy(&shot.stderr)
+    );
+    assert!(String::from_utf8_lossy(&shot.stderr).contains("symlink"));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "", "the symlink target must be untouched");
+}
+
+/// Usage errors are exit 2 with a clear message: no output file at all,
+/// or the file given twice (positional AND --output). No server needed —
+/// the flag checks run before any socket I/O.
+#[test]
+fn screenshot_usage_errors_exit_2() {
+    let dir = unique_temp_dir("screenshot-usage");
+    fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("absent.sock");
+
+    let missing = Command::new(bin())
+        .arg("--socket")
+        .arg(&sock)
+        .args(["screenshot", "--surface", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(2), "missing output file is a usage error");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("--output"),
+        "stderr should name --output, got: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+
+    let both = Command::new(bin())
+        .arg("--socket")
+        .arg(&sock)
+        .args(["screenshot", "--surface", "1", "--output", "a.txt", "b.txt"])
+        .output()
+        .unwrap();
+    assert_eq!(both.status.code(), Some(2), "positional + --output is a usage error");
+    assert!(
+        String::from_utf8_lossy(&both.stderr).contains("once"),
+        "stderr should explain the double pass, got: {}",
+        String::from_utf8_lossy(&both.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Fixture for the install-skill symlink-refusal test.
 ///
 /// Owns a temp "project" dir acting as CWD for `mtyx claude install-skill`
@@ -4669,4 +5022,299 @@ mod legacy_socket_fallback {
 
         let _ = fs::remove_dir_all(&base);
     }
+}
+
+// --- issue #98: CLI ergonomics batch --------------------------------------
+// (flag order / `=` forms, SIGPIPE pipe-close, `--` passthrough +
+// case-sensitive kill, structured --json errors)
+
+/// AC2: `--flag value` and `--flag=value` are interchangeable, and
+/// flags parse the same before or after the positional. The screenshot
+/// verb is the positional-taking one: every spelling must produce a
+/// file whose bytes equal `read-screen`'s stdout.
+#[test]
+fn flag_forms_and_orders_produce_the_same_request() {
+    let server = HeadlessServer::start("flag-forms");
+    let ws = cli(&server, &["new-workspace", "--name", "flag-forms"]);
+    assert_success(&ws);
+    let surface: u64 = String::from_utf8(ws.stdout).unwrap().trim().parse().unwrap();
+    let send = cli(
+        &server,
+        &["send", "--surface", &surface.to_string(), "--text", "printf 'ff-marker\n'\n"],
+    );
+    assert_success(&send);
+    let screen = wait_for_screen(&server, surface, "ff-marker");
+    assert!(screen.contains("ff-marker"));
+
+    // The two read-screen spellings agree byte-for-byte.
+    let spaced = cli(&server, &["read-screen", "--surface", &surface.to_string()]);
+    assert_success(&spaced);
+    let equals = cli(&server, &["read-screen", &format!("--surface={surface}")]);
+    assert_success(&equals);
+    assert_eq!(spaced.stdout, equals.stdout);
+    assert!(!spaced.stdout.is_empty(), "screen must have content to compare against");
+
+    // Every screenshot flag order writes the same bytes as read-screen.
+    // The `--` case doubles as AC3: `--weird.png` is a positional, not a
+    // flag (and `--surface=N` before it still parses). The screenshot
+    // runner prints the path it wrote (relative, as given), so run it
+    // with cwd = the server's temp dir and read the file back from there.
+    let surface_str = surface.to_string();
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        (
+            "flag-then-positional",
+            vec!["screenshot".into(), "--surface".into(), surface_str.clone(), "out1.png".into()],
+        ),
+        (
+            "positional-then-flag",
+            vec!["screenshot".into(), "out2.png".into(), "--surface".into(), surface_str.clone()],
+        ),
+        (
+            "equals-form",
+            vec!["screenshot".into(), format!("--surface={surface}"), "out3.png".into()],
+        ),
+        (
+            "dashdash-positional",
+            vec![
+                "screenshot".into(),
+                format!("--surface={surface}"),
+                "--".into(),
+                "--weird.png".into(),
+            ],
+        ),
+    ];
+    for (tag, argv) in &cases {
+        let out = Command::new(bin())
+            .args(["--socket"])
+            .arg(&server.socket)
+            .args(argv)
+            .current_dir(&server.dir)
+            .env_remove("MTYX_MUX_SOCKET")
+            .env_remove("CMUX_MUX_SOCKET")
+            .output()
+            .unwrap();
+        assert_success(&out);
+        let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let path = server.dir.join(&printed);
+        let written = fs::read(&path).unwrap_or_else(|e| panic!("{tag}: read {path:?}: {e}"));
+        assert_eq!(written, spaced.stdout, "{tag}: file bytes must equal read-screen stdout");
+    }
+
+    // A flag-shaped token after `--` for a verb with no positional slot
+    // is an unexpected ARGUMENT (exit 2), not an unknown flag.
+    let dash = cli(&server, &["read-screen", "--surface", &surface.to_string(), "--", "--weird"]);
+    assert_eq!(dash.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&dash.stderr).contains("unexpected argument"));
+}
+
+/// AC1: a closed downstream pipe must end the CLI quietly — SIGPIPE
+/// (the shell's 141), never a Rust panic (exit 101). The read end of
+/// the pipe is dropped before mtyx's first stdout write (it still has a
+/// socket round trip to do), so the write hits EPIPE; with the default
+/// SIGPIPE disposition restored at the CLI boundary the kernel ends the
+/// process instead of `println!`/flush panicking.
+#[test]
+fn read_screen_pipe_close_exits_quietly_without_panic() {
+    let server = HeadlessServer::start("sigpipe");
+    let ws = cli(&server, &["new-workspace", "--name", "sigpipe"]);
+    assert_success(&ws);
+    let surface: u64 = String::from_utf8(ws.stdout).unwrap().trim().parse().unwrap();
+    let send = cli(
+        &server,
+        &["send", "--surface", &surface.to_string(), "--text", "printf 'pipe-me\n'\n"],
+    );
+    assert_success(&send);
+    let _ = wait_for_screen(&server, surface, "pipe-me");
+
+    let mut child = Command::new(bin())
+        .args(["--socket"])
+        .arg(&server.socket)
+        .args(["read-screen", "--surface", &surface.to_string()])
+        .env_remove("MTYX_MUX_SOCKET")
+        .env_remove("CMUX_MUX_SOCKET")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Close the read end immediately: the child still owes a socket
+    // round trip before it writes, so this close wins the race and every
+    // stdout byte it later writes fails with EPIPE.
+    drop(child.stdout.take());
+    let status = child.wait().unwrap();
+    assert_ne!(
+        status.code(),
+        Some(101),
+        "a closed pipe must never surface as a Rust panic; status {status:?}"
+    );
+    // And when it is a signal death, it must be SIGPIPE itself (13),
+    // i.e. the shell-convention 141 — not some other failure mode.
+    // (map_or, not is_none_or: the repo keeps to conservative syntax.)
+    assert!(
+        status.signal().map_or(true, |sig| sig == 13),
+        "unexpected terminating signal {status:?}"
+    );
+    // The server must be untouched by the client's pipe death.
+    let identify = cli(&server, &["identify"]);
+    assert_success(&identify);
+}
+
+/// AC3: kill-session matches the session name EXACTLY (case-sensitive):
+/// only "mux" exists (the fixture's socket is mux.sock), so "MUX" must
+/// fail with not-found and leave the session alive to prove it.
+///
+/// Not run on macOS: the default APFS volume is case-INsensitive, so the
+/// fixture's `mux.sock` and the lookup for `MUX.sock` are the same
+/// directory entry. The premise (two names differing only in case are
+/// distinct paths) does not hold there, and no CLI-level change can make
+/// it hold. Linux/Windows CI keep the exact-match contract pinned.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn kill_session_matches_name_case_sensitively() {
+    let server = HeadlessServer::start("kill-case");
+
+    let wrong = cli(&server, &["kill-session", "--session", "MUX"]);
+    assert_eq!(wrong.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&wrong.stderr).contains("not found"),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&wrong.stderr)
+    );
+
+    // The case-mismatched kill must not have touched the real session.
+    let identify = cli(&server, &["identify"]);
+    assert_success(&identify);
+    assert!(server.socket.exists(), "live socket must survive a wrong-case kill");
+}
+
+/// AC4: with `--json`, CLI errors return a machine-readable
+/// {"ok":false,"error":{...}} envelope on stdout with the usual nonzero
+/// exit — both client-side usage errors (unknown flag) and
+/// server-reported ones (unknown agent). Non-JSON output is unchanged:
+/// the bare human string on stderr, nothing on stdout.
+#[test]
+fn json_errors_return_structured_envelope() {
+    let server = HeadlessServer::start("json-envelope");
+
+    // Usage error (--file is not an agent-read flag): exit 2 + envelope,
+    // wherever --json sits on the line (the parse aborts before the
+    // flag is recorded, so the raw argv is scanned).
+    for argv in [
+        vec!["agent-read", "--file", "/nope", "--json"],
+        vec!["--json", "agent-read", "--file", "/nope"],
+    ] {
+        let out = cli(&server, &argv);
+        assert_eq!(out.status.code(), Some(2), "argv {argv:?}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!("argv {argv:?}: stdout not JSON: {e}: {}", String::from_utf8_lossy(&out.stdout))
+        });
+        assert_eq!(value["ok"].as_bool(), Some(false), "argv {argv:?}");
+        assert_eq!(value["error"]["code"].as_i64(), Some(2), "argv {argv:?}");
+        assert!(
+            value["error"]["message"].as_str().unwrap_or("").contains("--file"),
+            "argv {argv:?}: envelope {value}"
+        );
+    }
+
+    // Server-reported error: exit 1 + envelope.
+    let unknown = cli(&server, &["--json", "agent-read", "--target", "nosuch-agent"]);
+    assert_eq!(unknown.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&unknown.stdout).unwrap();
+    assert_eq!(value["ok"].as_bool(), Some(false));
+    assert_eq!(value["error"]["code"].as_i64(), Some(1));
+    assert!(value["error"]["message"].as_str().unwrap_or("").contains("unknown agent"));
+
+    // Non-JSON errors are unchanged: human string on stderr, empty stdout.
+    let human = cli(&server, &["agent-read", "--target", "nosuch-agent"]);
+    assert_eq!(human.status.code(), Some(1));
+    assert!(human.stdout.is_empty(), "non-JSON errors keep stdout clean");
+    assert!(String::from_utf8_lossy(&human.stderr).contains("unknown agent"));
+}
+
+// --- Issue #85: wait-ready post-spawn health check ---
+
+/// AC1 end to end through the real binary: a freshly spawned shell pane
+/// becomes `ready:true` with spawn metadata (`child.pid`/`child.comm` and
+/// `prompt_seen`) and exits 0.
+///
+/// Linux-only: `ready` requires an observed process-tree child, and child
+/// enumeration is `/proc`-based (`mux_core::process::direct_children`
+/// documents "empty on non-Linux"). Its non-Linux counterpart below pins
+/// what the verb does there instead.
+#[test]
+#[cfg(target_os = "linux")]
+fn wait_ready_json_reports_ready_with_child() {
+    let server = HeadlessServer::start("wait-ready");
+    let workspace = cli(&server, &["new-workspace", "--name", "ready"]);
+    assert_success(&workspace);
+    let surface = String::from_utf8(workspace.stdout).unwrap().trim().parse::<u64>().unwrap();
+
+    // Give the login shell a moment to draw its prompt and fork nothing
+    // (the shell itself is the PTY child); wait-ready handles the rest.
+    let ready = cli(
+        &server,
+        &["--json", "wait-ready", "--surface", &surface.to_string(), "--timeout", "5000"],
+    );
+    assert_success(&ready);
+    let value: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+    assert_eq!(value["ready"].as_bool(), Some(true), "payload: {value}");
+    assert_eq!(value["surface"].as_u64(), Some(surface));
+    assert_eq!(value["prompt_seen"].as_bool(), Some(true), "payload: {value}");
+    assert!(value["child"]["pid"].as_u64().unwrap_or(0) > 0, "payload: {value}");
+    assert!(!value["child"]["comm"].as_str().unwrap_or("").is_empty(), "payload: {value}");
+    assert!(value["elapsed_ms"].is_u64());
+}
+
+/// Non-Linux counterpart to the test above: with no `/proc` there is no
+/// process-tree child to observe, so `ready` stays false (exit 1) while
+/// `prompt_seen` still reports the screen half — a caller can tell "shell
+/// up, exit gate not satisfiable here" from "nothing yet".
+///
+/// This pins the *existing* degraded behaviour so it cannot change
+/// silently; making `wait-ready` usably ready on macOS/Windows needs a
+/// per-platform child enumeration (sysctl/`KERN_PROC` on macOS, job
+/// objects on Windows) and is tracked in #105.
+#[test]
+#[cfg(not(target_os = "linux"))]
+fn wait_ready_without_process_enumeration_reports_prompt_seen_only() {
+    let server = HeadlessServer::start("wait-ready-noproc");
+    let workspace = cli(&server, &["new-workspace", "--name", "ready"]);
+    assert_success(&workspace);
+    let surface = String::from_utf8(workspace.stdout).unwrap().trim().parse::<u64>().unwrap();
+
+    let ready = cli(
+        &server,
+        &["--json", "wait-ready", "--surface", &surface.to_string(), "--timeout", "5000"],
+    );
+    assert_eq!(
+        ready.status.code(),
+        Some(1),
+        "no child can be observed without /proc, so ready must stay false:\n{}",
+        String::from_utf8_lossy(&ready.stdout)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+    assert_eq!(value["ready"].as_bool(), Some(false), "payload: {value}");
+    assert_eq!(value["prompt_seen"].as_bool(), Some(true), "payload: {value}");
+    assert!(value["child"].is_null(), "payload: {value}");
+    assert_eq!(value["surface"].as_u64(), Some(surface));
+}
+
+/// AC2 end to end: a surface that cannot become ready (here: one already
+/// closed) exits 1 but still prints `ready:false` as JSON, so a headless
+/// caller gets both a gateable exit code and a parseable payload.
+#[test]
+fn wait_ready_timeout_json_ready_false_exits_nonzero() {
+    let server = HeadlessServer::start("wait-ready-fail");
+    let workspace = cli(&server, &["new-workspace", "--name", "wedge"]);
+    assert_success(&workspace);
+    let surface = String::from_utf8(workspace.stdout).unwrap().trim().parse::<u64>().unwrap();
+    let close = cli(&server, &["close-surface", "--surface", &surface.to_string()]);
+    assert_success(&close);
+
+    let not_ready = cli(
+        &server,
+        &["--json", "wait-ready", "--surface", &surface.to_string(), "--timeout", "200"],
+    );
+    assert_eq!(not_ready.status.code(), Some(1), "not-ready must exit nonzero");
+    let value: serde_json::Value = serde_json::from_slice(&not_ready.stdout).unwrap();
+    assert_eq!(value["ready"].as_bool(), Some(false), "payload: {value}");
+    assert_eq!(value["child"], serde_json::Value::Null, "payload: {value}");
 }

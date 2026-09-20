@@ -19,10 +19,17 @@
 //! captured faithfully but restored as an ordinary local tab, with a
 //! `MuxEvent::Status` noting the downgrade rather than failing silently.
 
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Node, Screen, State};
 use crate::{PaneId, Rgb, SplitDir};
+
+/// Issue #95: how many rename-aside recovery copies to retain per session.
+/// Older ones are pruned on each new backup, so a session can never
+/// accumulate unbounded copies of a snapshot that keeps failing to parse.
+pub const BACKUP_KEEP: usize = 5;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 enum DirSnapshot {
@@ -125,22 +132,135 @@ impl SessionSnapshot {
         self.workspaces.is_empty()
     }
 
-    pub fn load(path: &std::path::Path) -> Option<Self> {
-        let contents = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&contents).ok()
+    /// Issue #95: an unloadable snapshot is never overwritten in place.
+    /// If the file EXISTS but cannot be read or parsed (truncated/torn
+    /// write, schema drift), it is renamed aside into
+    /// `session-backups/<session>.<unix-ts>.json` (keeping the last
+    /// [`BACKUP_KEEP`]) and `None` is returned so the caller starts fresh.
+    /// A missing file is the ordinary first-run case: nothing to do, and
+    /// nothing on disk is touched.
+    pub fn load(path: &Path) -> Option<Self> {
+        // Issue #87: mirror the runtime-dir discipline on the sessions
+        // dir at load time too, so a pre-existing (or concurrently
+        // recreated) dir is tightened before we read a snapshot out of
+        // it. Best-effort: an unwritable dir should not make an existing
+        // snapshot unreadable.
+        if let Some(dir) = path.parent() {
+            let _ = crate::platform::restrict_directory(dir);
+        }
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            // Absent: the ordinary first-run case. Leave the filesystem
+            // alone and report nothing to restore.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            // Present but unreadable (e.g. a torn write left invalid
+            // UTF-8): preserve it rather than let the next save clobber
+            // it, then start fresh.
+            Err(_) => {
+                backup_unloadable_snapshot(path);
+                return None;
+            }
+        };
+        match serde_json::from_str(&contents) {
+            Ok(snapshot) => Some(snapshot),
+            Err(_) => {
+                backup_unloadable_snapshot(path);
+                None
+            }
+        }
     }
 
     /// Writes atomically (write-to-temp then rename) so a crash or a
     /// concurrent read never observes a truncated file.
+    ///
+    /// Issue #87: snapshots name cwds, workspaces and remote SSH hosts,
+    /// so the `sessions/` dir is `restrict_directory`d (0700) and the
+    /// temp file `restrict_file`d (0600) before the rename lands it at
+    /// the canonical name — the same discipline the runtime dir already
+    /// uses. The rename preserves the temp file's mode, so the final
+    /// snapshot is 0600 too.
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
+            crate::platform::restrict_directory(dir)?;
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json)?;
+        crate::platform::restrict_file(&tmp)?;
         std::fs::rename(&tmp, path)
+    }
+}
+
+/// Issue #95: the name of a session's snapshot without its extension
+/// (the `<session>` half of `<session>.<ts>.json`). `None` for a path with
+/// no UTF-8 file stem.
+fn session_stem(path: &Path) -> Option<&str> {
+    path.file_stem()?.to_str()
+}
+
+/// Issue #95: parse the unix-second timestamp out of a backup filename
+/// (`<session>.<ts>.json`, or `<session>.<ts>-<n>.json` for a same-second
+/// collision). Returns `None` for anything that is not this session's
+/// backup, so pruning can never touch an unrelated file.
+fn backup_timestamp(file_name: &str, session: &str) -> Option<u64> {
+    let rest = file_name.strip_prefix(session)?.strip_prefix('.')?.strip_suffix(".json")?;
+    let ts = rest.split('-').next()?;
+    ts.parse().ok()
+}
+
+/// Issue #95: move an unloadable snapshot into the backup dir, never
+/// deleting it, then prune that session's older copies. Returns the backup
+/// path on success.
+///
+/// Best-effort by design: if the rename fails (e.g. a read-only state dir)
+/// we return `None` and leave the original in place — the shutdown guard in
+/// `Mux::write_snapshot_to` is what stops a later save from clobbering it.
+pub fn backup_unloadable_snapshot(path: &Path) -> Option<PathBuf> {
+    let session = session_stem(path)?;
+    let dir = crate::platform::session_backup_dir_for(path);
+    std::fs::create_dir_all(&dir).ok()?;
+    // Issue #87 discipline, extended to the backup dir: it holds the same
+    // cwds/hosts as the snapshot, so it is 0700 and each copy 0600.
+    let _ = crate::platform::restrict_directory(&dir);
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // A same-second collision (two corrupt snapshots read back to back)
+    // must not clobber the first backup; suffix a counter.
+    let mut dest = dir.join(format!("{session}.{ts}.json"));
+    let mut n = 1u32;
+    while dest.exists() {
+        dest = dir.join(format!("{session}.{ts}-{n}.json"));
+        n += 1;
+    }
+    std::fs::rename(path, &dest).ok()?;
+    let _ = crate::platform::restrict_file(&dest);
+    prune_backups(&dir, session, BACKUP_KEEP);
+    Some(dest)
+}
+
+/// Issue #95: retain the newest `keep` backups for `session`, removing
+/// older ones. Only files that parse as this session's backups are ever
+/// considered for removal.
+pub fn prune_backups(backup_dir: &Path, session: &str, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(backup_dir) else { return };
+    let mut backups: Vec<(u64, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(ts) = backup_timestamp(name, session) {
+            backups.push((ts, entry.path()));
+        }
+    }
+    // Newest first; the path breaks ties deterministically for
+    // same-second copies (`...-1`, `...-2`).
+    backups.sort_by(|a, b| (b.0, &b.1).cmp(&(a.0, &a.1)));
+    for (_, stale) in backups.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(stale);
     }
 }
 
@@ -321,6 +441,22 @@ fn restore_layout(layout: &LayoutSnapshot) -> RestoreLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn scratch_dir(label: &str) -> PathBuf {
+        let n = DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "mtyx_persist_test_{}_{}_{}",
+            std::process::id(),
+            n,
+            label
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
 
     #[test]
     fn shell_quote_handles_spaces_and_single_quotes() {
@@ -383,5 +519,65 @@ mod tests {
         assert_eq!(workspaces[0].screens[0].panes.len(), 2);
         assert_eq!(workspaces[0].screens[0].panes[1].name, Some("logs"));
         assert!(matches!(workspaces[0].screens[0].layout, RestoreLayout::Split { .. }));
+    }
+
+    /// Issue #95: an unloadable snapshot is renamed aside, not deleted,
+    /// and the caller sees a fresh start.
+    #[test]
+    fn unloadable_snapshot_is_renamed_aside_not_deleted() {
+        let dir = scratch_dir("rename_aside");
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("main.json");
+        std::fs::write(&path, b"{\"workspaces\": [ truncated").unwrap();
+
+        assert!(SessionSnapshot::load(&path).is_none(), "corrupt snapshot must not load");
+        assert!(!path.exists(), "corrupt snapshot must be moved, not left to be overwritten");
+
+        let backups: Vec<_> = std::fs::read_dir(dir.join("session-backups"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(backups.len(), 1, "exactly one backup expected, got {backups:?}");
+        assert!(backups[0].starts_with("main."), "named <session>.<ts>.json: {backups:?}");
+        assert!(backups[0].ends_with(".json"));
+    }
+
+    /// Issue #95: a missing file is the ordinary first-run case — no
+    /// backup dir is created and nothing is touched.
+    #[test]
+    fn missing_snapshot_is_not_backed_up() {
+        let dir = scratch_dir("missing");
+        let path = dir.join("sessions").join("main.json");
+        assert!(SessionSnapshot::load(&path).is_none());
+        assert!(!dir.join("session-backups").exists());
+    }
+
+    /// Issue #95: pruning keeps only the newest `keep` copies and never
+    /// removes a same-named file belonging to a different session.
+    #[test]
+    fn pruning_retains_newest_and_ignores_other_sessions() {
+        let dir = scratch_dir("prune");
+        let backups = dir.join("session-backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        for ts in 1..=8u64 {
+            std::fs::write(backups.join(format!("main.{ts}.json")), b"x").unwrap();
+        }
+        // A sibling session's backup and an unrelated file must survive.
+        std::fs::write(backups.join("work.1.json"), b"x").unwrap();
+        std::fs::write(backups.join("notes.txt"), b"x").unwrap();
+
+        prune_backups(&backups, "main", 5);
+
+        let mut remaining: Vec<u64> = std::fs::read_dir(&backups)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| backup_timestamp(&e.file_name().to_string_lossy(), "main"))
+            .collect();
+        remaining.sort_unstable();
+        assert_eq!(remaining, vec![4, 5, 6, 7, 8], "newest five retained");
+        assert!(backups.join("work.1.json").exists(), "other session untouched");
+        assert!(backups.join("notes.txt").exists(), "unrelated file untouched");
     }
 }

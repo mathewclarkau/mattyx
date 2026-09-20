@@ -24,6 +24,7 @@ mod help;
 mod hook_merge;
 mod host_colors;
 mod keys;
+mod machine;
 mod opencode_hook;
 mod pi_hook;
 mod plugin;
@@ -85,6 +86,29 @@ pub(crate) fn shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(Ordering::Acquire)
 }
 
+/// Issue #98: restore the default SIGPIPE disposition for
+/// control-socket CLI invocations. Rust starts with SIGPIPE ignored, so
+/// a write to a pipe whose reader exited (`mtyx read-screen --surface X
+/// | head -1`) surfaces as an EPIPE error — and through `println!`
+/// (list-sessions, subscribe, the JSON envelopes) as a panic, exit
+/// 101. With the default disposition the kernel ends the process
+/// quietly with SIGPIPE instead (the shell's 141, matching `head`'s own
+/// convention). Installed only on the CLI paths (cli::run and the
+/// --session-list --json dump): the TUI/server keep SIG_IGN so a dead
+/// client socket stays a handled EPIPE error, never a signal death,
+/// and PTY children spawned in server mode inherit an unchanged
+/// disposition. A no-op on Windows, where a closed pipe is a regular
+/// write error.
+#[cfg(unix)]
+pub(crate) fn reset_sigpipe_default() {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn reset_sigpipe_default() {}
+
 /// Install the terminate-shutdown hook: SIGTERM/SIGINT/SIGHUP on unix;
 /// CTRL_C/CTRL_BREAK/CTRL_CLOSE via `SetConsoleCtrlHandler` on Windows
 /// (routed to the same `SHUTDOWN_REQUESTED` flag, so the shutdown path
@@ -142,10 +166,13 @@ USAGE:
   mtyx agents <list|install>     Manage all agent hook integrations (see below)
   mtyx plugin <subcommand> Manage mtyx-plugin.toml manifests (see below)
   mtyx ssh <host> [OPTS]   Open a remote workspace over SSH (see below)
+  mtyx machine <subcommand>  Manage saved SSH machines (see below)
 
 OPTIONS:
   --session <name>   Session name (default: main). Determines the socket path.
   --socket <path>    Explicit control socket path.
+  --machine <label>  Route the verb to a saved SSH machine (see MACHINES
+                     below) instead of the local socket. No TUI.
   --headless         Run only the control socket, no TUI.
   --term <value>     TERM for child shells (default: xterm-256color).
   --apply-local-config
@@ -200,8 +227,8 @@ MOUSE
   screen entries to switch screens (+ for a new screen).
 
 CLI VERBS
-  identify, list-workspaces, send, read-screen, vt-state, new-tab,
-  new-browser-tab, new-workspace, new-screen, split, set-ratio,
+  identify, list-workspaces, send, read-screen, screenshot, vt-state,
+  new-tab, new-browser-tab, new-workspace, new-screen, split, set-ratio,
   set-default-colors, close-surface, close-pane, close-screen,
   close-workspace, rename-pane, rename-surface, rename-screen,
   rename-workspace, set-workspace-color, set-status, workspace-color,
@@ -210,14 +237,32 @@ CLI VERBS
   move-workspace, scroll-surface, subscribe, attach-surface, report-agent,
   list-agents, agent-read, agent-send, wait-agent-status, detect-agent,
   detect-agents, agent-pattern-add, agent-pattern-list,
-  agent-pattern-remove, browser-reload, list-sessions,
+  agent-pattern-remove, notify-ack, browser-reload, list-sessions,
   kill-session, kill-stale, rename-session, layout-export, layout-apply,
   layout-export-all, theme list,
   pane-worktree-create, pane-worktree-list, pane-worktree-remove
       (also spelled `mtyx pane worktree <create|list|remove>`; issue #77)
 
+FLAG SYNTAX (issue #98)
+  Every verb flag accepts `--flag value` and `--flag=value`
+  interchangeably, in any position relative to positionals (so
+  `screenshot <file> --surface 1` and `--surface 1 <file>` are the
+  same command). A bare `--` ends flag parsing: everything after it
+  is a positional, never a flag. With `--json`, errors return a
+  machine-readable `{\"ok\":false,\"error\":{...}}` envelope on stdout
+  (exit codes unchanged).
+
+SHORTHAND ALIASES (issue #91)
+  ls -> list-workspaces    new -> new-workspace    at -> attach
+  read -> read-screen      shot -> screenshot
+      Rewritten to the canonical spelling before dispatch (exact
+      whole-word match on the verb only, so `list-sessions`, `new-tab`,
+      `attach-surface` etc. are never shadowed). Output — including
+      `--json` — is byte-identical to the long form.
+
 SEND
   mtyx send --surface <id> --text <text> [--shell auto|fish|bash|zsh|sh|nu|raw]
+            [--no-confirm] [--timeout-ms N]
       Writes input to a PTY surface (stdin is used when neither --text nor
       --bytes is given). --shell enables shell-aware sanitisation (issue
       #35): with fish/bash/zsh/nu, a leading newline is prefixed when the
@@ -226,6 +271,13 @@ SEND
       instead of being interpreted by the shell's line editor. auto
       resolves the pane's shell from /proc on Linux. Default: raw
       (verbatim passthrough, unchanged from before).
+      Confirmed input (issue #88) is the DEFAULT: the command exits 0 only
+      after the daemon observes the input consumed (the surface echoed or
+      advanced, or the child exited) within --timeout-ms (default 5000).
+      --no-confirm restores fire-and-forget. Against a daemon without the
+      input-ACK capability (protocol < 7) a confirmed send fails with
+      legacy_host_receipt_rejected instead of silently downgrading;
+      oversized confirmed input (over 1 MiB) fails with oversized_input.
 
 LAYOUT EXPORT/APPLY (issue #76)
   mtyx layout-export --workspace <name-or-id> --output <file>.json
@@ -247,6 +299,16 @@ LAYOUT EXPORT/APPLY (issue #76)
       Layout-export records these argv/env pairs; for remote sessions
       compose `layout-apply` against the remote socket with a follow-up
       `mtyx attach --apply-local-config`.
+
+SCREENSHOT (issue #84)
+  mtyx screenshot --surface <id> <file>
+  mtyx screenshot --surface <id> --output <file>
+      Write a surface's visible text to <file> — the exact bytes
+      `mtyx read-screen --surface <id>` prints to stdout (the same
+      read-screen request; there is no separate server command).
+      Client-side atomic write (tmp + rename); symlinked outputs are
+      refused. Exit codes: 0 ok · 1 server/file error · 2 bad flags ·
+      3 connect failure.
 
 AGENT DETECTION
   mtyx detect-agent --surface <id>
@@ -394,6 +456,29 @@ REMOTE (SSH) WORKSPACES
       persistent mode: closing the tab detaches without killing the
       remote shell, and this session's own daemon restarting reattaches
       to it automatically (see mux/docs/getting-started.md).
+
+MACHINES (issue #94, multi-machine SSH fleet)
+  mtyx machine add <label> <user@host>
+      Save an SSH destination under a short label. Persisted in the
+      mattyx config dir (machines.json, 0600). Re-adding a label
+      repoints it. SSH aliases from the config dir work; the target is
+      passed to ssh verbatim.
+  mtyx machine list [--json]
+      List saved machines (one `<label>\t<target>` per line, or a JSON
+      object {\"machines\":[{\"label\":...,\"target\":...}]}).
+  mtyx machine remove <label>
+      Forget a machine. Unknown label is an error.
+  mtyx --machine <label> <verb> [args]
+      Run a control verb against that machine's mux server over SSH
+      (ssh -o BatchMode=yes <target> mtyx <verb> ...), with no TUI. The
+      read/write trio - list-workspaces, send, read-screen - and every
+      other verb work this way. A dropped transport is retried up to
+      3 times (250ms, then 1s) before giving up.
+      Failure is explicit: an unknown label prints `unknown machine
+      '<label>'` and exits nonzero WITHOUT contacting any local socket,
+      and a failed remote command exits with the remote's status - the
+      verb is never silently re-run locally.
+      Windows SSH hosts are out of scope.
 ";
 
 #[derive(Clone)]
@@ -534,6 +619,7 @@ fn main() {
             && first != "agents"
             && first != "agent-pattern"
             && first != "ssh"
+            && first != "machine"
             && first != "socket-watchdog"
         {
             if plugin::lookup_plugin(first).is_ok() {
@@ -576,6 +662,10 @@ fn main() {
     if raw_args.first().map(|arg| arg.as_str()) == Some("ssh") {
         std::process::exit(ssh_bootstrap::run(&raw_args[1..]));
     }
+    // Issue #94: `mtyx machine add|list|remove` — the SSH fleet registry.
+    if raw_args.first().map(|arg| arg.as_str()) == Some("machine") {
+        std::process::exit(machine::run(&raw_args[1..]));
+    }
     if raw_args.first().map(|arg| arg.as_str()) == Some("socket-watchdog") {
         std::process::exit(socket_watchdog::run(&raw_args[1..]));
     }
@@ -583,6 +673,10 @@ fn main() {
     while command_index < raw_args.len() {
         match raw_args[command_index].as_str() {
             "--session" | "--socket" => command_index += 2,
+            // Issue #98: `--flag=value` spellings of the global flags.
+            arg if arg.starts_with("--socket=") || arg.starts_with("--session=") => {
+                command_index += 1
+            }
             "--json" => command_index += 1,
             _ => break,
         }
@@ -637,6 +731,11 @@ fn main() {
         }
         std::process::exit(cli::run(&args, USAGE));
     }
+    // Issue #91: tmux-style shorthands (`ls`, `new`, `at`, ...) rewrite
+    // to the canonical spelling before dispatch — and before
+    // `is_cli_invocation`, which would not recognise a bare alias as a
+    // verb (nor would `at` reach the `attach` subcommand below).
+    cli::resolve_verb_alias(&mut raw_args);
     // Issue #77: accept the documented three-word form `mtyx pane
     // worktree create ...` by rewriting it to the flat verb before CLI
     // dispatch (must run before `is_cli_invocation`, which would not
@@ -654,8 +753,15 @@ fn main() {
             session: Some(args.session.clone()),
             socket: args.socket.clone(),
             json: args.json,
+            // Issue #94: session-list discovery is local-only; --machine
+            // is not a flag of the TUI/attach parser.
+            machine: None,
         };
         if args.json {
+            // Issue #98: this dump is stdout payload too — pipe-close
+            // must end quietly, like every other CLI path (cli::run
+            // resets it for the verb dispatch; this branch bypasses it).
+            reset_sigpipe_default();
             std::process::exit(cli::run_attach_session_list_json(&global));
         }
         // Interactive picker (Claims 2-7). It restores the terminal on every

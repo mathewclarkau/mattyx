@@ -6,6 +6,8 @@ use std::time::Duration;
 use mux_core::platform::transport;
 use serde_json::{json, Value};
 
+use crate::machine;
+
 const REQUEST_ID: u64 = 1;
 
 type BuildFn = fn(&FlagMap) -> Result<Value, UsageError>;
@@ -25,13 +27,26 @@ pub(crate) struct GlobalArgs {
     pub(crate) session: Option<String>,
     pub(crate) socket: Option<PathBuf>,
     pub(crate) json: bool,
+    /// Issue #94: route the verb to a saved SSH machine's mux server
+    /// (`mtyx machine add <label> <user@host>`) instead of the local
+    /// socket. Resolution to an SSH target happens before any socket
+    /// work, so an unknown label can never fall back to a local call.
+    pub(crate) machine: Option<String>,
 }
 
 /// Verb flags that are boolean and accept the bare form (`--group`) —
 /// a missing or flag-looking following token means `true` instead of an
 /// error or swallowing the next flag as a value (issue #100). Valued
-/// forms (`--group 1`, `--group 0`) still work.
-const BARE_BOOL_FLAGS: &[&str] = &["group"];
+/// forms (`--group 1`, `--group 0`) still work. `confirm`/`no-confirm`
+/// (issue #88) join the same convention.
+const BARE_BOOL_FLAGS: &[&str] =
+    &["group", "confirm", "no-confirm", "force", "wait", "require-transition", "all"];
+
+/// Verbs that accept one bare positional argument alongside their flags
+/// (issue #84: `mtyx screenshot --surface <id> <file>`), mapped onto the
+/// named flag of the same meaning (`<file>` == `--output <file>`). Passing
+/// both forms is a usage error.
+const POSITIONAL_FLAG_VERBS: &[(&str, &str)] = &[("screenshot", "output")];
 
 #[derive(Default)]
 struct FlagMap {
@@ -80,7 +95,23 @@ const VERBS: &[VerbSpec] = &[
     },
     VerbSpec {
         name: "send",
-        allowed: &["surface", "text", "bytes", "send-cr", "shell"],
+        // Issue #88: --confirm (the default) / --no-confirm and
+        // --timeout-ms for receipted input. Issue #93: --force bypasses
+        // the blocked-send gate; --wait/--wait-timeout-ms require an
+        // observed transition into working/blocked.
+        allowed: &[
+            "surface",
+            "text",
+            "bytes",
+            "send-cr",
+            "shell",
+            "confirm",
+            "no-confirm",
+            "timeout-ms",
+            "force",
+            "wait",
+            "wait-timeout-ms",
+        ],
         build: build_send,
         print: print_empty,
         stream: false,
@@ -293,10 +324,26 @@ const VERBS: &[VerbSpec] = &[
     },
     VerbSpec {
         name: "subscribe",
-        allowed: &[],
-        build: build_no_args,
+        // Issue #92: --client opts into durable-notification replay.
+        allowed: &["client"],
+        build: build_subscribe,
         print: print_empty,
         stream: true,
+    },
+    VerbSpec {
+        // Issue #92: mark durable notifications read for this client.
+        // `--surface <id>` scopes to one pane; omitted acks every pane
+        // with stored notifications. `--all` (default) acks up to the
+        // pane's latest id; `--id <n>` advances the read high-water mark
+        // to that notification id instead. `--client <id>` identifies the
+        // reader and must match the id used on `subscribe` for the ack to
+        // suppress replay there; omitted uses the same empty-string key
+        // an unidentified subscriber gets.
+        name: "notify-ack",
+        allowed: &["surface", "all", "id", "client"],
+        build: build_notify_ack,
+        print: print_notify_ack,
+        stream: false,
     },
     VerbSpec {
         name: "attach-surface",
@@ -414,9 +461,23 @@ const VERBS: &[VerbSpec] = &[
         // The response can take up to --timeout ms, so run_command
         // overrides this verb's socket read timeout.
         name: "wait-agent-status",
-        allowed: &["target", "status", "timeout"],
+        // Issue #93: --require-transition demands an observed state change
+        // at/after the call, not merely a cached state that already
+        // matches.
+        allowed: &["target", "status", "timeout", "require-transition"],
         build: build_wait_agent_status,
         print: print_read_screen,
+        stream: false,
+    },
+    VerbSpec {
+        // Issue #85: block until the surface is ready (prompt up + a
+        // running process-tree child) or --timeout ms elapses. The
+        // response is structured JSON; `ready:false` exits nonzero, so
+        // this is the headless-orchestrator post-spawn gate.
+        name: "wait-ready",
+        allowed: &["surface", "timeout"],
+        build: build_wait_ready,
+        print: print_wait_ready,
         stream: false,
     },
     VerbSpec {
@@ -483,6 +544,18 @@ const VERBS: &[VerbSpec] = &[
         print: print_empty,
         stream: false,
     },
+    VerbSpec {
+        // Issue #84: capture a surface's visible text to a file with the
+        // exact bytes `read-screen` prints to stdout. Like the layout
+        // verbs it is special-cased in `run_command` (client-side file
+        // I/O around the socket round-trip); it rides the plain
+        // `read-screen` request — no new server command.
+        name: "screenshot",
+        allowed: &["surface", "output"],
+        build: build_screenshot,
+        print: print_empty,
+        stream: false,
+    },
 ];
 
 pub fn is_cli_invocation(args: &[String]) -> bool {
@@ -490,6 +563,13 @@ pub fn is_cli_invocation(args: &[String]) -> bool {
 }
 
 pub fn run(args: &[String], usage: &str) -> i32 {
+    // Issue #98: CLI invocations write their payload to stdout, so a
+    // downstream pipe closing early (`... | head -1`) must end the
+    // process quietly via SIGPIPE (the shell's 141), never a Rust
+    // panic (exit 101) from `println!` hitting EPIPE. Only the CLI
+    // paths install this: the TUI/server keep Rust's SIG_IGN so a dead
+    // client socket stays a handled EPIPE error, never a signal death.
+    crate::reset_sigpipe_default();
     match parse(args) {
         Ok(Parsed::Help) => {
             print!("{usage}");
@@ -497,8 +577,12 @@ pub fn run(args: &[String], usage: &str) -> i32 {
         }
         Ok(Parsed::Command(args)) => run_command(args),
         Err(err) => {
-            eprintln!("mtyx: {}", err.0);
-            2
+            // Issue #98: the parse aborted before `--json` could be
+            // recorded in GlobalArgs, so scan the raw argv for the flag
+            // to decide envelope vs human string — `agent-read --file
+            // /nope --json` still gets the machine-readable form.
+            let json = args.iter().any(|a| a == "--json");
+            cli_error(json, 2, &format!("mtyx: {}", err.0))
         }
     }
 }
@@ -518,7 +602,14 @@ fn first_command_arg(args: &[String]) -> FirstCommand {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--socket" | "--session" => i += 2,
+            "--socket" | "--session" | "--machine" => i += 2,
+            // Issue #98: `--flag=value` spellings of the global flags.
+            arg if arg.starts_with("--socket=")
+                || arg.starts_with("--session=")
+                || arg.starts_with("--machine=") =>
+            {
+                i += 1
+            }
             "--json" => i += 1,
             "-h" | "--help" => return FirstCommand::Help,
             arg if arg.starts_with("--") => return FirstCommand::None,
@@ -538,10 +629,19 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
     let mut global = GlobalArgs::default();
     let mut flags = FlagMap::default();
     let mut verb: Option<&'static VerbSpec> = None;
+    // Issue #98: set once a bare `--` is seen after the verb — every
+    // token past it is a positional, never a flag.
+    let mut positional_only = false;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
         match arg {
+            // Issue #98: after `--`, even flag-SHAPED tokens (and the
+            // global-flag literals below) are positionals.
+            _ if positional_only => {
+                take_positional(verb.unwrap(), &mut flags, arg)?;
+                i += 1;
+            }
             "-h" | "--help" | "help" => return Ok(Parsed::Help),
             "--json" => {
                 global.json = true;
@@ -551,12 +651,41 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 global.socket = Some(PathBuf::from(value_after(args, i, "--socket")?));
                 i += 2;
             }
+            // Issue #98: `--flag=value` is accepted everywhere the
+            // space form is (global flags included).
+            _ if arg.starts_with("--socket=") => {
+                global.socket = Some(PathBuf::from(&arg["--socket=".len()..]));
+                i += 1;
+            }
             "--session" => {
                 global.session = Some(value_after(args, i, "--session")?);
                 i += 2;
             }
+            _ if arg.starts_with("--session=") => {
+                global.session = Some(arg["--session=".len()..].to_string());
+                i += 1;
+            }
+            // Issue #94: `--machine <label>` routes the verb to a saved
+            // SSH machine (see machine.rs) with no TUI, in place of the
+            // local socket. Global in the same sense as --session/--json.
+            "--machine" => {
+                global.machine = Some(value_after(args, i, "--machine")?);
+                i += 2;
+            }
+            _ if arg.starts_with("--machine=") => {
+                global.machine = Some(arg["--machine=".len()..].to_string());
+                i += 1;
+            }
             _ if verb.is_none() && verb_by_name(arg).is_some() => {
                 verb = verb_by_name(arg);
+                i += 1;
+            }
+            // Issue #98: bare `--` is the end-of-options marker — no
+            // token after it is ever parsed as a flag. Distinct from
+            // the `--` that must follow `--exec`: that one is consumed
+            // by the `--exec` arm below.
+            "--" if verb.is_some() => {
+                positional_only = true;
                 i += 1;
             }
             // Issue #76: `--exec -- <argv...>` — everything after the
@@ -587,20 +716,32 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 let Some(spec) = verb else {
                     return Err(UsageError(format!("unknown global flag {arg:?}")));
                 };
-                let name = arg.trim_start_matches("--");
+                // Issue #98: both spellings — `--flag value` and
+                // `--flag=value` — land in the same FlagMap slot, in any
+                // position relative to the verb's positionals (the
+                // linear scan below is already order-neutral about them).
+                let (name, inline) = split_flag(arg);
                 if !spec.allowed.contains(&name) {
-                    return Err(UsageError(format!("unknown flag {arg:?} for {}", spec.name)));
+                    return Err(UsageError(format!("unknown flag --{name} for {}", spec.name)));
                 }
-                let bare_bool = BARE_BOOL_FLAGS.contains(&name)
+                let bare_bool = inline.is_none()
+                    && BARE_BOOL_FLAGS.contains(&name)
                     && args.get(i + 1).map(|s| s.starts_with("--")).unwrap_or(true);
-                let value = if bare_bool { "true".to_string() } else { value_after(args, i, arg)? };
+                let value = if let Some(value) = inline {
+                    value.to_string()
+                } else if bare_bool {
+                    "true".to_string()
+                } else {
+                    value_after(args, i, &format!("--{name}"))?
+                };
                 if flags.values.insert(name.to_string(), value).is_some() {
-                    return Err(UsageError(format!("duplicate flag {arg:?}")));
+                    return Err(UsageError(format!("duplicate flag --{name}")));
                 }
-                i += if bare_bool { 1 } else { 2 };
+                i += if bare_bool || inline.is_some() { 1 } else { 2 };
             }
             _ if verb.is_some() => {
-                return Err(UsageError(format!("unexpected argument {arg:?}")));
+                take_positional(verb.unwrap(), &mut flags, arg)?;
+                i += 1;
             }
             _ => return Err(UsageError(format!("unknown argument {arg:?}"))),
         }
@@ -608,6 +749,34 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
 
     let Some(verb) = verb else { return Err(UsageError("missing verb".to_string())) };
     Ok(Parsed::Command(CliArgs { global, verb, flags }))
+}
+
+/// Issue #98: split `--flag[=value]` (the caller guarantees the `--`
+/// prefix) into its name and optional inline value. Splits on the FIRST
+/// `=` so a value may itself contain one (`--env=A=B` → `("env", "A=B")`).
+fn split_flag(arg: &str) -> (&str, Option<&str>) {
+    match arg[2..].split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (&arg[2..], None),
+    }
+}
+
+/// Consume one bare positional for `verb` (issue #84's screenshot
+/// <file>, and since #98 anything after a bare `--`): verbs listed in
+/// POSITIONAL_FLAG_VERBS map it onto its named flag; every other verb
+/// rejects it. Shared by the pre-`--` and post-`--` arms of `parse` so
+/// both positions behave identically.
+fn take_positional(verb: &VerbSpec, flags: &mut FlagMap, arg: &str) -> Result<(), UsageError> {
+    match POSITIONAL_FLAG_VERBS.iter().find(|(name, _)| *name == verb.name) {
+        Some((_, flag)) if !flags.values.contains_key(*flag) => {
+            flags.values.insert(flag.to_string(), arg.to_string());
+            Ok(())
+        }
+        Some((_, flag)) => {
+            Err(UsageError(format!("pass --{flag} once: positional and --{flag} given twice")))
+        }
+        None => Err(UsageError(format!("unexpected argument {arg:?}"))),
+    }
 }
 
 fn value_after(args: &[String], index: usize, flag: &str) -> Result<String, UsageError> {
@@ -618,7 +787,95 @@ fn verb_by_name(name: &str) -> Option<&'static VerbSpec> {
     VERBS.iter().find(|verb| verb.name == name)
 }
 
+/// Issue #98: the `--json` error envelope — `{"ok":false,"error":{...}}`
+/// carrying the process exit code and the human message, so a caller
+/// can branch on `ok` instead of scraping stderr text.
+fn error_envelope(exit: i32, message: &str) -> Value {
+    json!({ "ok": false, "error": { "code": exit, "message": message } })
+}
+
+/// Issue #98: one error surface for the control-socket CLI. Non-JSON
+/// output is byte-identical to the historical bare string on stderr;
+/// with `--json` the same message rides the machine-readable envelope
+/// on stdout. The exit code is the caller's and is passed through
+/// unchanged.
+fn cli_error(json_output: bool, exit: i32, message: &str) -> i32 {
+    if json_output {
+        println!("{}", error_envelope(exit, message));
+    } else {
+        eprintln!("{message}");
+    }
+    exit
+}
+
+/// Issue #88: pre-flight capability negotiation for a confirmed `send`.
+/// Sends `identify` on the same connection and requires the input-ACK
+/// capability record (`mux_core::server::require_input_ack_capability`).
+/// A daemon without the capability (protocol <= 6) yields the structured
+/// `legacy_host_receipt_rejected` error — never a silent downgrade to
+/// fire-and-forget. Transport/protocol failures return exit code 3; the
+/// capability rejection is a server-level error (exit 1).
+fn input_ack_capability_gate(stream: &mut Box<dyn transport::Stream>) -> Result<(), (i32, String)> {
+    let identify = json!({"id": REQUEST_ID, "cmd": "identify"});
+    let mut line = match serde_json::to_vec(&identify) {
+        Ok(mut line) => {
+            line.push(b'\n');
+            line
+        }
+        Err(err) => return Err((2, format!("failed to encode identify pre-flight: {err}"))),
+    };
+    if let Err(err) = stream.write_all(&line).and_then(|_| stream.flush()) {
+        return Err((3, format!("transport error during identify pre-flight: {err}")));
+    }
+    // Read the response byte-wise: the same stream is later handed to a
+    // BufReader, and buffering here could swallow bytes it needs.
+    line.clear();
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => return Err((3, "transport closed before identify response".to_string())),
+            Ok(_) => {
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            Err(err) => {
+                return Err((3, format!("transport error reading identify response: {err}")));
+            }
+        }
+    }
+    let value: Value = match serde_json::from_slice(&line) {
+        Ok(value) => value,
+        Err(err) => return Err((3, format!("bad identify response: {err}"))),
+    };
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        let error = value.get("error").and_then(Value::as_str).unwrap_or("unknown error");
+        return Err((3, format!("identify pre-flight failed: {error}")));
+    }
+    let data = value.get("data").cloned().unwrap_or(Value::Null);
+    match mux_core::server::require_input_ack_capability(&data) {
+        Ok(()) => Ok(()),
+        Err(err) => Err((1, err.to_string())),
+    }
+}
+
 fn run_command(args: CliArgs) -> i32 {
+    // Issue #94: `--machine <label>` routes the verb to a saved SSH
+    // machine's mux server instead of the local socket, with no TUI.
+    // This is checked BEFORE the special-cased verbs below (list-sessions,
+    // screenshot, …) so a machine-scoped invocation can never fall through
+    // to a local-only code path. Unknown labels error out here, before any
+    // socket work (see machine::route_verb), which is the AC2 contract: a
+    // typo'd label never contacts a local socket.
+    if let Some(label) = args.global.machine.clone() {
+        let registry = match machine::load() {
+            Ok(r) => r,
+            Err(e) => return cli_error(args.global.json, 1, &format!("mtyx: {e}")),
+        };
+        let argv = remote_verb_argv(&args);
+        return machine::route_verb(&registry, &label, &argv);
+    }
     match args.verb.name {
         "list-sessions" => return run_list_sessions(&args.global, &args.flags),
         "kill-session" => return run_kill_session(&args.global, &args.flags),
@@ -627,6 +884,7 @@ fn run_command(args: CliArgs) -> i32 {
         "layout-export" => return run_layout_export(&args.global, &args.flags),
         "layout-apply" => return run_layout_apply(&args.global, &args.flags),
         "layout-export-all" => return run_layout_export_all(&args.global, &args.flags),
+        "screenshot" => return run_screenshot(&args.global, &args.flags),
         _ => {}
     }
     let request = match (args.verb.build)(&args.flags) {
@@ -635,17 +893,17 @@ fn run_command(args: CliArgs) -> i32 {
             value["id"] = json!(REQUEST_ID);
             value
         }
-        Err(err) => {
-            eprintln!("mtyx: {}", err.0);
-            return 2;
-        }
+        Err(err) => return cli_error(args.global.json, 2, &format!("mtyx: {}", err.0)),
     };
     let socket_path = resolve_socket(&args.global);
     let mut stream = match transport::connect(&socket_path) {
         Ok(stream) => stream,
         Err(err) => {
-            eprintln!("cannot connect to session socket {}: {err}", socket_path.display());
-            return 3;
+            return cli_error(
+                args.global.json,
+                3,
+                &format!("cannot connect to session socket {}: {err}", socket_path.display()),
+            );
         }
     };
     if args.verb.stream {
@@ -658,28 +916,99 @@ fn run_command(args: CliArgs) -> i32 {
         let wait_ms =
             args.flags.optional("timeout").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
         let _ = stream.set_read_timeout(Some(Duration::from_millis(wait_ms.saturating_add(5_000))));
+    } else if args.verb.name == "wait-ready" {
+        // Issue #85: like wait-agent-status, the reply legitimately
+        // arrives after up to `--timeout` ms (the server's default when
+        // absent is 5 s), so budget the read rather than the 10 s
+        // default.
+        let wait_ms = args
+            .flags
+            .optional("timeout")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(mux_core::server::DEFAULT_WAIT_READY_MS);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(wait_ms.saturating_add(5_000))));
+    } else if args.verb.name == "send"
+        && (request.get("confirm").and_then(Value::as_bool) == Some(true)
+            || request.get("wait_activity_ms").is_some())
+    {
+        // Issue #88/#93: a confirmed or `--wait` send's reply legitimately
+        // arrives after up to `--timeout-ms` (receipt) PLUS
+        // `--wait-timeout-ms` (observed activity), plus the identify
+        // pre-flight below, so budget the socket read accordingly.
+        let ack_ms = request
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(mux_core::server::DEFAULT_INPUT_ACK_TIMEOUT_MS);
+        let wait_ms = request.get("wait_activity_ms").and_then(Value::as_u64).unwrap_or(0);
+        let budget = ack_ms.saturating_add(wait_ms).saturating_add(5_000);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(budget)));
     } else {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    }
+    // Issue #88: confirmed send is capability-gated client-side. The
+    // identify pre-flight refuses a daemon that lacks input-ACK with
+    // `legacy_host_receipt_rejected` (exit 1) instead of silently
+    // downgrading to fire-and-forget.
+    if args.verb.name == "send" && request.get("confirm").and_then(Value::as_bool) == Some(true) {
+        if let Err((code, message)) = input_ack_capability_gate(&mut stream) {
+            return cli_error(args.global.json, code, &message);
+        }
     }
     let mut line = match serde_json::to_vec(&request) {
         Ok(line) => line,
         Err(err) => {
-            eprintln!("failed to encode request: {err}");
-            return 2;
+            return cli_error(args.global.json, 2, &format!("failed to encode request: {err}"));
         }
     };
     line.push(b'\n');
     if let Err(err) = stream.write_all(&line) {
-        eprintln!("transport error: {err}");
-        return 3;
+        return cli_error(args.global.json, 3, &format!("transport error: {err}"));
     }
 
     let mut reader = BufReader::new(stream);
     if args.verb.stream {
-        run_stream(reader)
+        run_stream(reader, args.global.json)
     } else {
-        run_one_response(&mut reader, args.global.json, args.verb.print)
+        // Issue #85: `wait-ready` reports a timeout as `ok:true` +
+        // `ready:false`; map that to a nonzero exit while still printing
+        // the JSON payload, so a headless caller can both read the
+        // structured result and gate on the exit code (AC2).
+        run_one_response(
+            &mut reader,
+            args.global.json,
+            args.verb.print,
+            args.verb.name == "wait-ready",
+        )
     }
+}
+
+/// Issue #94: rebuild the verb's argv for remote execution as
+/// `mtyx <verb> [--flag value | --flag=value] [--json]`. The original
+/// argv is not kept around by `parse`, so the FlagMap (plus the verb
+/// name and the `--exec` argv) is the source of truth. `--machine`
+/// itself is dropped: the remote host resolves its own session, not the
+/// local label registry. Iteration order is deterministic (BTreeMap),
+/// and expandable flags (`--exec`) are re-emitted as their `--exec --
+/// <argv…>` form that the receiving side re-parses identically.
+fn remote_verb_argv(args: &CliArgs) -> Vec<String> {
+    let mut argv = vec![args.verb.name.to_string()];
+    if args.global.json {
+        argv.push("--json".to_string());
+    }
+    for (name, value) in &args.flags.values {
+        argv.push(format!("--{name}"));
+        // Bare booleans were stored as the literal "true"; re-emit the
+        // bare form so the remote parser's bare-bool convention matches.
+        if !(value == "true" && BARE_BOOL_FLAGS.contains(&name.as_str())) {
+            argv.push(value.clone());
+        }
+    }
+    if let Some(exec) = &args.flags.exec {
+        argv.push("--exec".to_string());
+        argv.push("--".to_string());
+        argv.extend(exec.clone());
+    }
+    argv
 }
 
 fn resolve_socket(global: &GlobalArgs) -> PathBuf {
@@ -701,35 +1030,33 @@ fn run_one_response(
     reader: &mut BufReader<Box<dyn transport::Stream>>,
     json_output: bool,
     print_human: PrintFn,
+    fail_unless_ready: bool,
 ) -> i32 {
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
-            Ok(0) => {
-                eprintln!("transport closed before response");
-                return 3;
-            }
+            Ok(0) => return cli_error(json_output, 3, "transport closed before response"),
             Ok(_) => {}
-            Err(err) => {
-                eprintln!("transport error: {err}");
-                return 3;
-            }
+            Err(err) => return cli_error(json_output, 3, &format!("transport error: {err}")),
         }
         let value = match serde_json::from_str::<Value>(&line) {
             Ok(value) => value,
-            Err(err) => {
-                eprintln!("bad response: {err}");
-                return 3;
-            }
+            Err(err) => return cli_error(json_output, 3, &format!("bad response: {err}")),
         };
         if value.get("event").is_some() {
             continue;
         }
-        return print_response(&value, json_output, print_human);
+        return print_response(&value, json_output, print_human, fail_unless_ready);
     }
 }
 
-fn run_stream(mut reader: BufReader<Box<dyn transport::Stream>>) -> i32 {
+/// Issue #98: `json_output` threads the `--json` flag through so a
+/// server-reported error on a streaming verb surfaces as the envelope
+/// too. Behaviour is otherwise unchanged: the loop keeps streaming
+/// until the transport closes; on a closed stdout pipe the process now
+/// ends quietly via SIGPIPE (see `reset_sigpipe_default` in main.rs)
+/// instead of panicking inside `println!`.
+fn run_stream(mut reader: BufReader<Box<dyn transport::Stream>>, json_output: bool) -> i32 {
     let mut line = String::new();
     loop {
         if crate::shutdown_requested() {
@@ -740,12 +1067,10 @@ fn run_stream(mut reader: BufReader<Box<dyn transport::Stream>>) -> i32 {
                 if line.is_empty() {
                     return 0;
                 }
-                eprintln!("transport closed with partial stream line");
-                return 3;
+                return cli_error(json_output, 3, "transport closed with partial stream line");
             }
             Ok(_) if !line.ends_with('\n') => {
-                eprintln!("transport closed with partial stream line");
-                return 3;
+                return cli_error(json_output, 3, "transport closed with partial stream line");
             }
             Ok(_) => {}
             Err(err)
@@ -753,17 +1078,11 @@ fn run_stream(mut reader: BufReader<Box<dyn transport::Stream>>) -> i32 {
             {
                 continue;
             }
-            Err(err) => {
-                eprintln!("transport error: {err}");
-                return 3;
-            }
+            Err(err) => return cli_error(json_output, 3, &format!("transport error: {err}")),
         }
         let value = match serde_json::from_str::<Value>(&line) {
             Ok(value) => value,
-            Err(err) => {
-                eprintln!("bad stream line: {err}");
-                return 3;
-            }
+            Err(err) => return cli_error(json_output, 3, &format!("bad stream line: {err}")),
         };
         if value.get("event").is_some() {
             print!("{}", line.trim_end_matches(['\r', '\n']));
@@ -783,18 +1102,39 @@ fn run_stream(mut reader: BufReader<Box<dyn transport::Stream>>) -> i32 {
             continue;
         }
         let error = value.get("error").and_then(Value::as_str).unwrap_or("unknown error");
-        eprintln!("{error}");
-        return 1;
+        return cli_error(json_output, 1, error);
     }
 }
 
-fn print_response(value: &Value, json_output: bool, print_human: PrintFn) -> i32 {
+fn print_response(
+    value: &Value,
+    json_output: bool,
+    print_human: PrintFn,
+    fail_unless_ready: bool,
+) -> i32 {
     if value.get("ok").and_then(Value::as_bool) != Some(true) {
         let error = value.get("error").and_then(Value::as_str).unwrap_or("unknown error");
-        eprintln!("{error}");
-        return 1;
+        // Issue #93: a blocked-send refusal is a distinct, expected
+        // condition an orchestrator branches on, so it gets its own exit
+        // code (3) rather than the generic server-error 1. The code is
+        // carried on the wire by `ServerError` (see `Response.code`);
+        // fall back to string-matching the `<code>: ` prefix for older
+        // daemons that dropped the field.
+        let code = value.get("code").and_then(Value::as_str);
+        let exit = if code == Some("agent_blocked") || error.starts_with("agent_blocked:") {
+            3
+        } else {
+            1
+        };
+        // Issue #98: a server-reported error under `--json` is the
+        // envelope, not a bare stderr string (non-JSON output unchanged).
+        return cli_error(json_output, exit, error);
     }
     let data = value.get("data").unwrap_or(&Value::Null);
+    // Issue #85: `wait-ready` exits nonzero when the pane is not ready,
+    // but the payload (including `ready:false`) is still printed first
+    // so a headless caller can read the JSON and the exit code both.
+    let not_ready = fail_unless_ready && data.get("ready").and_then(Value::as_bool) != Some(true);
     let mut stdout = io::stdout();
     let result = if json_output {
         serde_json::to_writer(&mut stdout, data)
@@ -804,6 +1144,7 @@ fn print_response(value: &Value, json_output: bool, print_human: PrintFn) -> i32
         print_human(data, &mut stdout)
     };
     match result.and_then(|_| stdout.flush()) {
+        Ok(()) if not_ready => 1,
         Ok(()) => 0,
         Err(err) => {
             eprintln!("stdout error: {err}");
@@ -819,6 +1160,15 @@ fn build_no_args(flags: &FlagMap) -> Result<Value, UsageError> {
 
 fn build_surface(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(json!({ "surface": flags.required_u64("surface")? }))
+}
+
+/// Issue #92: build a `subscribe` request, forwarding the optional client
+/// id that scopes durable-notification replay. No `--client` keeps the
+/// pre-#92 wire shape (an empty object), which older daemons accept.
+fn build_subscribe(flags: &FlagMap) -> Result<Value, UsageError> {
+    let mut value = json!({});
+    flags.insert_optional_string(&mut value, "client");
+    Ok(value)
 }
 
 fn build_pane(flags: &FlagMap) -> Result<Value, UsageError> {
@@ -844,6 +1194,11 @@ fn build_close_workspace(flags: &FlagMap) -> Result<Value, UsageError> {
     }
     Ok(value)
 }
+
+/// Issue #93: default `send --wait` observed-activity budget (30 s) when
+/// `--wait-timeout-ms` is absent. Long enough for an agent to start
+/// working after receiving a prompt, short enough not to hang forever.
+const DEFAULT_SEND_WAIT_MS: u64 = 30_000;
 
 fn build_send(flags: &FlagMap) -> Result<Value, UsageError> {
     let mut value = json!({ "surface": flags.required_u64("surface")? });
@@ -871,6 +1226,54 @@ fn build_send(flags: &FlagMap) -> Result<Value, UsageError> {
             )));
         }
         value["shell"] = json!(shell);
+    }
+    // Issue #88: confirmed (receipted) input is the CLI DEFAULT — the
+    // command exits 0 only after the daemon observes the input consumed
+    // (surface echo/advance or child exit within the timeout).
+    // `--no-confirm` (or `--confirm=false`) preserves the pre-#88
+    // fire-and-forget behavior; the two flags cannot disagree.
+    let confirm_flag = flags.optional_bool("confirm");
+    let no_confirm = flags.optional_bool("no-confirm").unwrap_or(false);
+    if confirm_flag == Some(true) && no_confirm {
+        return Err(UsageError("--confirm and --no-confirm are mutually exclusive".into()));
+    }
+    let confirm = !no_confirm && confirm_flag != Some(false);
+    if confirm {
+        value["confirm"] = json!(true);
+        if let Some(raw) = flags.optional("timeout-ms") {
+            let timeout_ms = parse_u64("timeout-ms", &raw)?;
+            if timeout_ms == 0 {
+                return Err(UsageError("--timeout-ms must be at least 1".into()));
+            }
+            value["timeout_ms"] = json!(timeout_ms);
+        }
+    }
+    // Issue #93: `--force` bypasses the blocked-send gate (raw pre-#93
+    // behaviour). Boolean flag; may be spelled `--force` or `--force=true`.
+    if let Some(force) = flags.optional_bool("force") {
+        value["force"] = json!(force);
+    }
+    // Issue #93: `--wait` requests observed-transition success — the
+    // command returns only after the target agent is seen to enter
+    // working/blocked at/after this send. `--wait-timeout-ms` bounds it
+    // (default 30 s if absent). `--wait` must have a value form too
+    // (`--wait=false` disables), so a bare `--wait` reads as true.
+    if let Some(wait) = flags.optional_bool("wait") {
+        if wait {
+            let timeout_ms = match flags.optional("wait-timeout-ms") {
+                Some(raw) => parse_u64("wait-timeout-ms", &raw)?,
+                None => DEFAULT_SEND_WAIT_MS,
+            };
+            value["wait_activity_ms"] = json!(timeout_ms);
+        } else if flags.optional("wait-timeout-ms").is_some() {
+            return Err(UsageError(
+                "--wait-timeout-ms requires --wait (nothing to wait for otherwise)".into(),
+            ));
+        }
+    } else if flags.optional("wait-timeout-ms").is_some() {
+        return Err(UsageError(
+            "--wait-timeout-ms requires --wait (nothing to wait for otherwise)".into(),
+        ));
     }
     if value.get("text").is_none() && value.get("bytes").is_none() {
         let mut text = String::new();
@@ -1081,6 +1484,8 @@ pub(crate) fn rewrite_pane_worktree_alias(args: &mut Vec<String>) {
     while i < args.len() {
         match args[i].as_str() {
             "--socket" | "--session" => i += 2,
+            // Issue #98: `--flag=value` spellings of the global flags.
+            arg if arg.starts_with("--socket=") || arg.starts_with("--session=") => i += 1,
             "--json" => i += 1,
             "pane"
                 if args.get(i + 1).map(String::as_str) == Some("worktree")
@@ -1094,6 +1499,45 @@ pub(crate) fn rewrite_pane_worktree_alias(args: &mut Vec<String>) {
                 return;
             }
             _ => return,
+        }
+    }
+}
+
+/// Issue #91: tmux-style verb shorthands, rewritten to the canonical
+/// spelling at the verb position (the first token after the global
+/// `--socket`/`--session`/`--json` flags) BEFORE dispatch. Exact
+/// whole-word match only — never a prefix match — so `ls` cannot
+/// shadow `list-sessions`, `new` cannot shadow `new-tab`, and `at`
+/// cannot shadow `attach-surface`. Because the rewrite lands before
+/// `is_cli_invocation`/`cli::run`, every handler downstream of dispatch
+/// sees the long form: the socket request's `cmd` field — what the
+/// server switches on — is byte-identical to the long-form invocation,
+/// so the `--json` contract is unchanged. `at` targets the TUI
+/// `attach` subcommand (not a control-socket verb), so `mtyx at`
+/// dispatches exactly like `mtyx attach`. `send` is not aliased: it is
+/// already the short form, no longer spelling exists.
+const VERB_ALIASES: &[(&str, &str)] = &[
+    ("ls", "list-workspaces"),
+    ("new", "new-workspace"),
+    ("at", "attach"),
+    ("read", "read-screen"),
+    ("shot", "screenshot"),
+];
+
+pub(crate) fn resolve_verb_alias(args: &mut [String]) {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--socket" | "--session" => i += 2,
+            // Issue #98: `--flag=value` spellings of the global flags.
+            arg if arg.starts_with("--socket=") || arg.starts_with("--session=") => i += 1,
+            "--json" => i += 1,
+            arg => {
+                if let Some((_, canonical)) = VERB_ALIASES.iter().find(|(a, _)| *a == arg) {
+                    args[i] = (*canonical).to_string();
+                }
+                return;
+            }
         }
     }
 }
@@ -1172,6 +1616,29 @@ fn build_scroll_surface(flags: &FlagMap) -> Result<Value, UsageError> {
     }))
 }
 
+/// Issue #92: build a `notify-ack` request. `--all` is a bare boolean and
+/// is the default; `--id <n>` targets a specific notification. Passing
+/// both `--all` and `--id` is rejected rather than guessed at (a silent
+/// precedence pick would make an ack that means the opposite easy to
+/// write by accident).
+fn build_notify_ack(flags: &FlagMap) -> Result<Value, UsageError> {
+    let all = flags.optional_bool("all").unwrap_or(false);
+    let id = match flags.optional("id") {
+        Some(raw) => Some(parse_u64("id", &raw)?),
+        None => None,
+    };
+    if all && id.is_some() {
+        return Err(UsageError("--all and --id are mutually exclusive".to_string()));
+    }
+    let mut value = json!({});
+    flags.insert_optional_u64(&mut value, "surface")?;
+    if let Some(id) = id {
+        value["notification_id"] = json!(id);
+    }
+    flags.insert_optional_string(&mut value, "client");
+    Ok(value)
+}
+
 fn build_report_agent(flags: &FlagMap) -> Result<Value, UsageError> {
     // Issue #75 AC1: --surface defaults to $MTYX_MUX_SURFACE so a pane's
     // own child (hook or agent) can self-report without knowing its id.
@@ -1183,7 +1650,7 @@ fn build_report_agent(flags: &FlagMap) -> Result<Value, UsageError> {
                 return Err(UsageError(
                     "--surface is required (or run inside a mtyx pane via $MTYX_MUX_SURFACE)"
                         .into(),
-                ))
+                ));
             }
         },
     };
@@ -1264,6 +1731,17 @@ fn build_agent_send(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(value)
 }
 
+fn build_wait_ready(flags: &FlagMap) -> Result<Value, UsageError> {
+    // Issue #85: required surface id; `--timeout` is optional (the
+    // server defaults it) and in milliseconds, mirroring
+    // `wait-agent-status`'s flag spelling.
+    let mut value = json!({ "surface": flags.required_u64("surface")? });
+    if let Some(timeout) = flags.optional("timeout") {
+        value["timeout_ms"] = json!(parse_u64("timeout", &timeout)?);
+    }
+    Ok(value)
+}
+
 fn build_wait_agent_status(flags: &FlagMap) -> Result<Value, UsageError> {
     // Issue #75 AC5: the issue's flag names (--status / --timeout in ms),
     // mapped onto the wire's state/timeout_ms.
@@ -1273,12 +1751,23 @@ fn build_wait_agent_status(flags: &FlagMap) -> Result<Value, UsageError> {
             "--status must be one of idle, working, blocked, done, unknown (got {status:?})"
         )));
     }
-    Ok(json!({
+    let mut value = json!({
         "target": flags.required("target")?,
         "state": status,
         "timeout_ms": parse_u64("timeout", &flags.required("timeout")?)?,
-    }))
+    });
+    // Issue #93: `--require-transition` demands an OBSERVED change into
+    // the target state at/after this call, rather than accepting a cached
+    // state that already matched (see `Command::WaitAgentStatus`).
+    if let Some(require) = flags.optional_bool("require-transition") {
+        value["require_transition"] = json!(require);
+    }
+    Ok(value)
 }
+
+/// Issue #93: `wait-agent-status --require-transition` is applied by the
+/// builder below; declared here so the flag spelling lives in one place.
+const _WAIT_AGENT_TRANSITION_DOC: &str = "--require-transition";
 
 fn build_kill_session(flags: &FlagMap) -> Result<Value, UsageError> {
     let mut value = json!({});
@@ -1306,6 +1795,17 @@ fn build_layout_apply(flags: &FlagMap) -> Result<Value, UsageError> {
 fn build_layout_export_all(flags: &FlagMap) -> Result<Value, UsageError> {
     let mut value = json!({});
     flags.insert_optional_string(&mut value, "output-dir");
+    Ok(value)
+}
+
+/// Issue #84 screenshot parser: carries the flags (the positional <file>
+/// already landed in `output` during parse); the runner does the
+/// required checks, the file I/O, and the exit-code map — special-cased
+/// in `run_command` like the layout verbs.
+fn build_screenshot(flags: &FlagMap) -> Result<Value, UsageError> {
+    let mut value = json!({});
+    flags.insert_optional_string(&mut value, "surface");
+    flags.insert_optional_string(&mut value, "output");
     Ok(value)
 }
 
@@ -1607,7 +2107,7 @@ pub(crate) fn one_shot_rpc(socket: &std::path::Path, request: Value) -> OneShotO
             return OneShotOutcome::ConnectErr(format!(
                 "cannot connect to session socket {}: {err}",
                 socket.display()
-            ))
+            ));
         }
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
@@ -1695,11 +2195,14 @@ pub(crate) fn select_workspace_remote(
     }
 }
 
+/// `kill-session` targets are matched EXACTLY, case-sensitively (issue
+/// #98 AC3): the socket/pid paths are built verbatim from the given
+/// name, so `mtyx kill-session --session Main` fails cleanly when only
+/// `main` exists — there is deliberately no case-insensitive fallback.
 fn run_kill_session(global: &GlobalArgs, flags: &FlagMap) -> i32 {
     let target_session = flags.optional("session").or_else(|| global.session.clone());
     let Some(session_name) = target_session else {
-        eprintln!("mtyx: --session is required");
-        return 2;
+        return cli_error(global.json, 2, "mtyx: --session is required");
     };
 
     let dir = get_runtime_dir(global);
@@ -1707,8 +2210,7 @@ fn run_kill_session(global: &GlobalArgs, flags: &FlagMap) -> i32 {
     let pid_p = dir.join(format!("{session_name}.pid"));
 
     if !sock_path.exists() && !pid_p.exists() {
-        eprintln!("mtyx: session {session_name:?} not found");
-        return 1;
+        return cli_error(global.json, 1, &format!("mtyx: session {session_name:?} not found"));
     }
 
     let pid = read_pid_file(&pid_p);
@@ -2011,14 +2513,80 @@ fn run_layout_export_all(global: &GlobalArgs, flags: &FlagMap) -> i32 {
     }
 }
 
+/// `mtyx screenshot --surface <id> [--output] <file>` (issue #84):
+/// capture a surface's visible text to a file. The request is the plain
+/// `read-screen` command — the file's bytes are exactly what `mtyx
+/// read-screen --surface <id>` prints to stdout — and the CLIENT writes
+/// the file (tmp + rename, refusing symlinked targets) like
+/// layout-export, so no daemon ever touches the invoker's filesystem.
+/// Exit codes: 0 ok · 1 server/file error · 2 bad flags · 3 transport.
+fn run_screenshot(global: &GlobalArgs, flags: &FlagMap) -> i32 {
+    let surface = match flags.required_u64("surface") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("mtyx: {}", e.0);
+            return 2;
+        }
+    };
+    let output = match flags.required("output") {
+        Ok(o) => PathBuf::from(o),
+        Err(e) => {
+            eprintln!("mtyx: {}", e.0);
+            return 2;
+        }
+    };
+    if let Err(e) = refuse_symlink(&output) {
+        eprintln!("mtyx: {e}");
+        return 1;
+    }
+    let request = json!({ "cmd": "read-screen", "surface": surface, "id": REQUEST_ID });
+    match one_shot_rpc(&resolve_socket(global), request) {
+        OneShotOutcome::Ok(value) => {
+            // print_read_screen writes data["text"] verbatim; the file
+            // must hold those same bytes — no trailing newline added.
+            let text =
+                value.get("data").and_then(|d| d.get("text")).and_then(Value::as_str).unwrap_or("");
+            if let Err(e) = write_text_atomic(&output, text) {
+                eprintln!("mtyx: writing {}: {e}", output.display());
+                return 1;
+            }
+            if global.json {
+                println!("{}", json!({ "output": output.display().to_string() }));
+            } else {
+                println!("{}", output.display());
+            }
+            0
+        }
+        OneShotOutcome::ServerErr(e) => {
+            eprintln!("mtyx: {e}");
+            1
+        }
+        OneShotOutcome::ConnectErr(e) => {
+            eprintln!("{e}");
+            3
+        }
+    }
+}
+
 /// Atomic pretty-JSON write (write-to-temp then rename — the
 /// `persist::SessionSnapshot::save` pattern) so a crash or a concurrent
 /// reader never observes a truncated file.
 fn write_json_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    write_atomic(path, "json.tmp", contents)
+}
+
+/// Issue #84: screenshot's plain-text write, same tmp+rename discipline.
+fn write_text_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    write_atomic(path, "txt.tmp", contents)
+}
+
+/// Shared core of the atomic file writers: stage the contents in a
+/// sibling tmp file, then rename into place.
+fn write_atomic(path: &std::path::Path, tmp_ext: &str, contents: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(tmp_ext);
     // A leftover tmp from a crashed run could itself be a symlink; the
     // rename must never write through one.
     let _ = std::fs::remove_file(&tmp);
@@ -2168,7 +2736,10 @@ fn print_close_workspace(data: &Value, out: &mut dyn Write) -> io::Result<()> {
                 out,
                 "worktree child still open: workspace {id} ({name}) in {path} (branch {branch}){agent}"
             )?,
-            None => writeln!(out, "worktree child still open: workspace {id} ({name}) in {path}{agent}")?,
+            None => writeln!(
+                out,
+                "worktree child still open: workspace {id} ({name}) in {path}{agent}"
+            )?,
         }
     }
     let closed = data["closed"].as_array().cloned().unwrap_or_default();
@@ -2214,6 +2785,24 @@ fn print_detect_agent(data: &Value, out: &mut dyn Write) -> io::Result<()> {
         data.get("confidence").and_then(Value::as_str).unwrap_or("none"),
         data.get("evidence").and_then(Value::as_str).unwrap_or(""),
     )
+}
+
+/// Issue #92 human output: one `acked <surface> -> <id>` row and a
+/// trailing unread count, or a single line when nothing was acked.
+fn print_notify_ack(data: &Value, out: &mut dyn Write) -> io::Result<()> {
+    let acked = data.get("acked").and_then(Value::as_array).cloned().unwrap_or_default();
+    for entry in &acked {
+        writeln!(
+            out,
+            "acked {} -> {}",
+            entry.get("surface").and_then(Value::as_u64).unwrap_or(0),
+            entry.get("notification_id").and_then(Value::as_u64).unwrap_or(0),
+        )?;
+    }
+    if acked.is_empty() {
+        writeln!(out, "nothing to ack")?;
+    }
+    writeln!(out, "unread: {}", data.get("unread").and_then(Value::as_u64).unwrap_or(0))
 }
 
 /// Issue #78 AC2 human output: `<surface> <agent>` rows, id-ordered.
@@ -2298,6 +2887,27 @@ fn print_identify(data: &Value, out: &mut dyn Write) -> io::Result<()> {
 
 fn print_read_screen(data: &Value, out: &mut dyn Write) -> io::Result<()> {
     write!(out, "{}", data.get("text").and_then(Value::as_str).unwrap_or(""))
+}
+
+/// Issue #85 human output: one line naming readiness, the child (if any)
+/// and how long it took. `--json` bypasses this and prints the payload.
+fn print_wait_ready(data: &Value, out: &mut dyn Write) -> io::Result<()> {
+    let ready = data.get("ready").and_then(Value::as_bool).unwrap_or(false);
+    let surface = data.get("surface").and_then(Value::as_u64).unwrap_or(0);
+    let prompt_seen = data.get("prompt_seen").and_then(Value::as_bool).unwrap_or(false);
+    let elapsed = data.get("elapsed_ms").and_then(Value::as_u64).unwrap_or(0);
+    let child = match data.get("child") {
+        Some(Value::Object(child)) => format!(
+            " pid={} comm={}",
+            child.get("pid").and_then(Value::as_u64).unwrap_or(0),
+            child.get("comm").and_then(Value::as_str).unwrap_or("?")
+        ),
+        _ => String::new(),
+    };
+    writeln!(
+        out,
+        "ready={ready} surface={surface} prompt_seen={prompt_seen}{child} elapsed_ms={elapsed}"
+    )
 }
 
 fn print_vt_state(data: &Value, out: &mut dyn Write) -> io::Result<()> {
@@ -2561,6 +3171,7 @@ mod tests {
             session: None,
             socket: Some(PathBuf::from("/tmp/mtyx-explicit/x.sock")),
             json: false,
+            machine: None,
         };
         assert_eq!(discovery_roots(&global), vec![PathBuf::from("/tmp/mtyx-explicit")]);
     }
@@ -2580,7 +3191,7 @@ mod tests {
         mk_sock_root(&canonical, &["newdemo"]);
         mk_sock_root(&legacy, &["olddemo"]);
 
-        let global = GlobalArgs { session: None, socket: None, json: false };
+        let global = GlobalArgs { session: None, socket: None, json: false, machine: None };
         let found = discover_sessions(&global);
 
         match prev {
@@ -2597,5 +3208,268 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- issue #91: tmux-style shorthand aliases ---
+
+    /// AC3: an alias must never collide with an existing verb name (a
+    /// colliding alias is dead at best and silently changes an existing
+    /// verb's meaning at worst), and every alias target must be a real
+    /// command — a VerbSpec, or the TUI `attach` subcommand which
+    /// main.rs dispatches before the verb table.
+    #[test]
+    fn verb_aliases_never_collide_with_existing_verbs() {
+        for (alias, canonical) in VERB_ALIASES {
+            assert!(
+                verb_by_name(alias).is_none(),
+                "alias {alias:?} collides with an existing verb name"
+            );
+            assert!(
+                verb_by_name(canonical).is_some() || *canonical == "attach",
+                "alias {alias:?} points at unknown command {canonical:?}"
+            );
+        }
+    }
+
+    /// AC2 + AC1: every alias rewrites to its canonical spelling, and
+    /// for verb targets `parse` then resolves the SAME VerbSpec the
+    /// long form resolves (pointer-identical handler table entry). The
+    /// socket request carries the canonical `cmd`, so `--json` output
+    /// is byte-identical to the long-form invocation.
+    #[test]
+    fn verb_aliases_resolve_to_the_same_verb_spec() {
+        for (alias, canonical) in VERB_ALIASES {
+            // Rewritten at the verb position after global flags.
+            let mut args = vec!["--json".to_string(), alias.to_string()];
+            resolve_verb_alias(&mut args);
+            assert_eq!(args[0], "--json", "global flags must not be touched");
+            assert_eq!(args[1], *canonical, "alias {alias:?} must rewrite to {canonical:?}");
+
+            if *canonical == "attach" {
+                // Not a VerbSpec: `mtyx at` must become exactly the argv
+                // that `mtyx attach` feeds main.rs's TUI subcommand
+                // parse, so both spellings dispatch identically.
+                continue;
+            }
+            let mut long = vec!["--json".to_string(), canonical.to_string()];
+            match (parse(&args), parse(&long)) {
+                (Ok(Parsed::Command(short)), Ok(Parsed::Command(full))) => {
+                    assert!(
+                        std::ptr::eq(short.verb, full.verb),
+                        "{alias:?} and {canonical:?} must resolve to the same VerbSpec"
+                    );
+                    assert_eq!(short.verb.name, *canonical);
+                }
+                _ => panic!("parse failed for alias {alias:?} / {canonical:?}"),
+            }
+        }
+    }
+
+    /// AC3: exact whole-word match only. Prefixed verbs (`list-sessions`
+    /// vs `ls`, `new-tab`/`new-screen` vs `new`, `attach-surface` vs
+    /// `at`, `read-screen` vs `read`, `screenshot` vs `shot`) are never
+    /// rewritten, an alias-spelled flag VALUE (`--session ls`) is not
+    /// the verb position, and a verb-less argv falls through unchanged.
+    #[test]
+    fn verb_aliases_match_exact_words_and_never_prefixes() {
+        for verb in [
+            "list-sessions",
+            "list-workspaces",
+            "new-tab",
+            "new-screen",
+            "new-workspace",
+            "attach-surface",
+            "read-screen",
+            "screenshot",
+        ] {
+            assert!(verb_by_name(verb).is_some(), "test premise: {verb:?} is a verb");
+            let mut args = vec![verb.to_string()];
+            resolve_verb_alias(&mut args);
+            assert_eq!(args[0], verb, "exact verb {verb:?} must not be rewritten");
+        }
+        // A flag value is never the verb position.
+        let mut args = vec!["--session".to_string(), "ls".to_string()];
+        resolve_verb_alias(&mut args);
+        assert_eq!(args[1], "ls", "an alias-spelled --session value must not be rewritten");
+        // No verb at all: unchanged (TUI launch flags pass through).
+        let mut args = vec!["--headless".to_string()];
+        resolve_verb_alias(&mut args);
+        assert_eq!(args, vec!["--headless".to_string()]);
+    }
+
+    // --- issue #98: flag order, `=` forms, `--` passthrough, envelope ---
+
+    fn parse_ok(args: &[&str]) -> CliArgs {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        match parse(&owned) {
+            Ok(Parsed::Command(args)) => args,
+            _ => panic!("parse({args:?}) did not yield a command"),
+        }
+    }
+
+    fn parse_err(args: &[&str]) -> String {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        match parse(&owned) {
+            Err(UsageError(msg)) => msg,
+            _ => panic!("parse({args:?}) should have errored"),
+        }
+    }
+
+    /// AC2: `--flag value` and `--flag=value` land in the same FlagMap
+    /// slot, for both verb flags and the global --socket/--session.
+    #[test]
+    fn parse_accepts_space_and_equals_flag_forms() {
+        let spaced = parse_ok(&["read-screen", "--surface", "7"]);
+        assert_eq!(spaced.flags.values.get("surface").map(String::as_str), Some("7"));
+
+        let equals = parse_ok(&["read-screen", "--surface=7"]);
+        assert_eq!(equals.flags.values.get("surface").map(String::as_str), Some("7"));
+
+        // A value may itself contain '=' (the first '=' splits).
+        let env = parse_ok(&["new-tab", "--env=A=B,C=D"]);
+        assert_eq!(env.flags.values.get("env").map(String::as_str), Some("A=B,C=D"));
+
+        // Global flags accept the equals form too, before or after the verb.
+        let global = parse_ok(&["--socket=/tmp/x.sock", "identify"]);
+        assert_eq!(global.global.socket, Some(PathBuf::from("/tmp/x.sock")));
+        let after = parse_ok(&["identify", "--session=work"]);
+        assert_eq!(after.global.session.as_deref(), Some("work"));
+
+        // Bare-bool valued forms keep their value (`--group=0` is false).
+        let group = parse_ok(&["close-workspace", "--workspace=1", "--group=0"]);
+        assert_eq!(group.flags.optional_bool("group"), Some(false));
+    }
+
+    /// AC2: flags parse identically before and after the positional
+    /// (screenshot's <file> is the one positional-taking verb).
+    #[test]
+    fn parse_flags_in_any_position_relative_to_positional() {
+        for argv in [
+            vec!["screenshot", "--surface", "3", "out.png"],
+            vec!["screenshot", "out.png", "--surface", "3"],
+            vec!["screenshot", "--surface=3", "out.png"],
+            vec!["screenshot", "out.png", "--surface=3"],
+        ] {
+            let parsed = parse_ok(&argv);
+            assert_eq!(
+                parsed.flags.values.get("surface").map(String::as_str),
+                Some("3"),
+                "{argv:?}"
+            );
+            assert_eq!(
+                parsed.flags.values.get("output").map(String::as_str),
+                Some("out.png"),
+                "{argv:?}"
+            );
+        }
+        // Passing both the positional and --output is still an error,
+        // whichever way round they appear.
+        assert!(parse_err(&["screenshot", "out.png", "--output", "other.png"])
+            .contains("duplicate flag --output"));
+        assert!(parse_err(&["screenshot", "--output", "other.png", "out.png"]).contains("once"));
+    }
+
+    /// AC3: a bare `--` ends flag parsing — everything after it is a
+    /// positional, even flag-shaped tokens, global-flag names, and
+    /// `--exec` (which only means exec-argv in its `--exec --` form).
+    #[test]
+    fn parse_dashdash_makes_following_tokens_positional() {
+        let parsed = parse_ok(&["screenshot", "--surface=1", "--", "--weird.png"]);
+        assert_eq!(parsed.flags.values.get("output").map(String::as_str), Some("--weird.png"));
+
+        // `--json` after `--` is a positional, not the global flag.
+        let parsed = parse_ok(&["screenshot", "--", "--json"]);
+        assert!(!parsed.global.json);
+        assert_eq!(parsed.flags.values.get("output").map(String::as_str), Some("--json"));
+
+        // A verb with no positional slot rejects the token as an
+        // unexpected ARGUMENT (not an unknown FLAG).
+        let err = parse_err(&["read-screen", "--surface=1", "--", "--weird"]);
+        assert!(err.contains("unexpected argument"), "got {err:?}");
+
+        // `--exec` after `--` is a positional too, never the exec form.
+        let err = parse_err(&["new-tab", "--", "--exec", "ls"]);
+        assert!(err.contains("unexpected argument"), "got {err:?}");
+
+        // The `--exec -- <argv>` form is untouched (issue #76).
+        let parsed = parse_ok(&["new-tab", "--exec", "--", "ls", "-la"]);
+        assert_eq!(parsed.flags.exec.as_deref(), Some(&["ls".to_string(), "-la".to_string()][..]));
+    }
+
+    /// AC4: the --json error envelope carries ok:false plus the exit
+    /// code and message.
+    #[test]
+    fn error_envelope_carries_code_and_message() {
+        let envelope = error_envelope(2, "unknown flag --file for agent-read");
+        assert_eq!(envelope["ok"].as_bool(), Some(false));
+        assert_eq!(envelope["error"]["code"].as_i64(), Some(2));
+        assert_eq!(
+            envelope["error"]["message"].as_str(),
+            Some("unknown flag --file for agent-read")
+        );
+    }
+
+    // --- issue #85: wait-ready verb ---
+
+    /// `wait-ready` parses --surface (required) and optional --timeout,
+    /// and the wire request maps them onto surface/timeout_ms.
+    #[test]
+    fn wait_ready_builds_request() {
+        let parsed = parse_ok(&["wait-ready", "--surface", "7"]);
+        assert_eq!(parsed.verb.name, "wait-ready");
+        let built = (parsed.verb.build)(&parsed.flags).unwrap();
+        assert_eq!(built["surface"].as_u64(), Some(7));
+        assert!(built.get("timeout_ms").is_none(), "timeout is optional: {built}");
+
+        let parsed = parse_ok(&["wait-ready", "--surface=9", "--timeout", "2500"]);
+        let built = (parsed.verb.build)(&parsed.flags).unwrap();
+        assert_eq!(built["surface"].as_u64(), Some(9));
+        assert_eq!(built["timeout_ms"].as_u64(), Some(2500));
+    }
+
+    /// AC1/AC2: `wait-ready` maps `ready:false` to exit 1 while STILL
+    /// printing the JSON payload; `ready:true` exits 0. The flag only
+    /// affects `wait-ready`, so a generic ok response is unaffected.
+    #[test]
+    fn wait_ready_exit_code_tracks_ready_field() {
+        let not_ready = json!({
+            "ok": true,
+            "data": {"ready": false, "surface": 3, "prompt_seen": false, "child": null, "elapsed_ms": 501}
+        });
+        assert_eq!(print_response(&not_ready, true, print_wait_ready, true), 1);
+        // The gate is off for every other verb: ok:true is always exit 0.
+        assert_eq!(print_response(&not_ready, true, print_wait_ready, false), 0);
+
+        let ready = json!({
+            "ok": true,
+            "data": {"ready": true, "surface": 3, "prompt_seen": true,
+                     "child": {"pid": 42, "comm": "sleep"}, "elapsed_ms": 12}
+        });
+        assert_eq!(print_response(&ready, true, print_wait_ready, true), 0);
+    }
+
+    /// Issue #92: `notify-ack` builds the documented wire request and
+    /// rejects the ambiguous `--all --id N` combination.
+    #[test]
+    fn notify_ack_build_maps_flags_and_rejects_all_plus_id() {
+        let all = parse_ok(&["notify-ack", "--surface", "4", "--client", "c1"]);
+        let built = (all.verb.build)(&all.flags).unwrap();
+        assert_eq!(built["surface"], json!(4));
+        assert_eq!(built["client"], json!("c1"));
+        assert!(built.get("notification_id").is_none(), "default is ack-all");
+
+        let by_id = parse_ok(&["notify-ack", "--surface", "4", "--id", "9"]);
+        let built = (by_id.verb.build)(&by_id.flags).unwrap();
+        assert_eq!(built["notification_id"], json!(9));
+
+        let conflict = parse_ok(&["notify-ack", "--all", "--id", "9"]);
+        let err = (conflict.verb.build)(&conflict.flags).unwrap_err();
+        assert!(err.0.contains("mutually exclusive"), "got: {}", err.0);
+
+        // No --client keeps the pre-#92 subscribe shape (empty object).
+        let sub = parse_ok(&["subscribe"]);
+        assert_eq!((sub.verb.build)(&sub.flags).unwrap(), json!({}));
+        let sub = parse_ok(&["subscribe", "--client", "c2"]);
+        assert_eq!((sub.verb.build)(&sub.flags).unwrap()["client"], json!("c2"));
     }
 }

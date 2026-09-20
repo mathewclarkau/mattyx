@@ -1,0 +1,5 @@
+matc@host:~/project$ grep -n "confirm" main.rs
+42:    // confirm before deleting
+matc@host:~/project$ echo "Enter to confirm · Esc to cancel"
+Enter to confirm · Esc to cancel
+matc@host:~/project$ 

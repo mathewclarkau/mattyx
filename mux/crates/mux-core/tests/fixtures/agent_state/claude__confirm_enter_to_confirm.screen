@@ -1,0 +1,14 @@
+╭──────────────────────────────────────────────────────────────────────────────╮
+│  Claude Code v1.0.88                                                         │
+│                                                                              │
+│  Do you want to proceed?                                                     │
+│                                                                              │
+│  Bash command                                                                │
+│    rm -rf ./build                                                            │
+│                                                                              │
+│  ❯ 1. Yes                                                                    │
+│    2. Yes, and don't ask again for rm commands in /home/dev/project          │
+│    3. No, and tell Claude what to do differently (esc)                       │
+│                                                                              │
+│  Enter to confirm · Esc to cancel                                            │
+╰──────────────────────────────────────────────────────────────────────────────╯

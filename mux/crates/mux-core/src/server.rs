@@ -13,6 +13,25 @@
 //!   Browsers receive `{"event":"browser-state"}` with optional latest
 //!   frame followed by live `{"event":"frame"}` PNG payloads.
 //!
+//! ## Durable notifications (issue #92)
+//!
+//! Desktop notifications scraped from a pane's OSC output are no longer
+//! fire-and-forget: every one is also stored in a bounded per-pane ring
+//! (see [`crate::notify`]) alongside the UNCHANGED `MuxEvent::OscNotification`
+//! emission. `subscribe` takes an optional `client` id; when present, the
+//! server replays that client's unread records (id greater than its
+//! last-read mark) as `{"event":"notification","surface":..,"id":..,
+//! "title":..,"body":..,"timestamp_ms":..}` lines. Replay is written on
+//! the SAME line stream and BEFORE the live forwarder starts, so a client
+//! sees every replayed record (oldest first) strictly before any live
+//! event — a live notification can never overtake a replayed older one.
+//! `notify-ack` (optionally scoped by `surface`, and either
+//! `notification_id` or the default "ack-all") advances the client's
+//! read high-water mark, so a second attach with the same client id
+//! replays nothing. All new request fields are serde-defaulted: an old
+//! client sending a bare `subscribe` gets no replay and the pre-#92
+//! behaviour, and an old daemon ignores the extra `client` field.
+//!
 //! ```text
 //! {"id":1,"cmd":"identify"}
 //! {"id":1,"ok":true,"data":{"app":"mtyx","session":"main",...}}
@@ -42,6 +61,44 @@
 //! watchdog still points at the original path; a SIGKILL after rename is
 //! handled by the next `serve()` stale-clear / `kill-stale` (an L3
 //! follow-up can respawn the watchdog for the new path).
+//!
+//! ## Confirmed (receipted) input — `send --confirm` (issue #88)
+//!
+//! Protocol 7 adds an `input-ack` capability (negotiated via the
+//! `capabilities` record in the `identify` response) and a confirmed mode
+//! for `send`: `"confirm": true` (plus optional `"timeout_ms"`, default
+//! [`DEFAULT_INPUT_ACK_TIMEOUT_MS`], capped at [`MAX_INPUT_ACK_TIMEOUT_MS`])
+//! returns success only after the daemon OBSERVES the input consumed —
+//! the practical receipt is: bytes written to the PTY AND the surface
+//! echoed/advanced (the reader thread applied output: see
+//! `PtySurface::output_epoch`), or the child exited, within the timeout.
+//! This is a documented heuristic, NOT a byte-exact consumption proof; see
+//! `Surface::write_bytes_confirmed`.
+//!
+//! Ordering: confirmed sends serialize per-surface on a FIFO ticket, so
+//! concurrent confirmed sends to one surface resolve in submission order
+//! (`PtySurface::ack_gate`). Unconfirmed send (the wire default; the
+//! pre-#88 behavior) bypasses the gate and is unchanged.
+//!
+//! Capability gate: a client that wants confirmed send must check
+//! `identify` first ([`require_input_ack_capability`]); against a daemon
+//! lacking the capability it gets a structured
+//! `legacy_host_receipt_rejected` error, never a silent downgrade. The
+//! CLI's `send` does this automatically (`--confirm` is its DEFAULT;
+//! `--no-confirm` preserves fire-and-forget).
+//!
+//! Error codes (extra `"code"` field on error responses; the `error`
+//! string keeps a `"code: message"` prefix for string-matching callers):
+//!
+//! - `oversized_input` — confirmed send payload exceeds
+//!   [`MAX_CONFIRMED_SEND_BYTES`] (1 MiB). Rejected up front rather than
+//!   applying receipt backpressure to an unbounded write.
+//! - `input_ack_timeout` — no receipt within the timeout (or the send
+//!   never reached its FIFO turn). Bytes were written unless the message
+//!   says otherwise; delivery is unproven, not failed.
+//! - `legacy_host_receipt_rejected` — emitted by the CLIENT-side gate
+//!   when the daemon lacks `input-ack`; documented here as part of the
+//!   capability contract (this server never emits it).
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
@@ -59,7 +116,87 @@ use crate::{
     SplitDir, SurfaceId, SurfaceKind, WorkspaceId,
 };
 
-pub const PROTOCOL_VERSION: u32 = 6;
+/// Control-socket protocol version. 7 adds the `input-ack` capability
+/// (confirmed/receipted `send`, issue #88); see the module docs. Bumped
+/// from 6 (rename-session, attach `resized` replay events). Older
+/// clients keep working against this daemon: their requests deserialize
+/// unchanged (all new `send` fields are serde-defaulted) and unconfirmed
+/// send behaves exactly as before.
+pub const PROTOCOL_VERSION: u32 = 7;
+
+/// Issue #88: hard cap on a CONFIRMED send payload (bytes of `text` plus
+/// decoded `bytes`, before the optional CR / shell-sanitisation prefix).
+/// Oversized confirmed input is rejected with a structured
+/// `oversized_input` error instead of applying receipt backpressure to an
+/// unbounded write. Unconfirmed sends are NOT capped (pre-#88 behavior is
+/// unchanged).
+pub const MAX_CONFIRMED_SEND_BYTES: usize = 1024 * 1024;
+
+/// Issue #88: default `send --confirm` receipt timeout.
+pub const DEFAULT_INPUT_ACK_TIMEOUT_MS: u64 = 5_000;
+
+/// Issue #88: server-side cap on the confirmed-send receipt timeout, so a
+/// leaked waiter can't park on its connection thread forever (mirrors
+/// [`MAX_AGENT_WAIT_MS`]).
+pub const MAX_INPUT_ACK_TIMEOUT_MS: u64 = 60_000;
+
+/// Issue #88: the input-ACK capability key in the `identify` response's
+/// `capabilities` object. A daemon reporting it implements confirmed
+/// (receipted) input for `send` (see the module docs).
+pub const CAP_INPUT_ACK: &str = "input-ack";
+
+/// True when an `identify` response's `data` advertises the input-ACK
+/// capability (issue #88).
+pub fn identify_has_input_ack(identify: &Value) -> bool {
+    identify.get("capabilities").and_then(|c| c.get(CAP_INPUT_ACK)).and_then(Value::as_bool)
+        == Some(true)
+}
+
+/// Issue #88 CLIENT-side capability gate: refuse a confirmed send against
+/// a daemon that lacks input-ACK (no `capabilities` record, e.g. protocol
+/// <= 6) instead of silently downgrading to fire-and-forget. The bundled
+/// CLI calls this on an `identify` pre-flight before every confirmed
+/// `send`; the error carries the structured code
+/// `legacy_host_receipt_rejected`.
+pub fn require_input_ack_capability(identify: &Value) -> Result<(), ServerError> {
+    if identify_has_input_ack(identify) {
+        return Ok(());
+    }
+    let protocol = identify.get("protocol").and_then(Value::as_u64).unwrap_or(0);
+    Err(ServerError::new(
+        "legacy_host_receipt_rejected",
+        format!(
+            "daemon (protocol {protocol}) does not advertise the input-ACK capability,              so a confirmed-send receipt cannot be negotiated; pass --no-confirm for              fire-and-forget delivery"
+        ),
+    ))
+}
+
+/// Issue #88: structured socket error — a stable machine-readable `code`
+/// plus a human message. Serialized as an extra `"code"` field on the
+/// error response line (old clients ignore it), and the `error` string
+/// keeps a `"<code>: <message>"` prefix so string-matching callers see
+/// the code too.
+#[derive(Debug, Clone)]
+pub struct ServerError {
+    /// Stable machine-readable error kind (see the module docs for the
+    /// issue-#88 codes).
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl ServerError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        ServerError { code, message: message.into() }
+    }
+}
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ServerError {}
 
 /// Default socket path for a session.
 pub fn default_socket_path(session: &str) -> PathBuf {
@@ -242,6 +379,35 @@ enum Command {
         /// on Linux and falls back to `raw` on lookup failure or non-Linux.
         #[serde(default)]
         shell: Option<String>,
+        /// Issue #88: request a RECEIPT — the reply is sent only after the
+        /// daemon observes the input consumed (surface echo/advance or
+        /// child exit within `timeout_ms`). Requires the `input-ack`
+        /// capability (protocol 7+); absent/false keeps the pre-#88
+        /// fire-and-forget write (the wire default, so old requests and
+        /// old daemons behave exactly as before).
+        #[serde(default)]
+        confirm: Option<bool>,
+        /// Issue #88: receipt timeout in milliseconds for
+        /// `confirm: true`. Defaults to [`DEFAULT_INPUT_ACK_TIMEOUT_MS`],
+        /// capped at [`MAX_INPUT_ACK_TIMEOUT_MS`] server-side. `0` is
+        /// rejected (a confirmed send must wait at least 1 ms).
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        /// Issue #93: bypass the blocked-send gate. Absent/false means a
+        /// surface whose effective agent state is `Blocked` refuses the
+        /// send with the structured `agent_blocked` error and NO bytes
+        /// are written; `true` restores the pre-#93 raw behaviour.
+        #[serde(default)]
+        force: Option<bool>,
+        /// Issue #93: observed-transition success. When set, the reply is
+        /// sent only after the target agent is observed to transition
+        /// (a strictly-newer `state_seq`) into `working`/`blocked` at/after
+        /// this call's start, or `wait_activity_ms` elapses. `None` keeps
+        /// the fire-and-forget reply. A `send` that lands while the pane
+        /// is already `working` but produces no new report still times out
+        /// — the transition must be *observed*, not merely implied.
+        #[serde(default)]
+        wait_activity_ms: Option<u64>,
     },
     ReadScreen {
         surface: SurfaceId,
@@ -525,7 +691,34 @@ enum Command {
         delta: Option<isize>,
     },
     /// Stream mux events on this connection.
-    Subscribe,
+    ///
+    /// Issue #92: the optional `client` id scopes durable-notification
+    /// replay and per-client read state. When present, the server replays
+    /// this client's unread notification records as `notification` events
+    /// BEFORE any live events from the subscription, then streams live as
+    /// before. Absent (old clients) means no replay and the empty-string
+    /// client key — the pre-#92 behaviour.
+    Subscribe {
+        #[serde(default)]
+        client: Option<String>,
+    },
+    /// Issue #92: mark durable notifications read for a client.
+    ///
+    /// `surface` restricts the ack to one pane; absent applies to every
+    /// pane with stored notifications. `notification_id`, when present,
+    /// advances the client's read high-water mark to that id (never
+    /// rewinding it); absent acks up to each pane's latest stored id
+    /// ("ack all"). `client` identifies the reader (the CLI persists one
+    /// per attach session) and defaults to the empty-string key when
+    /// absent, matching `subscribe`.
+    NotifyAck {
+        #[serde(default)]
+        surface: Option<SurfaceId>,
+        #[serde(default)]
+        notification_id: Option<u64>,
+        #[serde(default)]
+        client: Option<String>,
+    },
     /// Stream a surface: vt-state event followed by live output events.
     AttachSurface {
         surface: SurfaceId,
@@ -645,10 +838,35 @@ enum Command {
     /// `timeout_ms: 0` is a single immediate check. Capped server-side
     /// at [`MAX_AGENT_WAIT_MS`] so a leaked waiter can't park on its
     /// connection thread forever.
+    ///
+    /// Issue #93 adds `require_transition`: when true, a cached state
+    /// matching `state` whose `state_seq` predates the call does NOT
+    /// satisfy the wait — only an observed transition at/after the call
+    /// does. Absent/false keeps the pre-#93 immediate-match behaviour.
     WaitAgentStatus {
         target: String,
         state: String,
         timeout_ms: u64,
+        #[serde(default)]
+        require_transition: Option<bool>,
+    },
+    /// Issue #85: block until a surface is *ready* — its screen shows a
+    /// recognised prompt (or an agent) AND its PTY has a running
+    /// process-tree child — or `timeout_ms` elapses. Read-only
+    /// observation: it never writes to the pane or mutates mux state.
+    ///
+    /// The reply is always `ok:true` with a structured payload (see
+    /// [`wait_ready_json`]); a timeout is `{"ready": false, ...}`, NOT
+    /// an error, so a headless orchestrator can read the JSON and
+    /// decide. The CLI maps `ready:false` to a nonzero exit (AC2).
+    /// `timeout_ms` defaults to [`DEFAULT_WAIT_READY_MS`] when absent
+    /// (backward compat: a pre-#85 daemon hits serde's unknown-variant
+    /// path) and is capped at [`MAX_AGENT_WAIT_MS`] so a leaked waiter
+    /// cannot park on its connection thread forever.
+    WaitReady {
+        surface: SurfaceId,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
     },
     /// Rename THIS daemon's session (issue #63): atomically move its
     /// `.sock`/`.pid` to the new name, update the logical session name,
@@ -697,6 +915,11 @@ struct Response {
     data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Issue #88: stable machine-readable error code, present only when
+    /// the handler failed with a [`ServerError`] (e.g. `oversized_input`,
+    /// `input_ack_timeout`). Old clients ignore the extra field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
 }
 
 /// Line-oriented shared writer: responses and event streams interleave
@@ -713,12 +936,59 @@ impl LineWriter {
     }
 }
 
+/// Issue #86: `std::fs::create_dir_all` that reports whether it actually
+/// created the leaf directory (vs. finding it already present). Needed so
+/// the bind path can distinguish "a dir we just made" (safe to chmod
+/// 0700) from "someone else's pre-existing dir" (e.g. `/tmp`).
+fn create_dir_all_tracked(dir: &Path) -> std::io::Result<bool> {
+    if dir.is_dir() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(dir)?;
+    Ok(true)
+}
+
+/// Issue #86: does this process own `dir` (same uid as the daemon)?
+/// Used to decide whether restricting the directory to 0700 is a
+/// legitimate hardening step or an intrusion into someone else's tree.
+/// Non-unix: always false (no uid concept; `restrict_permissions` is a
+/// no-op there anyway).
+#[cfg(unix)]
+fn dir_owned_by_us(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(dir) else { return false };
+    meta.uid() == unsafe { libc::getuid() }
+}
+
+#[cfg(not(unix))]
+fn dir_owned_by_us(_dir: &Path) -> bool {
+    false
+}
+
 /// Bind the socket and serve connections on background threads.
 pub fn serve(mux: Arc<Mux>, path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    let explicit = path.is_some();
     let path = path.unwrap_or_else(|| default_socket_path(&mux.session_name()));
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-        platform::restrict_directory(dir)?;
+        // Issue #86 bind-path guard: only chmod a parent directory we own.
+        // `create_dir_all` is tracked so "did we just create it" is known;
+        // for an explicit `--socket /tmp/x.sock` the parent (/tmp) already
+        // exists and is NOT ours, so chmod'ing it 0700 would be a
+        // system-breaking side effect. In that case we best-effort the
+        // restrict (ignore failure) and warn instead of hard-failing; the
+        // socket itself is still chmod 0600 below and peer-authed above.
+        let created = create_dir_all_tracked(dir)?;
+        let default_runtime_dir = !explicit;
+        if created || default_runtime_dir || dir_owned_by_us(dir) {
+            platform::restrict_directory(dir)?;
+        } else {
+            eprintln!(
+                "mtyx: warning: {dir} was not created by this process; leaving its \
+                 permissions alone (socket keeps 0600)",
+                dir = dir.display()
+            );
+            let _ = platform::restrict_directory(dir);
+        }
     }
     let pid_p = pid_path(&path);
     // Refuse to clobber a live socket; remove a stale one.
@@ -742,6 +1012,26 @@ pub fn serve(mux: Arc<Mux>, path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     std::fs::write(&pid_p, format!("{}\n", std::process::id()))?;
     platform::restrict_file(&pid_p)?;
 
+    // Issue #89 shutdown-join audit: the accept thread and each per-conn
+    // `mux-conn` thread are DETACHED, and this is deliberate rather than
+    // an oversight. A clean join is not feasible without a redesign:
+    //
+    // - The listener is moved into the accept thread, so nothing outside
+    //   it can unblock a blocking `accept()`; a shutdown flag alone does
+    //   not wake the thread. Closing it needs either a self-connect to
+    //   release the syscall or a switch to non-blocking accept with a
+    //   poll timeout — a real behavioural change to connection latency.
+    // - Per-conn threads live only for one connection and are never
+    //   registered anywhere, so there is no handle list to join. Adding
+    //   one means a shared registry + a join at shutdown, and a long-lived
+    //   connection (a streaming `mux watch`) would block that join
+    //   indefinitely unless each conn also grew a cancellation path.
+    // - The process is already torn down by `Mux::shutdown`/process exit;
+    //   the OS reclaims the threads. Detaching keeps `serve()` returning
+    //   promptly, which the daemon start path depends on.
+    //
+    // Recording the audit outcome here so the next reader does not
+    // "fix" it into a shutdown hang. See PORT-PLAN #89.
     std::thread::Builder::new().name("mux-server".into()).spawn(move || loop {
         let Ok(stream) = listener.accept() else { continue };
         let mux = mux.clone();
@@ -752,9 +1042,81 @@ pub fn serve(mux: Arc<Mux>, path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+/// Issue #86: the exact JSON denial written on a rejected control
+/// connection, or `None` when the decision is not a rejection (accept no
+/// response, unsupported falls through to the filesystem boundary).
+///
+/// Kept as one pure function so the wire shape is pinned by a test and the
+/// handler cannot drift from it. `id` is explicitly `null` (unlike
+/// [`Response`], which omits a `None` id) because the plan specifies
+/// `{"id":null,"ok":false,"error":"peer uid <N> rejected"}` exactly.
+pub fn peer_auth_denial_json(decision: &platform::PeerAuthDecision) -> Option<Value> {
+    match decision {
+        platform::PeerAuthDecision::RejectForeign { uid } => Some(json!({
+            "id": Value::Null,
+            "ok": false,
+            "error": format!("peer uid {uid} rejected"),
+        })),
+        platform::PeerAuthDecision::RejectLookupError => Some(json!({
+            "id": Value::Null,
+            "ok": false,
+            "error": "peer authentication failed".to_string(),
+        })),
+        platform::PeerAuthDecision::Accept | platform::PeerAuthDecision::Unsupported => None,
+    }
+}
+
 fn handle_connection(mux: Arc<Mux>, stream: Box<dyn transport::Stream>) {
     let Ok(write_half) = stream.try_clone_box() else { return };
     let writer = LineWriter(Arc::new(Mutex::new(write_half)));
+
+    // Issue #86: peer-authenticate BEFORE any Request is parsed. The
+    // decision itself is pure (`platform::peer_auth_decision`); all we do
+    // here is gather the inputs and execute its verdict.
+    let peer = stream.peer_uid();
+    let decision = platform::peer_auth_decision(
+        peer.as_ref().map(|uid| *uid),
+        platform::daemon_uid(),
+        platform::transport_supports_peer_creds(),
+    );
+    let denial = peer_auth_denial_json(&decision);
+    match decision {
+        platform::PeerAuthDecision::Accept => {}
+        platform::PeerAuthDecision::RejectForeign { uid } => {
+            eprintln!("mtyx: rejected control connection from peer uid {uid}");
+            if let Some(denial) = &denial {
+                let _ = writer.send(denial);
+            }
+            return;
+        }
+        platform::PeerAuthDecision::RejectLookupError => {
+            let detail = match &peer {
+                Ok(_) => "no daemon uid available".to_string(),
+                Err(e) => e.to_string(),
+            };
+            eprintln!(
+                "mtyx: rejected control connection: peer-credential lookup failed ({detail})"
+            );
+            if let Some(denial) = &denial {
+                let _ = writer.send(denial);
+            }
+            return;
+        }
+        platform::PeerAuthDecision::Unsupported => {
+            // Documented interim: no peer-cred surface on this transport
+            // (Windows named pipes / non-Linux unix). Fall back to the
+            // filesystem-permissions boundary (runtime dir 0700, socket
+            // 0600) and say so exactly once.
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                eprintln!(
+                    "mtyx: warning: peer-credential authentication is unavailable on this \
+                     transport; relying on filesystem permissions (runtime dir 0700, socket 0600)"
+                );
+            });
+        }
+    }
+
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let Ok(line) = line else { break };
@@ -765,8 +1127,18 @@ fn handle_connection(mux: Arc<Mux>, stream: Box<dyn transport::Stream>) {
             Ok(req) => {
                 let id = req.id.clone();
                 match handle_command(&mux, req.cmd, &writer) {
-                    Ok(data) => Response { id, ok: true, data: Some(data), error: None },
-                    Err(e) => Response { id, ok: false, data: None, error: Some(e.to_string()) },
+                    Ok(data) => {
+                        Response { id, ok: true, data: Some(data), error: None, code: None }
+                    }
+                    // Issue #88: a structured ServerError also carries its
+                    // code on the wire (see Response::code).
+                    Err(e) => Response {
+                        code: e.downcast_ref::<ServerError>().map(|se| se.code.to_string()),
+                        id,
+                        ok: false,
+                        data: None,
+                        error: Some(e.to_string()),
+                    },
                 }
             }
             Err(e) => Response {
@@ -774,6 +1146,7 @@ fn handle_connection(mux: Arc<Mux>, stream: Box<dyn transport::Stream>) {
                 ok: false,
                 data: None,
                 error: Some(format!("bad request: {e}")),
+                code: None,
             },
         };
         let Ok(value) = serde_json::to_value(&response) else { break };
@@ -781,6 +1154,20 @@ fn handle_connection(mux: Arc<Mux>, stream: Box<dyn transport::Stream>) {
             break;
         }
     }
+}
+
+/// Issue #92: one durable notification as a subscribe-stream event. The
+/// same `notification` event shape is used for replay and for any future
+/// live durable push, so a client has one parse path.
+fn notification_json(record: crate::notify::NotificationRecord) -> Value {
+    json!({
+        "event": "notification",
+        "surface": record.surface,
+        "id": record.id,
+        "title": record.title,
+        "body": record.body,
+        "timestamp_ms": record.timestamp_ms,
+    })
 }
 
 fn node_json(node: &Node) -> Value {
@@ -1110,6 +1497,113 @@ fn tail_lines(text: &str, n: usize) -> String {
 /// timeout would let leaked waiters accumulate forever (plan §5.4).
 const MAX_AGENT_WAIT_MS: u64 = 600_000;
 
+/// Issue #85: default `wait-ready` timeout when the request omits
+/// `timeout_ms`. 5 s is long enough for a login shell/first prompt on a
+/// cold pane and short enough that a caller that forgot the flag does
+/// not hang; explicit callers should pass their own budget.
+pub const DEFAULT_WAIT_READY_MS: u64 = 5_000;
+
+/// Issue #85: resolve + cap a `wait-ready` timeout. Absent falls back to
+/// [`DEFAULT_WAIT_READY_MS`]; `0` is a legal single immediate check
+/// (mirrors `wait-agent-status`), anything over [`MAX_AGENT_WAIT_MS`]
+/// is rejected. Extracted so a table test can pin it.
+fn validate_wait_ready_timeout(timeout_ms: Option<u64>) -> anyhow::Result<u64> {
+    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_WAIT_READY_MS);
+    if timeout_ms > MAX_AGENT_WAIT_MS {
+        anyhow::bail!("timeout {timeout_ms}ms exceeds the {MAX_AGENT_WAIT_MS}ms cap");
+    }
+    Ok(timeout_ms)
+}
+
+/// Issue #93: resolve + cap a `send --wait` observed-activity timeout. `0`
+/// is a legal single immediate check (mirrors `wait-agent-status`); the
+/// absent case never reaches here (the field being present is what turns
+/// the wait on), so `0` here means exactly one observation attempt.
+/// Anything over [`MAX_AGENT_WAIT_MS`] is rejected before any wait, so a
+/// leaked waiter cannot park a connection thread forever.
+fn validate_wait_activity_timeout(timeout_ms: u64) -> anyhow::Result<u64> {
+    if timeout_ms > MAX_AGENT_WAIT_MS {
+        anyhow::bail!("timeout {timeout_ms}ms exceeds the {MAX_AGENT_WAIT_MS}ms cap");
+    }
+    Ok(timeout_ms)
+}
+
+/// Issue #93: block until the surface's agent is observed to transition
+/// (its `state_seq` strictly exceeds `started_seq`) into `working` or
+/// `blocked`, or `timeout` elapses.
+///
+/// Returns the observed state on success, or `None` on timeout. A cached
+/// report whose sequence predates `started_seq` (e.g. the agent was
+/// already `working` before the caller's send) does NOT satisfy this —
+/// success requires an *observed* transition at/after the call's start,
+/// which is the whole point of `--wait`.
+///
+/// A pane whose surface exited mid-wait errors immediately (it can never
+/// produce the transition), mirroring `wait-agent-status`'s review F2.
+fn wait_for_agent_activity(
+    mux: &Arc<Mux>,
+    surface: &Arc<crate::Surface>,
+    started_seq: u64,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Option<crate::AgentState>> {
+    let surface_id = surface.id;
+    // Subscribe BEFORE the immediate check so a report landing between
+    // the two is still observed (the channel is unbounded).
+    let events = mux.subscribe();
+    let immediate = surface.agent_report().filter(|report| {
+        report.state_seq > started_seq
+            && matches!(report.state, crate::AgentState::Working | crate::AgentState::Blocked)
+    });
+    if let Some(report) = immediate {
+        return Ok(Some(report.state));
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        match events.recv_timeout(remaining) {
+            Ok(MuxEvent::AgentStateChanged { surface: s, report, .. })
+                if s == surface_id
+                    && report.state_seq > started_seq
+                    && matches!(
+                        report.state,
+                        crate::AgentState::Working | crate::AgentState::Blocked
+                    ) =>
+            {
+                return Ok(Some(report.state));
+            }
+            Ok(MuxEvent::SurfaceExited(s)) if s == surface_id => {
+                anyhow::bail!("surface {surface_id} exited while waiting for agent activity");
+            }
+            Ok(_) => continue,
+            Err(_) => return Ok(None),
+        }
+    }
+}
+
+/// Issue #85 response payload, sent both when ready and on timeout
+/// (`ready` distinguishes them). `child` is `null` until a process-tree
+/// child is observed; `prompt_seen` reports the screen half on its own
+/// so a caller can tell "shell up, command not yet" from "nothing yet".
+fn wait_ready_json(
+    surface: SurfaceId,
+    readiness: &crate::mux::SurfaceReadiness,
+    elapsed_ms: u64,
+) -> Value {
+    json!({
+        "ready": readiness.is_ready(),
+        "surface": surface,
+        "prompt_seen": readiness.prompt_seen,
+        "child": readiness.child.as_ref().map(|child| json!({
+            "pid": child.pid,
+            "comm": child.comm,
+        })),
+        "elapsed_ms": elapsed_ms,
+    })
+}
+
 /// Shared validation for `wait-agent-status` (issue #75): the state
 /// string and the timeout cap. Extracted from the handler so the table
 /// test can pin both rejections.
@@ -1121,6 +1615,18 @@ fn validate_wait_request(state: &str, timeout_ms: u64) -> anyhow::Result<crate::
         anyhow::bail!("timeout {timeout_ms}ms exceeds the {MAX_AGENT_WAIT_MS}ms cap");
     }
     Ok(wanted)
+}
+
+/// Issue #88: resolve + validate a confirmed send's `timeout_ms`.
+/// Absent means [`DEFAULT_INPUT_ACK_TIMEOUT_MS`]; `0` and anything over
+/// [`MAX_INPUT_ACK_TIMEOUT_MS`] are rejected before any bytes are written
+/// (extracted from the handler so the table test can pin it).
+fn validate_input_ack_timeout(timeout_ms: Option<u64>) -> anyhow::Result<u64> {
+    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_INPUT_ACK_TIMEOUT_MS);
+    if timeout_ms == 0 || timeout_ms > MAX_INPUT_ACK_TIMEOUT_MS {
+        anyhow::bail!("timeout {timeout_ms}ms must be between 1 and {MAX_INPUT_ACK_TIMEOUT_MS}ms");
+    }
+    Ok(timeout_ms)
 }
 
 /// Success payload for `wait-agent-status`: the matched report plus the
@@ -1158,17 +1664,22 @@ fn agent_report_json(surface: SurfaceId, report: &crate::AgentReport) -> Value {
         "agent": report.agent,
         "message": report.message,
         "updated_at_ms": report.updated_at_ms,
+        // Issue #93: monotonic per-surface state-change sequence.
+        "state_seq": report.state_seq,
     })
 }
 
 /// Issue #78 AC1 response: agent name + confidence + the evidence line
-/// that triggered the match.
+/// that triggered the match. Issue #96 adds `state`: the screen-derived
+/// lifecycle classification (informational; the `Detected`-tier report
+/// it may publish is what actually changes `agent_status`).
 fn detection_json(surface: SurfaceId, detection: &crate::agent_detect::Detection) -> Value {
     json!({
         "surface": surface,
         "agent": detection.agent,
         "confidence": detection.confidence.map(|c| c.as_str()),
         "evidence": detection.evidence,
+        "state": detection.screen_state.as_str(),
     })
 }
 
@@ -1345,33 +1856,155 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
             "app": "mtyx",
             "version": crate::VERSION,
             "protocol": PROTOCOL_VERSION,
+            // Issue #88 capability record: a client wanting confirmed
+            // (receipted) send gates on this before sending `confirm:true`
+            // (see require_input_ack_capability).
+            "capabilities": { CAP_INPUT_ACK: true },
             "session": mux.session_name(),
             "pid": std::process::id(),
         })),
         Command::ListWorkspaces => Ok(mux.with_state(workspaces_json)),
         Command::GetResolvedConfig => Ok(mux.resolved_chrome().unwrap_or_else(|| json!({}))),
-        Command::Send { surface, text, bytes, send_cr, shell } => {
+        Command::Send {
+            surface,
+            text,
+            bytes,
+            send_cr,
+            shell,
+            confirm,
+            timeout_ms,
+            force,
+            wait_activity_ms,
+        } => {
             let surface = get_surface(mux, surface)?;
             require_pty(&surface)?;
+            // Issue #93: blocked-send gate. Refuse to write ANY bytes into
+            // a pane whose effective agent state is `Blocked` (any source
+            // tier — see `Mux::effective_agent_state`), so an orchestrator
+            // cannot blow through an approval dialog. `force` restores the
+            // pre-#93 raw behaviour. `Unknown` is deliberately NOT gated:
+            // a plain shell pane has no report and classifies `Unknown`,
+            // and gating it would break every existing `send` caller (the
+            // plan's "unknown" gating is not workable against the live
+            // code — see the issue report).
+            //
+            // Spawn-readiness (issue #85) is the sibling half of this
+            // lifecycle contract: `wait-ready` (see `Command::WaitReady`)
+            // is the post-spawn health signal an orchestrator gates on
+            // BEFORE its first send, so the gate below is only ever
+            // reached once the pane is known to be up.
+            let started_seq = surface.agent_state_seq();
+            if !force.unwrap_or(false) {
+                let (state, source, _) = mux.effective_agent_state(&surface);
+                if state == crate::AgentState::Blocked {
+                    return Err(ServerError::new(
+                        "agent_blocked",
+                        format!(
+                            "surface {} is blocked by an agent approval/dialog \
+                             (effective state via {source}); no input was sent. \
+                             Resolve the prompt in the pane, or pass --force to send anyway.",
+                            surface.id
+                        ),
+                    )
+                    .into());
+                }
+            }
             // Issue #35: shell-aware sanitisation of `text` (raw bytes
             // via `bytes` are always written verbatim). `raw` (the
             // default) keeps the pre-#35 passthrough behaviour.
             let mode = resolve_shell_mode(shell.as_deref(), surface.child_pid())?;
+            // Issue #88: build the whole payload up front (text first,
+            // then bytes — the pre-#88 wire order, each with its optional
+            // trailing CR) so a confirmed send writes ONE ordered, sized
+            // unit under the surface's input-ACK FIFO, and so a base64
+            // decode error can no longer land AFTER the text half was
+            // already applied (a latent pre-#88 wart: the bytes half was
+            // decoded after the text half was written).
+            let mut payload = Vec::new();
             if let Some(text) = text {
-                let mut bytes_buf = sanitise_text(mode, &text).into_bytes();
+                let mut text_bytes = sanitise_text(mode, &text).into_bytes();
                 if send_cr.unwrap_or(false) {
-                    bytes_buf.push(b'\r');
+                    text_bytes.push(b'\r');
                 }
-                surface.write_bytes(&bytes_buf)?;
+                payload.extend_from_slice(&text_bytes);
             }
             if let Some(b64) = bytes {
                 let mut raw = base64::engine::general_purpose::STANDARD.decode(b64)?;
                 if send_cr.unwrap_or(false) {
                     raw.push(b'\r');
                 }
-                surface.write_bytes(&raw)?;
+                payload.extend_from_slice(&raw);
             }
-            Ok(json!({}))
+            if confirm.unwrap_or(false) {
+                // Bounded input: reject before writing rather than hold
+                // receipt backpressure over an unbounded payload.
+                if payload.len() > MAX_CONFIRMED_SEND_BYTES {
+                    return Err(ServerError::new(
+                        "oversized_input",
+                        format!(
+                            "confirmed send payload is {} bytes; the cap is \
+                             {MAX_CONFIRMED_SEND_BYTES} bytes (MAX_CONFIRMED_SEND_BYTES)",
+                            payload.len()
+                        ),
+                    )
+                    .into());
+                }
+                let timeout =
+                    std::time::Duration::from_millis(validate_input_ack_timeout(timeout_ms)?);
+                match surface.write_bytes_confirmed(&payload, timeout) {
+                    Ok(()) => {}
+                    Err(crate::ConfirmedSendError::AckTimeout { waited_ms }) => {
+                        return Err(ServerError::new(
+                            "input_ack_timeout",
+                            format!(
+                                "no input receipt (surface output or child-drain) within \
+                                 {waited_ms}ms; bytes were written to the pty but consumption \
+                                 was not observed"
+                            ),
+                        )
+                        .into())
+                    }
+                    Err(crate::ConfirmedSendError::QueueTimeout { waited_ms }) => {
+                        return Err(ServerError::new(
+                            "input_ack_timeout",
+                            format!(
+                                "confirmed-input queue for this surface did not reach this \
+                                 send within {waited_ms}ms; nothing was written (earlier \
+                                 confirmed sends hold the queue)"
+                            ),
+                        )
+                        .into())
+                    }
+                    Err(crate::ConfirmedSendError::Io(err)) => return Err(err.into()),
+                };
+            } else {
+                // Unconfirmed (pre-#88) path: same byte sequence to the
+                // pty, no receipt wait, no size cap.
+                surface.write_bytes(&payload)?;
+            }
+            // Issue #93: observed-transition success. Only report success
+            // after the target agent is seen to enter working/blocked at
+            // or after this send — a pre-existing cached working/blocked
+            // state (sequenced before `started_seq`) does NOT satisfy the
+            // wait.
+            match wait_activity_ms {
+                Some(ms) => {
+                    let timeout = validate_wait_activity_timeout(ms)?;
+                    let observed = wait_for_agent_activity(
+                        mux,
+                        &surface,
+                        started_seq,
+                        std::time::Duration::from_millis(timeout),
+                    )?;
+                    Ok(json!({
+                        "confirmed": confirm.unwrap_or(false),
+                        "activity_observed": observed.is_some(),
+                        "state": observed.map(|state| state.as_str()),
+                    }))
+                }
+                None if confirm.unwrap_or(false) => Ok(json!({ "confirmed": true })),
+                None => Ok(json!({})),
+            }
         }
         Command::ReadScreen { surface } => {
             let surface = get_surface(mux, surface)?;
@@ -1819,18 +2452,28 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
             surface.write_bytes(&bytes)?;
             Ok(json!({ "surface": surface_id }))
         }
-        Command::WaitAgentStatus { target, state, timeout_ms } => {
+        Command::WaitAgentStatus { target, state, timeout_ms, require_transition } => {
             let wanted = validate_wait_request(&state, timeout_ms)?;
             let surface_id = mux.resolve_agent_target(&target)?;
             let surface = get_surface(mux, surface_id)?;
             require_pty(&surface)?;
+            // Issue #93: when `require_transition` is set, the wait must
+            // observe a strictly-newer report (a state change at/after
+            // this call), not merely find the cached state already equal
+            // to the target. Snapshot the sequence BEFORE subscribing so
+            // a report racing in is still counted.
+            let require_transition = require_transition.unwrap_or(false);
+            let started_seq = surface.agent_state_seq();
+            let accepts = |report: &crate::AgentReport| {
+                report.state == wanted && (!require_transition || report.state_seq > started_seq)
+            };
             // Subscribe BEFORE the immediate check so a report landing
             // between the two is still observed by the loop below (the
             // channel is unbounded, so `emit` never blocks the reporter).
             let events = mux.subscribe();
             let started = std::time::Instant::now();
             if let Some(report) = surface.agent_report() {
-                if report.state == wanted {
+                if accepts(&report) {
                     return Ok(wait_agent_status_json(
                         &surface,
                         surface_id,
@@ -1850,7 +2493,7 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
                 }
                 match events.recv_timeout(remaining) {
                     Ok(MuxEvent::AgentStateChanged { surface: s, report, .. })
-                        if s == surface_id && report.state == wanted =>
+                        if s == surface_id && accepts(&report) =>
                     {
                         return Ok(wait_agent_status_json(
                             &surface,
@@ -1872,6 +2515,53 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
                     Ok(_) => continue,
                     Err(_) => anyhow::bail!("timeout waiting for agent status {state}"),
                 }
+            }
+        }
+        Command::WaitReady { surface, timeout_ms } => {
+            // Issue #85: read-only readiness poll. Everything here only
+            // observes (terminal lock + /proc); no writes, no state
+            // mutation, so it is safe alongside a live orchestrator.
+            let timeout_ms = validate_wait_ready_timeout(timeout_ms)?;
+            // A vanished surface (child exited and the pane was reaped) is
+            // reported as `ready:false`, not an error: a health verb must
+            // give an orchestrator a uniform "not ready" answer rather
+            // than forcing it to distinguish an exit from a timeout. An
+            // id that never existed reads the same way — acceptable for a
+            // probe, and the caller owns the id it just spawned.
+            let started = std::time::Instant::now();
+            let mut last = crate::mux::SurfaceReadiness::default();
+            loop {
+                if let Some(surface_arc) = mux.surface(surface) {
+                    require_pty(&surface_arc)?;
+                    last = mux.surface_readiness(&surface_arc);
+                    if last.is_ready() {
+                        return Ok(wait_ready_json(
+                            surface,
+                            &last,
+                            started.elapsed().as_millis() as u64,
+                        ));
+                    }
+                } else {
+                    // Surface removed: no prompt, no child.
+                    last = crate::mux::SurfaceReadiness::default();
+                }
+                if std::time::Instant::now()
+                    >= started + std::time::Duration::from_millis(timeout_ms)
+                {
+                    // Timeout is a successful RPC with `ready:false` (see
+                    // the Command doc); the CLI turns that into exit 1.
+                    return Ok(wait_ready_json(
+                        surface,
+                        &last,
+                        started.elapsed().as_millis() as u64,
+                    ));
+                }
+                // Poll cadence: fine-grained enough that a prompt landing
+                // just after a check is seen promptly, coarse enough not
+                // to spin a core re-reading /proc + the terminal.
+                let remaining = (started + std::time::Duration::from_millis(timeout_ms))
+                    .saturating_duration_since(std::time::Instant::now());
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(25)));
             }
         }
         Command::RenameSession { new_name } => {
@@ -1977,8 +2667,35 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
                 "surfaces": summary.surfaces,
             }))
         }
-        Command::Subscribe => {
+        Command::Subscribe { client } => {
+            // Issue #95: a subscribing client is an attached client; the
+            // session is live from here, so an empty tree at shutdown means
+            // the user really emptied it (and the snapshot may be removed).
+            mux.mark_client_attached();
+            // Issue #92: durable-notification replay. Subscribe BEFORE
+            // snapshotting the unread set so a notification that fires
+            // concurrently is either in the snapshot or arrives live —
+            // never lost. The unread list uses the client's last-read
+            // high-water mark, so a second attach after `notify-ack` sees
+            // nothing. Replay is written on the SAME line stream as live
+            // events, before the live forwarder thread starts, so the
+            // client sees all replayed records (oldest first) strictly
+            // before any live event: a live OSC notification can never
+            // overtake a replayed older one.
+            let replay = match client.as_deref() {
+                Some(client) => mux
+                    .unread_notifications(client, None)
+                    .into_iter()
+                    .map(notification_json)
+                    .collect(),
+                None => Vec::new(),
+            };
             let events = mux.subscribe();
+            for value in &replay {
+                if writer.send(value).is_err() {
+                    return Ok(json!({}));
+                }
+            }
             let writer = writer.clone();
             std::thread::Builder::new().name("mux-events-out".into()).spawn(move || {
                 while let Ok(event) = events.recv() {
@@ -2021,6 +2738,7 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
                             "agent": report.agent,
                             "message": report.message,
                             "updated_at_ms": report.updated_at_ms,
+                            "state_seq": report.state_seq,
                         }),
                         MuxEvent::OscNotification { surface, title, body } => json!({
                             "event": "osc-notification",
@@ -2036,7 +2754,24 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
             })?;
             Ok(json!({}))
         }
+        Command::NotifyAck { surface, notification_id, client } => {
+            // Issue #92: advance this client's read high-water mark. The
+            // reply reports what was written so a caller can tell "acked N
+            // panes" from "nothing to ack" without a second round-trip.
+            let client = client.unwrap_or_default();
+            let applied = mux.ack_notifications(&client, surface, notification_id);
+            Ok(json!({
+                "client": client,
+                "acked": applied
+                    .iter()
+                    .map(|(surface, id)| json!({"surface": surface, "notification_id": id}))
+                    .collect::<Vec<_>>(),
+                "unread": mux.unread_notifications(&client, surface).len(),
+            }))
+        }
         Command::AttachSurface { surface: surface_id } => {
+            // Issue #95: a direct surface attach is an attached client too.
+            mux.mark_client_attached();
             let surface = get_surface(mux, surface_id)?;
             if surface.kind() == SurfaceKind::Browser {
                 let (state, frames) = surface.attach_frames()?;
@@ -2198,6 +2933,43 @@ mod tests {
     }
 
     #[test]
+    fn peer_auth_denial_json_pins_the_exact_wire_shape() {
+        // Issue #86: a foreign uid is denied with a structured response
+        // that names the uid, carries `id` as null (unlike Response), and
+        // is `ok:false`.
+        let foreign = platform::PeerAuthDecision::RejectForeign { uid: 4242 };
+        let denial = peer_auth_denial_json(&foreign).expect("foreign uid must deny");
+        assert_eq!(denial["ok"], json!(false));
+        assert!(denial["id"].is_null(), "id must be present and null");
+        assert_eq!(denial["error"], json!("peer uid 4242 rejected"));
+
+        // A lookup error also denies, but names no uid.
+        let lookup = peer_auth_denial_json(&platform::PeerAuthDecision::RejectLookupError)
+            .expect("lookup error must deny");
+        assert_eq!(lookup["ok"], json!(false));
+        assert_eq!(lookup["error"], json!("peer authentication failed"));
+
+        // Accept and Unsupported write NO denial (Unsupported falls back
+        // to the filesystem-permissions boundary).
+        assert!(peer_auth_denial_json(&platform::PeerAuthDecision::Accept).is_none());
+        assert!(peer_auth_denial_json(&platform::PeerAuthDecision::Unsupported).is_none());
+    }
+
+    #[test]
+    fn wait_ready_validates_timeout_table() {
+        // Issue #85: absent defaults, 0 and the cap are legal, over-cap
+        // is rejected. Extracted so this is pinned without a live PTY.
+        assert_eq!(validate_wait_ready_timeout(None).unwrap(), DEFAULT_WAIT_READY_MS);
+        assert_eq!(validate_wait_ready_timeout(Some(0)).unwrap(), 0);
+        assert_eq!(validate_wait_ready_timeout(Some(5000)).unwrap(), 5000);
+        assert!(validate_wait_ready_timeout(Some(MAX_AGENT_WAIT_MS + 1)).is_err());
+        assert_eq!(
+            validate_wait_ready_timeout(Some(MAX_AGENT_WAIT_MS)).unwrap(),
+            MAX_AGENT_WAIT_MS
+        );
+    }
+
+    #[test]
     fn tail_lines_drops_trailing_blank_rows_and_tails() {
         // Issue #75 agent-read --lines: trailing blank rows (the VT plain
         // formatter can leave empty rows below the cursor) don't consume
@@ -2208,6 +2980,55 @@ mod tests {
         assert_eq!(tail_lines(screen, 2), "row-b\nrow-c");
         assert_eq!(tail_lines(screen, 10), "cmd\nrow-a\nrow-b\nrow-c");
         assert_eq!(tail_lines("", 5), "");
+    }
+
+    /// Issue #88: confirmed-send receipt timeout validation. Absent →
+    /// the default; 0 and over-cap are rejected; 1 and the cap are legal.
+    #[test]
+    fn input_ack_timeout_validation_table() {
+        assert_eq!(validate_input_ack_timeout(None).unwrap(), DEFAULT_INPUT_ACK_TIMEOUT_MS);
+        assert_eq!(validate_input_ack_timeout(Some(1)).unwrap(), 1);
+        assert_eq!(
+            validate_input_ack_timeout(Some(MAX_INPUT_ACK_TIMEOUT_MS)).unwrap(),
+            MAX_INPUT_ACK_TIMEOUT_MS
+        );
+        assert!(validate_input_ack_timeout(Some(0)).is_err());
+        assert!(validate_input_ack_timeout(Some(MAX_INPUT_ACK_TIMEOUT_MS + 1)).is_err());
+    }
+
+    /// Issue #88: the CLIENT-side capability gate. A protocol-6 identify
+    /// (no `capabilities` record) and even a protocol-7 identify without
+    /// the record are refused with the structured
+    /// `legacy_host_receipt_rejected` code — never a silent downgrade to
+    /// fire-and-forget. A daemon advertising `input-ack` passes. (The
+    /// end-to-end identify shape is pinned in tests/input_ack.rs.)
+    #[test]
+    fn legacy_host_receipt_rejected_by_capability_gate() {
+        let legacy = json!({
+            "app": "mtyx", "version": "0.0.0", "protocol": 6,
+            "session": "main", "pid": 1,
+        });
+        let err = require_input_ack_capability(&legacy).unwrap_err();
+        assert_eq!(err.code, "legacy_host_receipt_rejected");
+        let message = err.to_string();
+        assert!(
+            message.starts_with("legacy_host_receipt_rejected: daemon (protocol 6)"),
+            "{message}"
+        );
+        assert!(message.contains("input-ACK capability"), "{message}");
+        assert!(message.contains("--no-confirm"), "{message}");
+        // The gate keys on the capability record, not the number: a v7
+        // daemon that (hypothetically) omitted the record is still
+        // refused, and a reply WITH the record passes.
+        let no_record = json!({ "app": "mtyx", "protocol": 7 });
+        assert_eq!(
+            require_input_ack_capability(&no_record).unwrap_err().code,
+            "legacy_host_receipt_rejected"
+        );
+        let capable =
+            json!({ "app": "mtyx", "protocol": 7, "capabilities": { "input-ack": true } });
+        assert!(require_input_ack_capability(&capable).is_ok());
+        assert!(identify_has_input_ack(&capable));
     }
 
     #[test]

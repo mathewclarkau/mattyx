@@ -1,6 +1,6 @@
 # Control Socket Protocol
 
-As of protocol v6, every server speaks JSON Lines over a Unix domain socket. Send one JSON object per line. Every request receives one response line. `subscribe` and `attach-surface` also push event lines on the same connection.
+As of protocol v7, every server speaks JSON Lines over a Unix domain socket. Send one JSON object per line. Every request receives one response line. `subscribe` and `attach-surface` also push event lines on the same connection.
 
 For shell use, prefer `mtyx <verb>`; it wraps the same socket commands and preserves JSON output with `--json`.
 
@@ -10,11 +10,11 @@ Default socket path:
 $TMPDIR/mtyx-<uid>/<session>.sock
 ```
 
-`identify` reports the protocol version:
+`identify` reports the protocol version and, since protocol 7 (issue #88), a `capabilities` record for feature negotiation. The one defined capability is `input-ack`: confirmed (receipted) `send` — see [Confirmed Input](#confirmed-input-receipted-send). A client wanting confirmed input must gate on `capabilities["input-ack"] == true` and refuse (structured `legacy_host_receipt_rejected` error) against a daemon lacking it, never silently downgrade.
 
 ```json
 {"id":1,"cmd":"identify"}
-{"id":1,"ok":true,"data":{"app":"mtyx","version":"...","protocol":6,"session":"main","pid":12345}}
+{"id":1,"ok":true,"data":{"app":"mtyx","version":"...","protocol":7,"capabilities":{"input-ack":true},"session":"main","pid":12345}}
 ```
 
 Responses have this shape:
@@ -22,9 +22,10 @@ Responses have this shape:
 ```json
 {"id":1,"ok":true,"data":{}}
 {"id":2,"ok":false,"error":"unknown surface 99"}
+{"id":3,"ok":false,"error":"oversized_input: confirmed send payload is 1048577 bytes; the cap is 1048576 bytes (MAX_CONFIRMED_SEND_BYTES)","code":"oversized_input"}
 ```
 
-Bad JSON returns `ok:false` with no request id.
+Bad JSON returns `ok:false` with no request id. Since protocol 7, structured errors carry a machine-readable `code` field (issue #88); the `error` string keeps the `<code>: ` prefix so string-matching callers see the code too.
 
 ## Command Contract
 
@@ -135,11 +136,28 @@ When the stream ends, it sends:
 
 ## Client Compatibility
 
-The remote TUI requires protocol v6. It refuses servers reporting any other protocol version because attach streams need resize markers carrying replay data.
+The remote TUI requires protocol v7. It refuses servers reporting any other protocol version because attach streams need resize markers carrying replay data (v6) and it ships with the v7 `identify` capabilities record (issue #88).
 
 Attach clients mirror PTY surfaces locally. On first render, a client can resize the server surface before requesting `attach-surface`, so the initial VT replay is captured at the visible geometry.
 
 When several attach clients render the same surface at different sizes, sizing follows latest local interaction. A client reasserts its visible sizes after key input, mouse input, paste, focus gained, or terminal resize. Mux-driven redraws update local mirrors from `surface-resized` without reasserting an idle client's viewport.
+
+## Confirmed Input (Receipted Send)
+
+Protocol 7 (issue #88) adds a confirmed mode to `send`: `"confirm": true` (plus optional `"timeout_ms"`, default 5000, cap 60000) returns success only after the daemon OBSERVES the input consumed — the practical receipt is: bytes written to the PTY AND the surface echoed/advanced (the pty reader thread applied output), or the child exited, within the timeout. This is a documented heuristic receipt, not a byte-exact consumption proof.
+
+```json
+{"id":40,"cmd":"send","surface":4,"text":"cargo test\n","confirm":true,"timeout_ms":10000}
+{"id":40,"ok":true,"data":{"confirmed":true}}
+```
+
+Ordering: confirmed sends serialize per-surface on a FIFO ticket, so concurrent confirmed sends to one surface resolve in submission order. Unconfirmed send (absent/false `confirm`) is unchanged fire-and-forget and bypasses the queue.
+
+Bounds and errors:
+
+- Confirmed payloads above 1 MiB (`MAX_CONFIRMED_SEND_BYTES`) are rejected up front with `oversized_input` rather than applying receipt backpressure to an unbounded write.
+- A receipt that never arrives fails with `input_ack_timeout` (the bytes were written; delivery is unproven, not failed).
+- A client requesting confirmed send against a daemon whose `identify` lacks `input-ack` (protocol <= 6) must refuse with `legacy_host_receipt_rejected` — never silently downgrade. The bundled CLI does this pre-flight automatically; `mtyx send` is confirmed BY DEFAULT, and `--no-confirm` preserves fire-and-forget.
 
 ## Browser Limitations
 

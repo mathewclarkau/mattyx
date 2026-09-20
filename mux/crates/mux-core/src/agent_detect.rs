@@ -171,11 +171,22 @@ pub struct Detection {
     /// Human-readable evidence line naming what triggered the match
     /// (issue #78 AC1).
     pub evidence: String,
+    /// Screen-derived lifecycle state for this pane (issue #96), from
+    /// [`crate::agent_state_classify`]. `Unknown` on a plain
+    /// [`detect`] run; populated by [`crate::Mux::detect_agent`], which
+    /// also publishes it as a conservative `Detected`-tier report when
+    /// it is `Blocked`/`Working`. Never downgrades a hook/socket report.
+    pub screen_state: crate::AgentState,
 }
 
 impl Detection {
     pub fn unknown(evidence: impl Into<String>) -> Self {
-        Detection { agent: "unknown".to_string(), confidence: None, evidence: evidence.into() }
+        Detection {
+            agent: "unknown".to_string(),
+            confidence: None,
+            evidence: evidence.into(),
+            screen_state: crate::AgentState::Unknown,
+        }
     }
 
     pub fn is_unknown(&self) -> bool {
@@ -279,6 +290,7 @@ pub fn detect(
             agent: pattern.name.clone(),
             confidence: Some(pattern.confidence),
             evidence: format!("process '{}' (pid {})", pattern.pattern, evidence.pid),
+            screen_state: crate::AgentState::Unknown,
         };
     }
 
@@ -296,6 +308,7 @@ pub fn detect(
             agent: pattern.name.clone(),
             confidence: Some(pattern.confidence),
             evidence: format!("screen marker '{}'", pattern.pattern),
+            screen_state: crate::AgentState::Unknown,
         },
         _ => Detection::unknown(match best_process {
             Some((_, pattern, _)) => format!(
@@ -400,7 +413,10 @@ fn parse_starttime(stat: &str) -> Option<u64> {
 /// Screen-marker semantics: substring match where `*` in the pattern
 /// spans any run of characters (segments must appear in order). A
 /// pattern without `*` is a plain substring test.
-fn text_matches(text: &str, pattern: &str, case_insensitive: bool) -> bool {
+///
+/// `pub(crate)` so the screen state classifier (issue #96) reuses the
+/// exact same wildcard semantics rather than reimplementing them.
+pub(crate) fn text_matches(text: &str, pattern: &str, case_insensitive: bool) -> bool {
     let (haystack, needle) = if case_insensitive {
         (text.to_lowercase(), pattern.to_lowercase())
     } else {
