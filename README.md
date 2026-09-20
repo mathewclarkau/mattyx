@@ -19,11 +19,11 @@ carries forward the GPL-3.0-or-later grant — see [`LICENSE`](./LICENSE).
 
 ## Installation
 
-### Prebuilt binary
+### Prebuilt Linux binary
 
 ```bash
 curl -fsSL -o ~/.local/bin/mtyx \
-  "https://github.com/mathewclarkau/mattyx/releases/latest/download/mattyx-$(uname -m)"
+  "https://github.com/mathewclarkau/mattyx/releases/latest/download/mtyx-linux-$(uname -m)"
 chmod +x ~/.local/bin/mtyx
 ```
 
