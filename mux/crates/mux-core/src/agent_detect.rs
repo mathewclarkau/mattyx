@@ -325,6 +325,19 @@ pub fn detect(
 /// platforms without a process listing or when there is no local child
 /// (browser / remote panes).
 ///
+/// Linux: `/proc/<pid>/comm` + `/proc/<pid>/cmdline` + `/proc/<pid>/stat`
+/// (starttime) for the child and every descendant.
+///
+/// macOS: `proc_listchildpids` enumerates the tree; `proc_pidinfo` with
+/// `PROC_PIDTBSDINFO` reads `pbi_comm` (image name) and `pbi_start_tvsec`
+/// (start time, seconds resolution) per pid. Residual limitation: no
+/// cmdline evidence (`PROC_PIDTASKALLINFO` exists but the argv is not
+/// exposed by libproc's stable surface), so process patterns that need
+/// argv (`claude --resume …`) cannot match on macOS, same trade-off as
+/// the Windows arm. The most-recently-spawned tie-break uses the seconds
+/// starttime, which is coarser than Linux's clock ticks but sufficient
+/// for the "prefer the spawned command over the shell" ordering.
+///
 /// Windows: a Toolhelp32 snapshot walk of the child's descendants
 /// (`win::descendant_processes`). Residual limitation: only image
 /// names are visible — no cmdline, no start time — so process patterns
@@ -333,6 +346,13 @@ pub fn detect(
 /// order. Documented, not hidden.
 pub fn collect_process_evidence(child_pid: Option<u32>) -> Vec<ProcessEvidence> {
     #[cfg(target_os = "linux")]
+    {
+        let Some(root) = child_pid else { return Vec::new() };
+        let mut pids = vec![root];
+        pids.extend(crate::process::all_descendants(root));
+        pids.into_iter().filter_map(process_evidence_for_pid).collect()
+    }
+    #[cfg(target_os = "macos")]
     {
         let Some(root) = child_pid else { return Vec::new() };
         let mut pids = vec![root];
@@ -359,7 +379,7 @@ pub fn collect_process_evidence(child_pid: Option<u32>) -> Vec<ProcessEvidence> 
             })
             .collect()
     }
-    #[cfg(all(not(target_os = "linux"), not(windows)))]
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(windows)))]
     {
         let _ = child_pid;
         Vec::new()
@@ -376,6 +396,57 @@ fn process_evidence_for_pid(pid: u32) -> Option<ProcessEvidence> {
         return None;
     }
     Some(ProcessEvidence { pid, comm, cmdline, starttime: read_starttime(pid) })
+}
+
+/// macOS evidence for one pid via `proc_pidinfo(PROC_PIDTBSDINFO)`. `None`
+/// when the call fails or returns fewer bytes than `proc_bsdinfo` (raced
+/// exit). `comm` is the image name from `pbi_comm`; `cmdline` is empty
+/// (libproc's stable surface does not expose argv — see the
+/// `collect_process_evidence` doc comment for the trade-off); `starttime`
+/// is `pbi_start_tvsec` (seconds resolution, fine for the spawned-command-
+/// over-shell tie-break).
+#[cfg(target_os = "macos")]
+fn process_evidence_for_pid(pid: u32) -> Option<ProcessEvidence> {
+    use std::mem;
+    let mut info: libc::proc_bsdinfo = unsafe { mem::zeroed() };
+    let size = mem::size_of::<libc::proc_bsdinfo>();
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::pid_t,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut _,
+            size as libc::c_int,
+        )
+    };
+    if got < size as libc::c_int {
+        return None;
+    }
+    // pbi_comm is a [c_char; MAXCOMLEN] NUL-terminated C string.
+    let comm = cstr_to_string(&info.pbi_comm);
+    if comm.is_empty() {
+        return None;
+    }
+    Some(ProcessEvidence {
+        pid,
+        comm,
+        // No cmdline from libproc's stable surface; document the gap
+        // exactly like the Windows arm does.
+        cmdline: String::new(),
+        starttime: Some(info.pbi_start_tvsec as u64),
+    })
+}
+
+/// Decode a fixed-size NUL-terminated C string (`[c_char; N]`) into a
+/// Rust `String`, stopping at the first NUL. `from_utf8_lossy` so a
+/// non-UTF-8 comm (rare, but possible on macOS for legacy tools) does
+/// not panic the daemon.
+#[cfg(target_os = "macos")]
+fn cstr_to_string(buf: &[libc::c_char]) -> String {
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len()) };
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 #[cfg(target_os = "linux")]

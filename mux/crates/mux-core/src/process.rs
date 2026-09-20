@@ -1,9 +1,13 @@
-//! Linux process-tree helpers for orphan reaping.
+//! Unix process-tree helpers for orphan reaping.
 //!
 //! When a pane's shell exits (or is killed), grandchildren that double-forked
 //! or were backgrounded can outlive the direct PTY child. Combined with
 //! [`set_child_subreaper`], this module lets mtyx inherit those orphans and
 //! terminate the whole tree on surface kill / mux shutdown.
+//!
+//! Linux walks `/proc`; macOS walks `proc_listchildpids`/`proc_pidinfo`.
+//! Windows does not enumerate here — pane teardown uses per-surface job
+//! objects (`win.rs`) instead, and readiness uses `win::descendant_processes`.
 //!
 //! See issue #28.
 
@@ -56,14 +60,16 @@ pub fn is_alive(pid: u32) -> bool {
 }
 
 /// Direct children of `pid` (Linux `/proc/<pid>/task/<pid>/children`, with
-/// a `/proc` scan fallback). Empty on non-Linux.
+/// a `/proc` scan fallback; macOS `proc_listchildpids`). Empty on Windows.
 ///
 /// Windows residual limitation: there is no per-parent child listing
 /// used here — pane children are torn down via per-surface job objects
 /// (see `win.rs`), so the /proc-tree walk this feeds on unix has no
 /// Windows caller. Returns empty rather than a Toolhelp approximation,
 /// because approximating "children of this pid" with parent-pid links
-/// is unreliable when pids are reused mid-walk.
+/// is unreliable when pids are reused mid-walk. Readiness on Windows
+/// goes through `win::descendant_processes` instead, which snapshots
+/// the tree atomically via Toolhelp32.
 pub fn direct_children(pid: u32) -> Vec<u32> {
     #[cfg(target_os = "linux")]
     {
@@ -99,11 +105,60 @@ pub fn direct_children(pid: u32) -> Vec<u32> {
         }
         scan_proc_for_children(pid)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_direct_children(pid)
+    }
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
     {
         let _ = pid;
         Vec::new()
     }
+}
+
+/// macOS `direct_children` via `proc_listchildpids`. Two-call pattern:
+/// first probe the byte count with a zero-size buffer, allocate a
+/// `Vec<libc::pid_t>` with headroom (children can be born between the
+/// two calls), second call, truncate to the returned count. Returns
+/// empty on any error — callers (`all_descendants`, `kill_process_tree`,
+/// `kill_remaining_children`) degrade to "no children seen" rather than
+/// panicking, which is the safe side for orphan reaping.
+#[cfg(target_os = "macos")]
+fn macos_direct_children(pid: u32) -> Vec<u32> {
+    use std::mem;
+    // First call: returns the byte count needed. A NULL/zero-size
+    // buffer is the documented "size query" spelling.
+    let needed =
+        unsafe { libc::proc_listchildpids(pid as libc::pid_t, std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return Vec::new();
+    }
+    let needed = needed as usize;
+    let elem = mem::size_of::<libc::pid_t>();
+    // Slack for children spawned between the two calls (proc_listchildpids
+    // is not atomic). +16 is the same headroom libproc callers commonly
+    // use; the second call's returned count is the source of truth.
+    let cap = needed / elem + 16;
+    let mut buf: Vec<libc::pid_t> = Vec::with_capacity(cap);
+    let got = unsafe {
+        libc::proc_listchildpids(
+            pid as libc::pid_t,
+            buf.as_mut_ptr() as *mut _,
+            (cap * elem) as libc::c_int,
+        )
+    };
+    if got <= 0 {
+        return Vec::new();
+    }
+    let got = got as usize / elem;
+    // SAFETY: proc_listchildpids wrote `got` pid_t elements starting at
+    // buf.as_ptr(); the Vec was allocated with >= got capacity. We never
+    // read uninitialized memory beyond `got`.
+    unsafe { buf.set_len(got) };
+    buf.into_iter()
+        .filter(|&c| c > 0)
+        .map(|c| c as u32)
+        .collect()
 }
 
 #[cfg(target_os = "linux")]
