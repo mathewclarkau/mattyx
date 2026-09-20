@@ -52,7 +52,12 @@ impl From<DirSnapshot> for SplitDir {
 enum LayoutSnapshot {
     /// Index into the owning [`ScreenSnapshot::panes`].
     Leaf(usize),
-    Split { dir: DirSnapshot, ratio: f32, a: Box<LayoutSnapshot>, b: Box<LayoutSnapshot> },
+    Split {
+        dir: DirSnapshot,
+        ratio: f32,
+        a: Box<LayoutSnapshot>,
+        b: Box<LayoutSnapshot>,
+    },
 }
 
 /// Enough of a `RemoteSpec` to reattach the same `cmuxd-remote` session on
@@ -173,14 +178,16 @@ fn capture_screen(state: &State, screen: &Screen) -> ScreenSnapshot {
                     .iter()
                     .map(|sid| {
                         let surface = state.surfaces.get(sid);
-                        let remote = surface.and_then(|s| s.remote_spec()).map(|spec| {
-                            RemoteTabSnapshot {
+                        let remote =
+                            surface.and_then(|s| s.remote_spec()).map(|spec| RemoteTabSnapshot {
                                 host: spec.host,
                                 slot: spec.slot,
                                 session_id: spec.session_id,
-                                local_binary_path: spec.local_binary_path.to_string_lossy().into_owned(),
-                            }
-                        });
+                                local_binary_path: spec
+                                    .local_binary_path
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            });
                         TabSnapshot {
                             name: surface.and_then(|s| s.name()),
                             cwd: surface.and_then(|s| s.cwd()),
@@ -280,11 +287,13 @@ pub(crate) fn workspaces(snapshot: &SessionSnapshot) -> (Vec<RestoreWorkspace<'_
                                 .map(|tab| RestoreTab {
                                     name: tab.name.as_deref(),
                                     cwd: tab.cwd.as_deref(),
-                                    remote: tab.remote.as_ref().map(|r| crate::remote_pty::RemoteSpec {
-                                        host: r.host.clone(),
-                                        slot: r.slot.clone(),
-                                        session_id: r.session_id.clone(),
-                                        local_binary_path: r.local_binary_path.clone().into(),
+                                    remote: tab.remote.as_ref().map(|r| {
+                                        crate::remote_pty::RemoteSpec {
+                                            host: r.host.clone(),
+                                            slot: r.slot.clone(),
+                                            session_id: r.session_id.clone(),
+                                            local_binary_path: r.local_binary_path.clone().into(),
+                                        }
                                     }),
                                 })
                                 .collect(),
@@ -315,7 +324,10 @@ mod tests {
 
     #[test]
     fn shell_quote_handles_spaces_and_single_quotes() {
-        assert_eq!(shell_quote("/home/matc/Projects/mtyx-linux"), "'/home/matc/Projects/mtyx-linux'");
+        assert_eq!(
+            shell_quote("/home/matc/Projects/mtyx-linux"),
+            "'/home/matc/Projects/mtyx-linux'"
+        );
         assert_eq!(shell_quote("/tmp/a b"), "'/tmp/a b'");
         assert_eq!(shell_quote("/tmp/it's"), "'/tmp/it'\\''s'");
     }
@@ -342,12 +354,20 @@ mod tests {
                         PaneSnapshot {
                             name: None,
                             active_tab_index: 0,
-                            tabs: vec![TabSnapshot { name: None, cwd: Some("/a".into()), remote: None }],
+                            tabs: vec![TabSnapshot {
+                                name: None,
+                                cwd: Some("/a".into()),
+                                remote: None,
+                            }],
                         },
                         PaneSnapshot {
                             name: Some("logs".into()),
                             active_tab_index: 0,
-                            tabs: vec![TabSnapshot { name: None, cwd: Some("/b".into()), remote: None }],
+                            tabs: vec![TabSnapshot {
+                                name: None,
+                                cwd: Some("/b".into()),
+                                remote: None,
+                            }],
                         },
                     ],
                 }],

@@ -160,9 +160,7 @@ fn main() {
         builder = builder.clang_arg(format!("-resource-dir={}", resdir.display()));
     }
 
-    let bindings = builder
-        .generate()
-        .expect("bindgen failed for ghostty/vt.h");
+    let bindings = builder.generate().expect("bindgen failed for ghostty/vt.h");
     bindings.write_to_file(out_dir.join("bindings.rs")).expect("failed to write bindings.rs");
 }
 
@@ -268,10 +266,7 @@ fn probe_system_includes(cc: &str) -> Option<Vec<std::path::PathBuf>> {
 /// libclang's resource-dir detection is broken (thin Arch `clang`,
 /// distroless images, some Nix shells).
 fn clang_resource_dir() -> Option<std::path::PathBuf> {
-    let output = Command::new("clang")
-        .arg("-print-resource-dir")
-        .output()
-        .ok()?;
+    let output = Command::new("clang").arg("-print-resource-dir").output().ok()?;
     if !output.status.success() {
         return None;
     }

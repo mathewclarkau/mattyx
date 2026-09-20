@@ -615,11 +615,7 @@ fn main() {
                     eprintln!("mtyx: usage: mtyx agent-pattern add <name> --pattern <pattern>");
                     std::process::exit(2);
                 };
-                args.extend([
-                    "agent-pattern-add".to_string(),
-                    "--name".to_string(),
-                    name.clone(),
-                ]);
+                args.extend(["agent-pattern-add".to_string(), "--name".to_string(), name.clone()]);
                 args.extend(rest[2..].to_vec());
             }
             Some("list") => args.push("agent-pattern-list".to_string()),
@@ -704,12 +700,17 @@ fn run_attach(mut args: Args, fallback: Option<PathBuf>) -> anyhow::Result<()> {
     // call (the recovery iteration), so the user sees why a handoff failed.
     let mut pending_status: Option<String> = None;
     loop {
-        let overlay =
-            if args.apply_local_config { resolve_local_overlay(args.config.as_deref()) } else { None };
+        let overlay = if args.apply_local_config {
+            resolve_local_overlay(args.config.as_deref())
+        } else {
+            None
+        };
         // Rename compat: client_socket_path falls back to a LIVE
         // cmux-era socket when the canonical mtyx one is not up.
-        let socket_path =
-            args.socket.clone().unwrap_or_else(|| mux_core::server::client_socket_path(&args.session));
+        let socket_path = args
+            .socket
+            .clone()
+            .unwrap_or_else(|| mux_core::server::client_socket_path(&args.session));
         // Issue #69: retry once on a transiently-unconnectable socket, then
         // recover in-process to last_good when this is a swap (last_good is
         // Some) instead of propagating the error to exit 1. A genuine first
@@ -721,19 +722,11 @@ fn run_attach(mut args: Args, fallback: Option<PathBuf>) -> anyhow::Result<()> {
         ) {
             Ok(r) => r,
             Err(e) => {
-                let failed_name =
-                    socket_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                match session::plan_swap_recovery(
-                    last_good.as_deref(),
-                    &socket_path,
-                    failed_name,
-                ) {
+                let failed_name = socket_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                match session::plan_swap_recovery(last_good.as_deref(), &socket_path, failed_name) {
                     session::SwapRecovery::Propagate => {
                         return Err(e).with_context(|| {
-                            format!(
-                                "attaching to mtyx session socket at {}",
-                                socket_path.display()
-                            )
+                            format!("attaching to mtyx session socket at {}", socket_path.display())
                         });
                     }
                     session::SwapRecovery::Recover { socket, status } => {
@@ -871,6 +864,17 @@ fn run_server(args: Args) -> anyhow::Result<()> {
     surface_options.browser_capture_scale = config.browser.capture_scale;
     if let Some(term) = args.term {
         surface_options.term = term;
+    }
+    // Issue #99: headless VT geometry from mux.json (`headless.vt_size`,
+    // e.g. "100x30") — the size surfaces spawn at when no client is
+    // attached. Only applied when `MTYX_MUX_VT_SIZE` (read in
+    // `SurfaceOptions::default`) is unset, so a per-process env override
+    // still wins over the config file.
+    if std::env::var_os("MTYX_MUX_VT_SIZE").is_none() {
+        if let Some((cols, rows)) = config.headless.vt_size {
+            surface_options.cols = cols;
+            surface_options.rows = rows;
+        }
     }
     // Compute the socket path up front so surface children inherit it.
     let socket_path =

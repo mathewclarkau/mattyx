@@ -115,7 +115,10 @@ impl AgentPattern {
             return Err("agent name cannot have leading/trailing whitespace".to_string());
         }
         if self.name.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            return Err(format!("agent name {:?} cannot contain whitespace or control characters", self.name));
+            return Err(format!(
+                "agent name {:?} cannot contain whitespace or control characters",
+                self.name
+            ));
         }
         if self.name == "unknown" {
             return Err("agent name 'unknown' is reserved".to_string());
@@ -240,7 +243,10 @@ pub fn detect(
         .enumerate()
         .filter(|(_, p)| p.kind == PatternKind::Process)
         .flat_map(|(pi, pattern)| {
-            process.iter().filter(move |ev| pattern.matches_process(ev)).map(move |ev| (pi, pattern, ev))
+            process
+                .iter()
+                .filter(move |ev| pattern.matches_process(ev))
+                .map(move |ev| (pi, pattern, ev))
         })
         .collect();
 
@@ -523,27 +529,21 @@ mod tests {
         let patterns = bundled_patterns().unwrap();
         // codex spawned later (larger starttime) even though claude's
         // pid is lower.
-        let process = vec![
-            ev(10, "claude", "claude", Some(100)),
-            ev(20, "codex", "codex", Some(200)),
-        ];
+        let process =
+            vec![ev(10, "claude", "claude", Some(100)), ev(20, "codex", "codex", Some(200))];
         let detection = detect(&process, "", &patterns, Confidence::Low);
         assert_eq!(detection.agent, "codex");
 
         // Equal starttimes: codex also has screen evidence → codex wins.
-        let process = vec![
-            ev(10, "claude", "claude", Some(200)),
-            ev(20, "codex", "codex", Some(200)),
-        ];
+        let process =
+            vec![ev(10, "claude", "claude", Some(200)), ev(20, "codex", "codex", Some(200))];
         let detection = detect(&process, "codex> thinking", &patterns, Confidence::Low);
         assert_eq!(detection.agent, "codex");
 
         // Equal starttimes, no screen evidence either: deterministic
         // (first pattern in the registry wins) — must not be "unknown".
-        let process = vec![
-            ev(20, "codex", "codex", Some(200)),
-            ev(10, "claude", "claude", Some(200)),
-        ];
+        let process =
+            vec![ev(20, "codex", "codex", Some(200)), ev(10, "claude", "claude", Some(200))];
         let detection = detect(&process, "", &patterns, Confidence::Low);
         assert!(!detection.is_unknown());
     }
@@ -587,7 +587,10 @@ mod tests {
     fn wildcard_and_case_insensitive_patterns_match() {
         // Screen wildcard: segments must appear in order.
         let mut pat = screen_pat("wild", "my*mark");
-        assert!(pat.matches_screen("noise MY stuff MARK noise") == false, "case-sensitive by default");
+        assert!(
+            pat.matches_screen("noise MY stuff MARK noise") == false,
+            "case-sensitive by default"
+        );
         pat.case_insensitive = true;
         assert!(pat.matches_screen("noise MY stuff MARK noise"));
         assert!(!pat.matches_screen("noise mark stuff my"), "segments must appear in order");

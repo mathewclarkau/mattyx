@@ -44,8 +44,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, TerminateProcess, WaitForSingleObject,
@@ -186,9 +186,7 @@ pub fn track_child_handle(handle: windows_sys::Win32::Foundation::HANDLE) {
 pub fn reap_tracked_handles() {
     let mut handles = TRACKED_HANDLES.lock().unwrap();
     handles.retain(|raw| {
-        let signalled = unsafe {
-            WaitForSingleObject(usize_as_handle(*raw), 0) == WAIT_OBJECT_0
-        };
+        let signalled = unsafe { WaitForSingleObject(usize_as_handle(*raw), 0) == WAIT_OBJECT_0 };
         if signalled {
             unsafe { CloseHandle(usize_as_handle(*raw)) };
         }
@@ -217,11 +215,8 @@ fn snapshot_processes() -> Vec<SnapshotProcess> {
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
         if Process32FirstW(snap, &mut entry) != 0 {
             loop {
-                let len = entry
-                    .szExeFile
-                    .iter()
-                    .position(|c| *c == 0)
-                    .unwrap_or(entry.szExeFile.len());
+                let len =
+                    entry.szExeFile.iter().position(|c| *c == 0).unwrap_or(entry.szExeFile.len());
                 let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
                 let image = name.to_ascii_lowercase().trim_end_matches(".exe").to_string();
                 out.push(SnapshotProcess {
@@ -251,8 +246,7 @@ pub fn process_image_name(pid: u32) -> Option<String> {
 /// the module limitations).
 pub fn descendant_processes(root: u32) -> Vec<(u32, String)> {
     let snapshot = snapshot_processes();
-    let by_pid: HashMap<u32, &SnapshotProcess> =
-        snapshot.iter().map(|p| (p.pid, p)).collect();
+    let by_pid: HashMap<u32, &SnapshotProcess> = snapshot.iter().map(|p| (p.pid, p)).collect();
     let mut out: Vec<(u32, String)> = Vec::new();
     let mut stack = vec![root];
     let mut seen = std::collections::HashSet::new();

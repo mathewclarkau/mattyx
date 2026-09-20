@@ -44,8 +44,12 @@ fn legacy_config_path(global: bool) -> Option<PathBuf> {
 }
 
 fn report_command(state: &str) -> String {
+    // Issue #97: invoke the *running* binary by absolute path (shell-
+    // quoted — the resolved path can contain spaces), never a bare
+    // `mtyx` that a rename or a stale $PATH entry could hijack.
+    let bin = hook_merge::shell_quote(&hook_merge::hook_bin());
     format!(
-        "test -n \"$MTYX_MUX_SURFACE\" && mtyx report-agent --surface \"$MTYX_MUX_SURFACE\" --state {state} --source hook || true"
+        "test -n \"$MTYX_MUX_SURFACE\" && {bin} report-agent --surface \"$MTYX_MUX_SURFACE\" --state {state} --source hook || true"
     )
 }
 
@@ -97,7 +101,10 @@ fn clean_legacy(global: bool) -> bool {
     match hook_merge::load_json::<LegacyGrokHooksConfig>(&path) {
         Ok(mut config) => {
             let before = config.hooks.len();
-            config.hooks.retain(|h| !h.command.contains("mtyx report-agent"));
+            // `report-agent` (not the fuller `mtyx report-agent`): also
+            // removes entries carrying a quoted absolute binary path
+            // installed since issue #97, alongside the bare legacy text.
+            config.hooks.retain(|h| !h.command.contains("report-agent"));
             if config.hooks.is_empty() {
                 let _ = fs::remove_file(&path);
                 before > 0
@@ -129,7 +136,9 @@ pub fn run(args: &[String]) -> i32 {
         Some("install-hooks") => run_install(uninstall, global),
         Some("install-skill") => run_install_skill(uninstall, global),
         _ => {
-            eprintln!("mtyx: usage: mtyx grok <install-hooks|install-skill> [--uninstall] [--global]");
+            eprintln!(
+                "mtyx: usage: mtyx grok <install-hooks|install-skill> [--uninstall] [--global]"
+            );
             2
         }
     }
@@ -261,18 +270,74 @@ mod tests {
         assert_eq!(hooks["hooks"]["Notification"][0]["matcher"], "idle_prompt|permission_prompt");
     }
 
+    /// Issue #97 AC1: every emitted command invokes the running binary by
+    /// its current_exe() absolute path, never a bare `mtyx` PATH lookup.
+    #[test]
+    fn native_hooks_invoke_the_running_binary_absolute_path() {
+        let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap();
+        // The hooks are compared as serde_json text, where backslashes in
+        // Windows paths are escaped (`\\`). Compare against the escaped
+        // form so the assert is platform-neutral.
+        let exe_json = serde_json::to_string(&exe).unwrap().trim_matches('"').to_string();
+        let quoted = hook_merge::shell_quote(&exe_json);
+        let hooks = grok_native_hooks();
+        let text = serde_json::to_string(&hooks).unwrap();
+        assert!(text.contains(&quoted), "commands must name the running binary: {text}");
+        assert!(
+            !text.contains("mtyx report-agent"),
+            "a bare-mtyx PATH lookup must not survive: {text}"
+        );
+        // The shell guard still wraps the invocation.
+        let command = hooks["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(command.starts_with("test -n \"$MTYX_MUX_SURFACE\" && "), "{command}");
+    }
+
     #[test]
     fn config_path_is_the_grok_hooks_directory() {
         let project = config_path(false).expect("project path");
-        assert_eq!(
-            project,
-            PathBuf::from(".grok").join("hooks").join("mtyx-agent-state.json")
-        );
+        assert_eq!(project, PathBuf::from(".grok").join("hooks").join("mtyx-agent-state.json"));
     }
 
     #[test]
     fn test_run_unknown_subcommand() {
         let code = run(&["invalid".to_string()]);
         assert_eq!(code, 2);
+    }
+
+    /// Issue #97 AC3: uninstall still removes entries written by older
+    /// versions (bare `mtyx report-agent …` command text) from the legacy
+    /// flat `.grok/hooks.json`, keeps unrelated user entries, and drops
+    /// the native hooks file wholesale.
+    #[test]
+    fn uninstall_removes_legacy_bare_mtyx_entries_and_keeps_user_hooks() {
+        let _guard = crate::hook_merge::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "grok-hook-test-legacy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(home.join(".grok").join("hooks")).unwrap();
+        fs::write(
+            home.join(".grok").join("hooks.json"),
+            r#"{"hooks":[{"event":"PreToolUse","command":"mtyx report-agent --surface 1 --state working --source hook"},{"event":"Stop","command":"/opt/elsewhere/mtyx report-agent --surface 1 --state done --source hook"},{"event":"UserEvent","command":"echo keep me"}]}"#,
+        )
+        .unwrap();
+        fs::write(home.join(".grok").join("hooks").join(HOOK_FILENAME), "{}").unwrap();
+        std::env::set_var("HOME", &home);
+
+        assert_eq!(run_install(true, true), 0);
+
+        // Native hooks file removed wholesale.
+        assert!(!home.join(".grok").join("hooks").join(HOOK_FILENAME).exists());
+        // Legacy flat config: ours gone, the user's entry kept.
+        let legacy: LegacyGrokHooksConfig = serde_json::from_str(
+            &fs::read_to_string(home.join(".grok").join("hooks.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(legacy.hooks.len(), 1);
+        assert_eq!(legacy.hooks[0].command, "echo keep me");
+
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(&home);
     }
 }

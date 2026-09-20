@@ -41,8 +41,7 @@ pub fn stdout_is_vt_capable() -> bool {
             return false;
         }
         let mut mode: CONSOLE_MODE = 0;
-        GetConsoleMode(handle, &mut mode) != 0
-            && mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0
+        GetConsoleMode(handle, &mut mode) != 0 && mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0
     }
 }
 
@@ -66,8 +65,7 @@ pub fn read_stdin_until(timeout: Duration, stop: &dyn Fn(&[u8]) -> bool) -> Vec<
     let mut out = Vec::new();
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let wait_ms =
-            remaining.as_millis().min(20).min(u32::MAX as u128) as u32;
+        let wait_ms = remaining.as_millis().min(20).min(u32::MAX as u128) as u32;
         let signaled = unsafe { WaitForSingleObject(handle, wait_ms) };
         if signaled == WAIT_TIMEOUT {
             continue;
@@ -79,7 +77,13 @@ pub fn read_stdin_until(timeout: Duration, stop: &dyn Fn(&[u8]) -> bool) -> Vec<
         let mut buf = [0u8; 1024];
         let mut read = 0u32;
         let ok = unsafe {
-            ReadFile(handle, buf.as_mut_ptr().cast(), buf.len() as u32, &mut read, std::ptr::null_mut())
+            ReadFile(
+                handle,
+                buf.as_mut_ptr().cast(),
+                buf.len() as u32,
+                &mut read,
+                std::ptr::null_mut(),
+            )
         };
         if ok == 0 || read == 0 {
             break;

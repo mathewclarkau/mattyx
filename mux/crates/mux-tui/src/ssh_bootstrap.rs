@@ -162,7 +162,9 @@ fn build_mtyxd_remote(os: &str, arch: &str, out: &Path) -> anyhow::Result<()> {
         .arg(out)
         .arg("./cmd/cmuxd-remote")
         .status()
-        .map_err(|e| anyhow::anyhow!("failed to run `go build` (is Go installed and on PATH?): {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!("failed to run `go build` (is Go installed and on PATH?): {e}")
+        })?;
     if !status.success() {
         anyhow::bail!("go build failed: {status}");
     }

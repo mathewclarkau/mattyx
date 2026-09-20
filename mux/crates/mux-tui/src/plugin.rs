@@ -262,16 +262,16 @@ pub fn effective_capabilities(cap: Option<&Capabilities>) -> Capabilities {
 pub fn validate_capabilities(cap: &Capabilities) -> Result<(), String> {
     match cap.socket.as_deref() {
         Some("off") | Some("read") | Some("write") => {}
-        Some(other) => return Err(format!(
-            r#"manifest capabilities.socket must be one of off/read/write; got {other:?}"#
-        )),
+        Some(other) => {
+            return Err(format!(
+                r#"manifest capabilities.socket must be one of off/read/write; got {other:?}"#
+            ))
+        }
         None => {}
     }
     if let Some(mem) = cap.memory_mib {
         if mem == 0 || mem > 4096 {
-            return Err(format!(
-                "manifest capabilities.memory_mib must be in 1..=4096; got {mem}"
-            ));
+            return Err(format!("manifest capabilities.memory_mib must be in 1..=4096; got {mem}"));
         }
     }
     if let Some(runtime) = cap.max_runtime_ms {
@@ -290,9 +290,11 @@ pub fn validate_capabilities(cap: &Capabilities) -> Result<(), String> {
     }
     match cap.network.as_deref() {
         Some("off") | Some("outbound") | None => {}
-        Some(other) => return Err(format!(
-            r#"manifest capabilities.network must be one of off/outbound; got {other:?}"#
-        )),
+        Some(other) => {
+            return Err(format!(
+                r#"manifest capabilities.network must be one of off/outbound; got {other:?}"#
+            ))
+        }
     }
     Ok(())
 }
@@ -381,10 +383,7 @@ fn save_registry(base: &Path, reg: &Registry) -> Result<(), String> {
     }
     if let Ok(meta) = fs::symlink_metadata(&path) {
         if meta.file_type().is_symlink() {
-            return Err(format!(
-                "refusing to write through symlink at {}",
-                path.display()
-            ));
+            return Err(format!("refusing to write through symlink at {}", path.display()));
         }
     }
     let json = serde_json::to_string_pretty(reg)
@@ -474,9 +473,7 @@ pub fn lookup_plugin(name: &str) -> Result<(PluginEntry, std::path::PathBuf), St
         return Err(format!("plugin {name:?} is disabled (run `mtyx plugin enable {name}`)"));
     }
     if !entry.verbs.iter().any(|v| v == "cmux_call") {
-        return Err(format!(
-            "plugin {name:?} manifest does not declare the cmux_call verb"
-        ));
+        return Err(format!("plugin {name:?} manifest does not declare the cmux_call verb"));
     }
     let dir = plugins_dir(&base).join(&entry.name);
     Ok((entry, dir))
@@ -486,11 +483,7 @@ pub fn lookup_plugin(name: &str) -> Result<(PluginEntry, std::path::PathBuf), St
 /// code 0 on success, 2 on usage error, 1 on runtime error. Reads the
 /// manifest + the registered capabilities, builds the SocketDispatcher,
 /// and invokes the plugin via crate::plugin_host::invoke.
-pub fn cmd_call(
-    plugin_name: &str,
-    args: &[String],
-    socket_path: &std::path::Path,
-) -> i32 {
+pub fn cmd_call(plugin_name: &str, args: &[String], socket_path: &std::path::Path) -> i32 {
     let (entry, plugin_dir) = match lookup_plugin(plugin_name) {
         Ok(x) => x,
         Err(err) => {
@@ -505,10 +498,7 @@ pub fn cmd_call(
     let manifest_text = match std::fs::read_to_string(&manifest_path) {
         Ok(s) => s,
         Err(err) => {
-            eprintln!(
-                "mtyx: failed to read manifest {}: {err}",
-                manifest_path.display()
-            );
+            eprintln!("mtyx: failed to read manifest {}: {err}", manifest_path.display());
             return 1;
         }
     };
@@ -555,9 +545,8 @@ pub fn cmd_call(
             return 1;
         }
     };
-    let dispatcher = std::sync::Arc::new(crate::plugin_host::SocketDispatcher::new(
-        socket_path.to_path_buf(),
-    ));
+    let dispatcher =
+        std::sync::Arc::new(crate::plugin_host::SocketDispatcher::new(socket_path.to_path_buf()));
     match crate::plugin_host::invoke(
         &engine,
         &module,
@@ -632,10 +621,7 @@ fn cmd_install(base: &Path, positional: &[&str]) -> i32 {
         }
     };
     if reg.plugins.iter().any(|p| p.name == plugin.name) {
-        eprintln!(
-            "mtyx plugin install: a plugin named {:?} is already installed",
-            plugin.name
-        );
+        eprintln!("mtyx plugin install: a plugin named {:?} is already installed", plugin.name);
         return 1;
     }
     let plugin_dir = plugins_dir(base).join(&plugin.name);
@@ -785,24 +771,15 @@ mod tests {
     use super::*;
 
     fn manifest(name: &str, entry: &str, verbs: &[&str]) -> String {
-        let verbs = verbs
-            .iter()
-            .map(|v| format!("\"{v}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "[plugin]\nname = \"{name}\"\nentry = \"{entry}\"\nverbs = [{verbs}]\n"
-        )
+        let verbs = verbs.iter().map(|v| format!("\"{v}\"")).collect::<Vec<_>>().join(", ");
+        format!("[plugin]\nname = \"{name}\"\nentry = \"{entry}\"\nverbs = [{verbs}]\n")
     }
 
     fn tmp_base(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "mtyx-plugin-test-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -869,10 +846,7 @@ mod tests {
         // Install a valid manifest from a temp file.
         let manifest_dir = std::env::temp_dir().join(format!(
             "mtyx-plugin-manifest-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::create_dir_all(&manifest_dir).unwrap();
         let manifest_file = manifest_dir.join("mtyx-plugin.toml");
@@ -888,10 +862,7 @@ mod tests {
         assert_eq!(entry.name, "fleet");
         assert!(entry.enabled);
         assert_eq!(entry.entry, "bin/fleet.wasm");
-        assert_eq!(
-            entry.verbs,
-            vec!["deploy".to_string(), "rollback".to_string()]
-        );
+        assert_eq!(entry.verbs, vec!["deploy".to_string(), "rollback".to_string()]);
         let dest = plugins_dir(&base).join("fleet").join("mtyx-plugin.toml");
         assert!(dest.exists(), "manifest should be copied to {}", dest.display());
         assert_eq!(
@@ -946,10 +917,7 @@ mod tests {
         let base = tmp_base("badman");
         let dir = std::env::temp_dir().join(format!(
             "mtyx-plugin-bad-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("mtyx-plugin.toml");
@@ -1002,10 +970,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, registry_path(&base)).unwrap();
         let reg = Registry::default();
         let err = save_registry(&base, &reg).expect_err("must refuse symlink target");
-        assert!(
-            err.contains("symlink"),
-            "error should mention symlink: {err}"
-        );
+        assert!(err.contains("symlink"), "error should mention symlink: {err}");
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
             "do-not-touch",
@@ -1036,18 +1001,11 @@ mod tests {
         // Stage a real manifest in a separate temp dir.
         let manifest_dir = std::env::temp_dir().join(format!(
             "mtyx-plugin-test-manifest-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::create_dir_all(&manifest_dir).unwrap();
         let manifest_file = manifest_dir.join("mtyx-plugin.toml");
-        fs::write(
-            &manifest_file,
-            manifest("fleet", "bin/fleet.wasm", &["deploy"]),
-        )
-        .unwrap();
+        fs::write(&manifest_file, manifest("fleet", "bin/fleet.wasm", &["deploy"])).unwrap();
         let path_str = manifest_file.to_str().unwrap();
 
         assert_eq!(cmd_install(&base, &[path_str]), 1);
@@ -1086,18 +1044,11 @@ mod tests {
 
         let manifest_dir = std::env::temp_dir().join(format!(
             "mtyx-plugin-test-manifest-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::create_dir_all(&manifest_dir).unwrap();
         let manifest_file = manifest_dir.join("mtyx-plugin.toml");
-        fs::write(
-            &manifest_file,
-            manifest("fleet", "bin/fleet.wasm", &["deploy"]),
-        )
-        .unwrap();
+        fs::write(&manifest_file, manifest("fleet", "bin/fleet.wasm", &["deploy"])).unwrap();
         let path_str = manifest_file.to_str().unwrap();
 
         assert_eq!(cmd_install(&base, &[path_str]), 1);
@@ -1254,10 +1205,7 @@ mod tests {
         let a = json.find("\"alpha\"").expect("alpha must be present");
         let b = json.find("\"beta\"").expect("beta must be present");
         let c = json.find("\"gamma\"").expect("gamma must be present");
-        assert!(
-            a < b && b < c,
-            "JSON output must sort by name; got: {json}"
-        );
+        assert!(a < b && b < c, "JSON output must sort by name; got: {json}");
 
         // Plain output must use the same order.
         let plain = format_list_output(&reg, false).expect("format plain");
@@ -1268,7 +1216,6 @@ mod tests {
         assert!(lines[2].starts_with("gamma "), "plain line 2: {}", lines[2]);
     }
 
-
     #[test]
     fn cmd_call_rejects_disallowed_verb() {
         // Build a manifest that only allows `deploy`, then try to
@@ -1277,10 +1224,7 @@ mod tests {
         // need a real .wasm fixture to test the validation path).
         let m = parse_manifest(&manifest("fleet", "bin/fleet.wasm", &["deploy"]))
             .expect("valid manifest");
-        assert!(
-            !m.verbs.iter().any(|v| v == "rollback"),
-            "rollback should not be in allowlist"
-        );
+        assert!(!m.verbs.iter().any(|v| v == "rollback"), "rollback should not be in allowlist");
     }
 
     /// Issue #42 AC6: the pifactory-fleet example plugin ships at
@@ -1385,10 +1329,7 @@ mod tests {
             // developer ran ./build.sh), confirm it is non-empty.
             let meta = fs::metadata(&entry_path)
                 .unwrap_or_else(|e| panic!("stat {}: {e}", entry_path.display()));
-            assert!(
-                meta.len() > 0,
-                "bin/fleet.wasm should be a non-empty WASM artifact"
-            );
+            assert!(meta.len() > 0, "bin/fleet.wasm should be a non-empty WASM artifact");
         }
     }
 
@@ -1399,8 +1340,8 @@ mod tests {
     /// supporting files.
     #[test]
     fn example_pifactory_fleet_sources_exist() {
-        let plugin_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../spec/plugins/pifactory-fleet");
+        let plugin_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spec/plugins/pifactory-fleet");
         let plugin_dir = plugin_dir
             .canonicalize()
             .unwrap_or_else(|e| panic!("could not canonicalize {}: {e}", plugin_dir.display()));
@@ -1452,26 +1393,17 @@ mod tests {
 
         // Neither file: canonical name is returned (callers surface the
         // read error against the canonical path).
-        assert_eq!(
-            manifest_path_in(&plugin_dir),
-            plugin_dir.join("mtyx-plugin.toml")
-        );
+        assert_eq!(manifest_path_in(&plugin_dir), plugin_dir.join("mtyx-plugin.toml"));
 
         // Legacy only: honoured.
         fs::write(plugin_dir.join("cmux-plugin.toml"), manifest("fleet", "a.wasm", &["v"]))
             .unwrap();
-        assert_eq!(
-            manifest_path_in(&plugin_dir),
-            plugin_dir.join("cmux-plugin.toml")
-        );
+        assert_eq!(manifest_path_in(&plugin_dir), plugin_dir.join("cmux-plugin.toml"));
 
         // Both: canonical wins.
         fs::write(plugin_dir.join("mtyx-plugin.toml"), manifest("fleet", "a.wasm", &["v"]))
             .unwrap();
-        assert_eq!(
-            manifest_path_in(&plugin_dir),
-            plugin_dir.join("mtyx-plugin.toml")
-        );
+        assert_eq!(manifest_path_in(&plugin_dir), plugin_dir.join("mtyx-plugin.toml"));
     }
 
     #[test]

@@ -170,7 +170,8 @@ mod tests {
 
     #[test]
     fn detached_head_shows_short_sha() {
-        let dir = std::env::temp_dir().join(format!("git-info-test-detached-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("git-info-test-detached-{}", std::process::id()));
         let git_dir = dir.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
         std::fs::write(git_dir.join("HEAD"), "a78fe53efaaea56b80d47569d85e0d7b76512aa7\n").unwrap();
@@ -227,8 +228,7 @@ mod tests {
         assert_eq!(head_short_for_path(dir.to_str().unwrap()), Some("a78fe53".to_string()));
 
         // Detached HEAD: HEAD itself is the sha.
-        std::fs::write(git_dir.join("HEAD"), "deadbee000000000000000000000000000000000\n")
-            .unwrap();
+        std::fs::write(git_dir.join("HEAD"), "deadbee000000000000000000000000000000000\n").unwrap();
         assert_eq!(head_short_for_path(dir.to_str().unwrap()), Some("deadbee".to_string()));
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -263,8 +263,7 @@ mod tests {
         std::fs::create_dir_all(admin.join("refs/heads")).unwrap(); // must NOT be used
         std::fs::create_dir_all(main_git.join("refs/heads/feat")).unwrap();
         std::fs::create_dir_all(&worktree).unwrap();
-        std::fs::write(worktree.join(".git"), format!("gitdir: {}\n", admin.display()))
-            .unwrap();
+        std::fs::write(worktree.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
         std::fs::write(admin.join("HEAD"), "ref: refs/heads/feat/auth\n").unwrap();
         std::fs::write(admin.join("commondir"), "../..\n").unwrap();
         std::fs::write(

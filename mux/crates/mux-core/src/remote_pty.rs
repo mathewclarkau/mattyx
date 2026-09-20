@@ -42,7 +42,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
-use portable_pty::{Child, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize, SlavePty};
+use portable_pty::{
+    Child, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize, SlavePty,
+};
 use serde_json::{json, Value};
 
 use crate::persist::shell_quote;
@@ -354,13 +356,9 @@ impl MasterPty for RemoteMasterPty {
     }
 
     fn try_clone_reader(&self) -> anyhow::Result<Box<dyn Read + Send>> {
-        let rx = self
-            .0
-            .reader_rx
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("remote pty reader already taken or not yet attached"))?;
+        let rx = self.0.reader_rx.lock().unwrap().take().ok_or_else(|| {
+            anyhow::anyhow!("remote pty reader already taken or not yet attached")
+        })?;
         Ok(Box::new(RemotePtyReader { rx, buf: Vec::new(), pos: 0 }))
     }
 
@@ -428,7 +426,8 @@ fn remote_command_line(cmd: &CommandBuilder) -> Option<String> {
     if cmd.is_default_prog() {
         return cd_prefix.map(|prefix| format!("{prefix}exec \"$SHELL\" -l"));
     }
-    let argv: Vec<String> = cmd.get_argv().iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    let argv: Vec<String> =
+        cmd.get_argv().iter().map(|a| a.to_string_lossy().into_owned()).collect();
     if argv.is_empty() {
         return cd_prefix.map(|prefix| format!("{prefix}exec \"$SHELL\" -l"));
     }
@@ -584,10 +583,7 @@ mod tests {
     #[test]
     fn custom_command_is_shell_quoted_and_execed() {
         let cmd = builder(&["claude", "--resume", "abc"]);
-        assert_eq!(
-            remote_command_line(&cmd),
-            Some("exec 'claude' '--resume' 'abc'".to_string())
-        );
+        assert_eq!(remote_command_line(&cmd), Some("exec 'claude' '--resume' 'abc'".to_string()));
     }
 
     #[test]

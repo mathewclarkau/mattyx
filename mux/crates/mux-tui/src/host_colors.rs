@@ -4,10 +4,10 @@ use std::fs::OpenOptions;
 use std::io;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
-#[cfg(unix)]
-use std::time::Instant;
 #[cfg(any(unix, windows))]
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use mux_core::DefaultColors;
 #[cfg(any(unix, windows, test))]
@@ -75,13 +75,10 @@ pub fn probe_default_colors() -> DefaultColors {
         return DefaultColors::default();
     }
     crate::win_console::write_stdout(QUERY);
-    parse_replies(&crate::win_console::read_stdin_until(
-        DEADLINE,
-        &|bytes| {
-            let colors = parse_replies(bytes);
-            colors.fg.is_some() && colors.bg.is_some()
-        },
-    ))
+    parse_replies(&crate::win_console::read_stdin_until(DEADLINE, &|bytes| {
+        let colors = parse_replies(bytes);
+        colors.fg.is_some() && colors.bg.is_some()
+    }))
 }
 
 #[cfg(unix)]

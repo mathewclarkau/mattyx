@@ -51,11 +51,9 @@ fn unique_temp_dir(name: &str) -> PathBuf {
 /// streams are drained after exit, when the child's write ends are
 /// closed, so the drain cannot block either.
 fn bounded_output(stage_name: &str, mut cmd: Command) -> Output {
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("{}: failed to spawn {:?}: {}", stage_name, cmd.get_program(), e));
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap_or_else(|e| {
+        panic!("{}: failed to spawn {:?}: {}", stage_name, cmd.get_program(), e)
+    });
     let deadline = Instant::now() + CLI_DEADLINE;
     loop {
         match child.try_wait() {
@@ -249,11 +247,7 @@ fn pane_create_send_and_read_screen() {
     assert_success("new-workspace", &created);
     let stdout_text = String::from_utf8_lossy(&created.stdout).into_owned();
     let surface = stdout_text.trim().to_string();
-    assert!(
-        !surface.is_empty(),
-        "new-workspace: stdout is not a surface id: {:?}",
-        stdout_text
-    );
+    assert!(!surface.is_empty(), "new-workspace: stdout is not a surface id: {:?}", stdout_text);
     stage(&format!("pane-create: surface {}", surface));
 
     // Send: portable echo probe, submitted with a real CR. `--send-cr`
@@ -263,7 +257,15 @@ fn pane_create_send_and_read_screen() {
     let marker = "PARITY-MARK-7Q";
     let sent = server.cli(
         "send",
-        &["send", "--surface", &surface, "--text", &format!("echo {}", marker), "--send-cr", "true"],
+        &[
+            "send",
+            "--surface",
+            &surface,
+            "--text",
+            &format!("echo {}", marker),
+            "--send-cr",
+            "true",
+        ],
     );
     assert_success("send", &sent);
 
@@ -419,11 +421,9 @@ fn conpty_lifecycle_spawn_write_read_resize_kill() {
                 seen.push_str(&String::from_utf8_lossy(&bytes));
                 last_recv = Instant::now();
             }
-            Ok(Err(e)) => panic!(
-                "conpty: reader errored during startup: {}; output so far: {:?}",
-                e,
-                seen
-            ),
+            Ok(Err(e)) => {
+                panic!("conpty: reader errored during startup: {}; output so far: {:?}", e, seen)
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }

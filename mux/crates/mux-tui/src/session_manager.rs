@@ -79,11 +79,18 @@ impl Clone for WorkspaceColumn {
 pub enum Mode {
     Browse,
     /// y/N confirmation for killing a session row.
-    ConfirmKill { index: usize, name: String },
+    ConfirmKill {
+        index: usize,
+        name: String,
+    },
     /// Inline rename of the focused LIVE session (reuses
     /// `cli::rename_session_at`). `socket_path` is the session's current
     /// socket; `old_name` pre-fills the input.
-    Rename { socket_path: PathBuf, old_name: String, input: TextInput },
+    Rename {
+        socket_path: PathBuf,
+        old_name: String,
+        input: TextInput,
+    },
 }
 
 /// What `handle_key` wants the App to do after handling a key. Mirrors the
@@ -98,16 +105,24 @@ pub enum SessionManagerAction {
     /// Kill the session at this row index (App calls `cli::kill_session_at`).
     KillSession(usize),
     /// Commit the rename: App calls `cli::rename_session_at(socket, new_name)`.
-    RenameSession { socket: PathBuf, new_name: String },
+    RenameSession {
+        socket: PathBuf,
+        new_name: String,
+    },
     /// Attach to another session (case b, left row Enter). The App quits and
     /// the caller re-attaches via `RunOutcome::Reattach`; the target socket
     /// is recorded in `SessionManagerState::pending_reattach`.
     AttachSession,
     /// Focus a workspace in the *current* session in-process (case a).
-    FocusWorkspaceInPlace { index: usize },
+    FocusWorkspaceInPlace {
+        index: usize,
+    },
     /// Focus a workspace in an *other* session remotely (select-workspace
     /// one-shot RPC) and reattach to it (case b, right row Enter).
-    AttachOtherSessionWorkspace { socket: PathBuf, index: usize },
+    AttachOtherSessionWorkspace {
+        socket: PathBuf,
+        index: usize,
+    },
     /// A transient status line message (e.g. "unreachable — cannot attach").
     SetStatus(String),
     /// Re-run discovery and reset the right column (the App rebuilds the
@@ -226,31 +241,29 @@ impl SessionManagerState {
                     SessionManagerAction::Redraw
                 }
             },
-            Mode::Rename { socket_path, old_name, mut input } => {
-                match input.handle_key(&key) {
-                    InputEvent::Commit => {
-                        let new_name = input.as_str().trim().to_string();
-                        self.mode = Mode::Browse;
-                        if new_name.is_empty() {
-                            self.status = "session name cannot be empty".to_string();
-                            return SessionManagerAction::Redraw;
-                        }
-                        if new_name == old_name {
-                            self.status = format!("unchanged ({old_name})");
-                            return SessionManagerAction::Redraw;
-                        }
-                        SessionManagerAction::RenameSession { socket: socket_path, new_name }
+            Mode::Rename { socket_path, old_name, mut input } => match input.handle_key(&key) {
+                InputEvent::Commit => {
+                    let new_name = input.as_str().trim().to_string();
+                    self.mode = Mode::Browse;
+                    if new_name.is_empty() {
+                        self.status = "session name cannot be empty".to_string();
+                        return SessionManagerAction::Redraw;
                     }
-                    InputEvent::Cancel => {
-                        self.mode = Mode::Browse;
-                        SessionManagerAction::Redraw
+                    if new_name == old_name {
+                        self.status = format!("unchanged ({old_name})");
+                        return SessionManagerAction::Redraw;
                     }
-                    InputEvent::Changed | InputEvent::None => {
-                        self.mode = Mode::Rename { socket_path, old_name, input };
-                        SessionManagerAction::Redraw
-                    }
+                    SessionManagerAction::RenameSession { socket: socket_path, new_name }
                 }
-            }
+                InputEvent::Cancel => {
+                    self.mode = Mode::Browse;
+                    SessionManagerAction::Redraw
+                }
+                InputEvent::Changed | InputEvent::None => {
+                    self.mode = Mode::Rename { socket_path, old_name, input };
+                    SessionManagerAction::Redraw
+                }
+            },
             Mode::Browse => self.browse_key(key),
         }
     }
@@ -349,9 +362,7 @@ impl SessionManagerState {
             ));
         }
         if s.socket_path == self.own_socket {
-            return SessionManagerAction::SetStatus(
-                "already attached to this session".to_string(),
-            );
+            return SessionManagerAction::SetStatus("already attached to this session".to_string());
         }
         // Record the reattach target so `take_reattach_target` can drain it
         // after the App quits; the action lets the App know to stop the loop.
@@ -428,10 +439,8 @@ impl SessionManagerState {
         for i in targets {
             let Some(s) = self.sessions.get(i) else { continue };
             let socket = s.socket_path.clone();
-            let needs = matches!(
-                self.workspaces.get(&socket),
-                None | Some(WorkspaceColumn::NotFetched)
-            );
+            let needs =
+                matches!(self.workspaces.get(&socket), None | Some(WorkspaceColumn::NotFetched));
             if needs {
                 self.workspaces.insert(socket.clone(), WorkspaceColumn::Loading);
                 out.push(socket);
@@ -500,7 +509,9 @@ pub fn fetch_workspaces(socket: &Path) -> WorkspaceColumn {
             let data = value.get("data").unwrap_or(&value);
             WorkspaceColumn::Ready(parse_tree(data))
         }
-        OneShotOutcome::ServerErr(_) | OneShotOutcome::ConnectErr(_) => WorkspaceColumn::Unreachable,
+        OneShotOutcome::ServerErr(_) | OneShotOutcome::ConnectErr(_) => {
+            WorkspaceColumn::Unreachable
+        }
     }
 }
 
@@ -599,14 +610,13 @@ pub fn draw(app: &mut crate::app::App, frame: &mut ratatui::Frame) {
     let cursor_pos = visible.iter().position(|&i| i == state.left_sel);
     left_state.select(cursor_pos);
     let left_title = format!(" sessions ({}) ", visible.len());
-    let left_block = Block::default()
-        .borders(Borders::ALL)
-        .title(left_title)
-        .border_style(if state.focus == Column::Left {
+    let left_block = Block::default().borders(Borders::ALL).title(left_title).border_style(
+        if state.focus == Column::Left {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default().fg(Color::DarkGray)
-        });
+        },
+    );
     frame.render_stateful_widget(
         List::new(items)
             .block(left_block)
@@ -622,14 +632,13 @@ pub fn draw(app: &mut crate::app::App, frame: &mut ratatui::Frame) {
         Some(s) => format!(" workspaces: {} ", s.session),
         None => " workspaces ".to_string(),
     };
-    let right_block = Block::default()
-        .borders(Borders::ALL)
-        .title(right_title)
-        .border_style(if state.focus == Column::Right {
+    let right_block = Block::default().borders(Borders::ALL).title(right_title).border_style(
+        if state.focus == Column::Right {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default().fg(Color::DarkGray)
-        });
+        },
+    );
     let right_lines: Vec<Line> = match focused.and_then(|s| state.workspaces.get(&s.socket_path)) {
         Some(WorkspaceColumn::Ready(tree)) => {
             let mut lines = Vec::new();
@@ -640,30 +649,22 @@ pub fn draw(app: &mut crate::app::App, frame: &mut ratatui::Frame) {
                     Style::default()
                 };
                 let marker = if i == tree.active_workspace { "● " } else { "  " };
-                lines.push(Line::from(Span::styled(
-                    format!("{marker}{}", ws.name),
-                    style,
-                )));
+                lines.push(Line::from(Span::styled(format!("{marker}{}", ws.name), style)));
             }
             lines
         }
-        Some(WorkspaceColumn::Loading) => vec![Line::from(Span::styled(
-            " loading… ",
-            Style::default().fg(Color::DarkGray),
-        ))],
-        Some(WorkspaceColumn::Unreachable) => vec![Line::from(Span::styled(
-            " [unreachable] — socket not connectable ",
-            dim,
-        ))],
+        Some(WorkspaceColumn::Loading) => {
+            vec![Line::from(Span::styled(" loading… ", Style::default().fg(Color::DarkGray)))]
+        }
+        Some(WorkspaceColumn::Unreachable) => {
+            vec![Line::from(Span::styled(" [unreachable] — socket not connectable ", dim))]
+        }
         Some(WorkspaceColumn::NotFetched) | None => vec![Line::from(Span::styled(
             " (focus a session to preview its workspaces) ",
             Style::default().fg(Color::DarkGray),
         ))],
     };
-    frame.render_widget(
-        Paragraph::new(right_lines).block(right_block),
-        right_area,
-    );
+    frame.render_widget(Paragraph::new(right_lines).block(right_block), right_area);
 
     // Footer: the active prompt (filter / rename / confirm-kill) on row 1,
     // keymap hints + status on row 2.
@@ -842,10 +843,7 @@ mod tests {
         ];
         let mut state = SessionManagerState::new(PathBuf::from("/run/own.sock"), sessions);
         state.left_sel = 1; // focus the other session
-        state.set_workspaces(
-            PathBuf::from("/run/other.sock"),
-            WorkspaceColumn::Ready(mk_tree(3)),
-        );
+        state.set_workspaces(PathBuf::from("/run/other.sock"), WorkspaceColumn::Ready(mk_tree(3)));
         state.focus = Column::Right;
         state.right_sel = 2;
         let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -875,14 +873,19 @@ mod tests {
     /// T8 — AC7: q / Esc close the overlay.
     #[test]
     fn t8_close_keys_q_esc_restore_focus() {
-        let mut state =
-            SessionManagerState::new(PathBuf::from("/run/own.sock"), vec![mk_session("own", "/run/own.sock", true)]);
+        let mut state = SessionManagerState::new(
+            PathBuf::from("/run/own.sock"),
+            vec![mk_session("own", "/run/own.sock", true)],
+        );
         for key in [
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
         ] {
             let action = state.handle_key(key);
-            assert!(matches!(action, SessionManagerAction::Close), "close key must Close, got {action:?}");
+            assert!(
+                matches!(action, SessionManagerAction::Close),
+                "close key must Close, got {action:?}"
+            );
             // Re-open for the next iteration's sake.
             state = SessionManagerState::new(
                 PathBuf::from("/run/own.sock"),
@@ -901,9 +904,12 @@ mod tests {
         ];
         let mut state = SessionManagerState::new(PathBuf::from("/run/own.sock"), sessions);
         state.left_sel = 1; // focus the live session
-        // `r` enters rename mode.
+                            // `r` enters rename mode.
         let enter = state.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        assert!(matches!(enter, SessionManagerAction::Redraw), "r must enter rename mode (Redraw), got {enter:?}");
+        assert!(
+            matches!(enter, SessionManagerAction::Redraw),
+            "r must enter rename mode (Redraw), got {enter:?}"
+        );
         // Rename pre-fills with the old name; clear it (Ctrl-U) then type the new.
         state.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         state.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));

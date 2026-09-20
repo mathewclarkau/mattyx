@@ -36,6 +36,10 @@ pub struct SurfaceOptions {
     /// TERM value for children. xterm-256color is the compatible default;
     /// set xterm-ghostty when the ghostty terminfo is installed.
     pub term: String,
+    /// Initial VT geometry (cols, rows). When a surface is spawned with
+    /// no client attached and no explicit size, this is the headless
+    /// default — 120x40, overridable via `MTYX_MUX_VT_SIZE=COLSxROWS`
+    /// (issue #99; see [`SurfaceOptions::default`]).
     pub cols: u16,
     pub rows: u16,
     pub scrollback: usize,
@@ -65,14 +69,57 @@ pub struct SurfaceOptions {
     pub remote: Option<crate::remote_pty::RemoteSpec>,
 }
 
+/// Default headless VT geometry (issue #99): the size a surface spawns
+/// at when no client is attached and no explicit size is given.
+/// Attaching a client still resizes to its real geometry as before.
+const DEFAULT_VT_COLS: u16 = 120;
+const DEFAULT_VT_ROWS: u16 = 40;
+
+/// Parse a `COLSxROWS` geometry string (e.g. `"100x30"`; an uppercase
+/// `X` separator and surrounding whitespace are tolerated). Both
+/// dimensions must be >= 1. Shared by the `MTYX_MUX_VT_SIZE` env
+/// override and mux-tui's `headless.vt_size` config key (issue #99).
+pub fn parse_vt_size(value: &str) -> Option<(u16, u16)> {
+    let value = value.trim();
+    let (cols, rows) = value.split_once('x').or_else(|| value.split_once('X'))?;
+    let cols: u16 = cols.trim().parse().ok()?;
+    let rows: u16 = rows.trim().parse().ok()?;
+    (cols >= 1 && rows >= 1).then_some((cols, rows))
+}
+
+/// Headless VT geometry for [`SurfaceOptions::default`]: the
+/// `MTYX_MUX_VT_SIZE` env var when it parses as `COLSxROWS`, else the
+/// 120x40 default (issue #99).
+fn vt_size_from_env() -> (u16, u16) {
+    if let Ok(value) = std::env::var("MTYX_MUX_VT_SIZE") {
+        match parse_vt_size(&value) {
+            Some(size) => size,
+            None => {
+                eprintln!(
+                    "mtyx: ignoring MTYX_MUX_VT_SIZE={value:?}; expected COLSxROWS, e.g. \"100x30\""
+                );
+                (DEFAULT_VT_COLS, DEFAULT_VT_ROWS)
+            }
+        }
+    } else {
+        (DEFAULT_VT_COLS, DEFAULT_VT_ROWS)
+    }
+}
+
 impl Default for SurfaceOptions {
     fn default() -> Self {
+        // Issue #99: headless VT geometry — 120x40 unless overridden with
+        // `MTYX_MUX_VT_SIZE=COLSxROWS` (e.g. "100x30"). The TUI's
+        // mux.json `headless.vt_size` key (applied in mux-tui's
+        // `run_server`) is the config-file form of the same knob; the
+        // env var wins because it is read here, first.
+        let (cols, rows) = vt_size_from_env();
         SurfaceOptions {
             command: None,
             cwd: None,
             term: std::env::var("MTYX_MUX_TERM").unwrap_or_else(|_| "xterm-256color".into()),
-            cols: 80,
-            rows: 24,
+            cols,
+            rows,
             scrollback: 10_000,
             extra_env: Vec::new(),
             chrome_binary: None,
@@ -372,7 +419,11 @@ impl Surface {
         // shell start wherever it normally would," not "assume it starts
         // in this machine's $HOME."
         let initial_cwd = opts.cwd.clone().or_else(|| {
-            opts.remote.is_none().then(platform::home_dir).flatten().map(|p| p.display().to_string())
+            opts.remote
+                .is_none()
+                .then(platform::home_dir)
+                .flatten()
+                .map(|p| p.display().to_string())
         });
         if let Some(cwd) = initial_cwd.as_deref() {
             cmd.cwd(cwd);
@@ -394,10 +445,7 @@ impl Surface {
             crate::win::assign_pid_to_kill_on_close_job(pid);
         }
         let killer = child.clone_killer();
-        let mut reader = pty
-            .master
-            .try_clone_reader()
-            .context("cloning pty master reader")?;
+        let mut reader = pty.master.try_clone_reader().context("cloning pty master reader")?;
         let writer = pty.master.take_writer().context("taking pty master writer")?;
 
         // Query responses generated while parsing pty output are queued
@@ -432,11 +480,7 @@ impl Surface {
             term.set_default_colors(colors.fg, colors.bg);
         }
         let surface = Arc::new(Surface::Pty(PtySurface {
-            meta: SurfaceMeta {
-                id,
-                name: Mutex::new(None),
-                detected_agent: Mutex::new(None),
-            },
+            meta: SurfaceMeta { id, name: Mutex::new(None), detected_agent: Mutex::new(None) },
             term: Mutex::new(term),
             writer: Mutex::new(writer),
             master: Mutex::new(pty.master),
@@ -503,7 +547,11 @@ impl Surface {
                                     None,
                                     None,
                                 );
-                                mux.emit(MuxEvent::OscNotification { surface: surface.id, title, body });
+                                mux.emit(MuxEvent::OscNotification {
+                                    surface: surface.id,
+                                    title,
+                                    body,
+                                });
                             }
                         }
                     }
@@ -669,7 +717,8 @@ impl Surface {
     /// Best-known working directory: the shell's live OSC 7 report when
     /// available, otherwise the directory the surface was spawned in.
     pub fn cwd(&self) -> Option<String> {
-        self.as_pty().and_then(|pty| pty.pwd.lock().unwrap().clone().or_else(|| pty.initial_cwd.clone()))
+        self.as_pty()
+            .and_then(|pty| pty.pwd.lock().unwrap().clone().or_else(|| pty.initial_cwd.clone()))
     }
 
     /// The `RemoteSpec` this surface was spawned with, if it's a
@@ -932,5 +981,37 @@ impl PtySurface {
             });
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_vt_size_accepts_cols_by_rows() {
+        assert_eq!(parse_vt_size("100x30"), Some((100, 30)));
+        assert_eq!(parse_vt_size(" 120x40 "), Some((120, 40)));
+        assert_eq!(parse_vt_size("100X7"), Some((100, 7)));
+        assert_eq!(parse_vt_size("100"), None);
+        assert_eq!(parse_vt_size(""), None);
+        assert_eq!(parse_vt_size("axb"), None);
+        assert_eq!(parse_vt_size("0x30"), None);
+        assert_eq!(parse_vt_size("100x0"), None);
+        assert_eq!(parse_vt_size("70000x30"), None);
+    }
+
+    /// Issue #99: the no-client default geometry is 120x40;
+    /// `MTYX_MUX_VT_SIZE=COLSxROWS` overrides it when parseable. The
+    /// assertion adapts to an ambient override so the test stays green
+    /// on machines that export the env var.
+    #[test]
+    fn default_geometry_is_120x40_unless_env_overrides() {
+        let expected = std::env::var("MTYX_MUX_VT_SIZE")
+            .ok()
+            .and_then(|value| parse_vt_size(&value))
+            .unwrap_or((120, 40));
+        let opts = SurfaceOptions::default();
+        assert_eq!((opts.cols, opts.rows), expected);
     }
 }

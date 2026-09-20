@@ -1,16 +1,17 @@
 //! Shared helpers for the agent hook installers (`antigravity_hook`,
-//! `codex_hook`, `pi_hook`).
+//! `codex_hook`, `grok_hook`, `pi_hook`, `opencode_hook`, `aider_hook`).
 //!
 //! ## What is and isn't migrated here
 //!
-//! `claude_hook.rs` is deliberately **NOT** migrated into this module:
-//! post-PR #7 it is already minimal, and it is the precedent for "if the
-//! file is already small, don't refactor it for the sake of it."
+//! `claude_hook.rs` keeps its own config logic: post-PR #7 it is already
+//! minimal, and it is the precedent for "if the file is already small,
+//! don't refactor it for the sake of it." It does share [`hook_bin`] —
+//! it is where that resolution logic was born (issue #97 generalized it
+//! to every installer).
 //!
-//! `aider_hook.rs` is also untouched. It installs a bash wrapper and has
-//! no JSON config and no marker-block logic, so it consumes **none** of
-//! these helpers. Adding a `use crate::hook_merge;` there would be an
-//! abstraction with nothing behind it.
+//! `aider_hook.rs` shares only [`hook_bin`]/[`shell_quote`]: it installs
+//! a bash wrapper and has no JSON config and no marker-block logic, so
+//! it consumes none of the load/save/marker helpers below.
 //!
 //! ## Behavior contracts preserved from the original inline code
 //!
@@ -35,6 +36,53 @@
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::path::Path;
+
+/// The binary every installed hook command must invoke (issue #97).
+///
+/// Resolves to the absolute path of the *currently running* executable
+/// so a hook never depends on a `$PATH` lookup at agent runtime — during
+/// the cmux→mtyx rename a stale or shadowed `mtyx` earlier on `$PATH`
+/// could silently hijack every installed hook. Falls back to the bare
+/// name `"mtyx"` only when `current_exe()` fails (no meaningful path on
+/// this platform), in which case behaviour matches the pre-#97 install.
+/// This is the same resolution `claude_hook.rs` has always done; it lives
+/// here now so every installer shares one copy of it.
+pub(crate) fn hook_bin() -> String {
+    std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "mtyx".to_string())
+}
+
+/// Quote `word` as a single POSIX shell word (issue #97).
+///
+/// The resolved [`hook_bin`] path can contain spaces or any other shell
+/// metacharacter; embedding it unquoted into the shell command strings
+/// we write into agent configs would split into multiple words. Always
+/// single-quotes: inside single quotes nothing is special, and an
+/// embedded `'` is emitted as `'\''` (close, escaped quote, reopen).
+/// The result is safe to interpolate into `sh -c` command strings.
+pub(crate) fn shell_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+/// Render `s` as a double-quoted JavaScript/TypeScript string literal
+/// (issue #97). JSON string literals are valid JS string literals, and
+/// serde_json escapes everything either language needs escaped
+/// (`"`, `\\`, control characters), so installed `.ts` hook files can
+/// embed the resolved [`hook_bin`] path — even one containing quotes or
+/// backslashes — without breaking the file's syntax.
+pub(crate) fn js_quote(s: &str) -> String {
+    serde_json::to_string(s).expect("serializing a &str to a JSON string cannot fail")
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// `$HOME` (and any other process-global env var) is mutated by hook
+    /// installer tests in *several* modules (`claude_hook`, `codex_hook`,
+    /// `antigravity_hook`, `grok_hook`, `pi_hook`, `opencode_hook`). Cargo
+    /// runs tests in one process, so every test that sets or restores
+    /// `$HOME` must hold this lock — a module-local mutex would still
+    /// race against the other modules' tests.
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
 
 /// Why a config load failed.
 ///
@@ -375,6 +423,43 @@ mod tests {
         dir
     }
 
+    // ---- hook_bin / shell_quote / js_quote ----
+
+    #[test]
+    fn hook_bin_resolves_the_running_executable() {
+        // In a test binary current_exe() is the test harness itself, so
+        // hook_bin() must return exactly that path (the "mtyx" fallback
+        // is only reachable on platforms where current_exe() fails).
+        let expected = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "mtyx".to_string());
+        assert_eq!(hook_bin(), expected);
+        // Platform-neutral absolute check: Windows current_exe() is `D:\...`,
+        // so a leading-slash assert can never pass there.
+        assert!(
+            std::path::Path::new(hook_bin().as_str()).is_absolute(),
+            "expected an absolute path, got {}",
+            hook_bin()
+        );
+    }
+
+    #[test]
+    fn shell_quote_quotes_spaces_and_embedded_single_quotes() {
+        // Paths with spaces stay one shell word; embedded single quotes
+        // are closed-escaped-reopened; plain paths are still quoted
+        // (quoting is unconditional so no caller can forget it).
+        assert_eq!(shell_quote("/usr/local/bin/mtyx"), "'/usr/local/bin/mtyx'");
+        assert_eq!(shell_quote("/opt/my mtyx/mtyx"), "'/opt/my mtyx/mtyx'");
+        assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn js_quote_emits_a_valid_string_literal() {
+        assert_eq!(js_quote("/usr/local/bin/mtyx"), "\"/usr/local/bin/mtyx\"");
+        assert_eq!(js_quote("a\"b\\c"), "\"a\\\"b\\\\c\"");
+    }
+
     // ---- load_or_default ----
 
     #[test]
@@ -506,12 +591,10 @@ mod tests {
         // a `<!-- CMUX-START/END -->` block. Re-running the installer must
         // strip the OLD block and append the fresh canonical one — never
         // leave two blocks behind.
-        let content = "preamble\n\n<!-- CMUX-START -->\nold cmux-era skill\n<!-- CMUX-END -->\n\ntail\n";
+        let content =
+            "preamble\n\n<!-- CMUX-START -->\nold cmux-era skill\n<!-- CMUX-END -->\n\ntail\n";
         let got = replace_marked_block(content, &MTYX_MARKERS, "new skill");
-        assert_eq!(
-            got,
-            "preamble\n\n\ntail\n<!-- MTYX-START -->\nnew skill\n<!-- MTYX-END -->\n"
-        );
+        assert_eq!(got, "preamble\n\n\ntail\n<!-- MTYX-START -->\nnew skill\n<!-- MTYX-END -->\n");
         assert!(!got.contains("CMUX-START"));
         assert!(!got.contains("old cmux-era skill"));
     }

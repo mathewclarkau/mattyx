@@ -214,11 +214,8 @@ impl FinderState {
             // of its agent session id (when present). The label still
             // drives display; the session is purely extra searchable text
             // so type-ahead covers agent session ids per AC2.
-            let score = fuzzy_score(query, &item.label).or_else(|| {
-                item.agent_session
-                    .as_deref()
-                    .and_then(|s| fuzzy_score(query, s))
-            });
+            let score = fuzzy_score(query, &item.label)
+                .or_else(|| item.agent_session.as_deref().and_then(|s| fuzzy_score(query, s)));
             if let Some(score) = score {
                 out.push((i, score));
             }
@@ -342,7 +339,11 @@ pub fn fuzzy_score(query: &str, hay: &str) -> Option<u32> {
             qi += 1;
         }
     }
-    if qi == query.len() { Some(score) } else { None }
+    if qi == query.len() {
+        Some(score)
+    } else {
+        None
+    }
 }
 
 /// The centered bordered-box rectangle the finder overlay occupies,
@@ -355,12 +356,7 @@ pub fn finder_rect(screen: Rect) -> Option<Rect> {
     if screen.width < width || screen.height < height {
         return None;
     }
-    Some(Rect {
-        x: (screen.width - width) / 2,
-        y: (screen.height - height) / 2,
-        width,
-        height,
-    })
+    Some(Rect { x: (screen.width - width) / 2, y: (screen.height - height) / 2, width, height })
 }
 
 /// Y offset of the first results row inside the overlay box. Kept
@@ -414,8 +410,10 @@ pub fn draw(app: &mut crate::app::App, frame: &mut Frame) {
     let border = base.fg(Color::Indexed(244));
     let title = base.fg(Color::Indexed(255)).add_modifier(Modifier::BOLD);
     let input_style = Style::default().bg(Color::Indexed(233)).fg(Color::Indexed(255));
-    let selected =
-        Style::default().bg(Color::Indexed(242)).fg(Color::Indexed(255)).add_modifier(Modifier::BOLD);
+    let selected = Style::default()
+        .bg(Color::Indexed(242))
+        .fg(Color::Indexed(255))
+        .add_modifier(Modifier::BOLD);
     let filter_label = format!("[{}: B W I D A]", finder.state_filter.label());
     let fw = filter_label.chars().count() as u16;
     let fx = x + width.saturating_sub(fw + 2);
@@ -551,10 +549,8 @@ mod tests {
 
     #[test]
     fn ranks_cb_builder_before_reviewer() {
-        let items = vec![
-            item("claude-builder", None, surf(1)),
-            item("claude-reviewer", None, surf(2)),
-        ];
+        let items =
+            vec![item("claude-builder", None, surf(1)), item("claude-reviewer", None, surf(2))];
         let mut finder = FinderState::new(items);
         finder.input = TextInput::new("cb".to_string());
         let ranked = finder.ranked();
@@ -615,18 +611,8 @@ mod tests {
         // Two surfaces whose labels share no letters with the session id;
         // only the agent session id can match the typed query.
         let items = vec![
-            item_with_session(
-                "shell",
-                Some(AgentState::Working),
-                surf(1),
-                "agent-7f3a-session",
-            ),
-            item_with_session(
-                "shell",
-                Some(AgentState::Idle),
-                surf(2),
-                "agent-7f3b-session",
-            ),
+            item_with_session("shell", Some(AgentState::Working), surf(1), "agent-7f3a-session"),
+            item_with_session("shell", Some(AgentState::Idle), surf(2), "agent-7f3b-session"),
         ];
         // A query fragment present only in the session id surfaces the
         // matching agent row.
@@ -700,9 +686,8 @@ mod tests {
 
         // Build a list strictly longer than the viewport.
         let total = rows_visible + 4;
-        let items: Vec<FinderItem> = (0..total as u64)
-            .map(|i| item(&format!("row-{i}"), None, surf(i)))
-            .collect();
+        let items: Vec<FinderItem> =
+            (0..total as u64).map(|i| item(&format!("row-{i}"), None, surf(i))).collect();
         let mut finder = FinderState::new(items);
 
         // Move the cursor down past the bottom of the first page. After
@@ -836,9 +821,8 @@ mod tests {
 
         // Build a list longer than the viewport and scroll toward the bottom.
         let total = rows_visible + 6;
-        let items: Vec<FinderItem> = (0..total as u64)
-            .map(|i| item(&format!("row-{i}"), None, surf(i)))
-            .collect();
+        let items: Vec<FinderItem> =
+            (0..total as u64).map(|i| item(&format!("row-{i}"), None, surf(i))).collect();
         let mut finder = FinderState::new(items);
         for _ in 0..(rows_visible + 2) {
             finder.move_cursor(1, rows_visible);
@@ -847,9 +831,8 @@ mod tests {
 
         // An agent-state-changed refresh shrinks the matching set well below
         // the current scroll offset.
-        let shrunk: Vec<FinderItem> = (0..3u64)
-            .map(|i| item(&format!("shrunk-{i}"), None, surf(i)))
-            .collect();
+        let shrunk: Vec<FinderItem> =
+            (0..3u64).map(|i| item(&format!("shrunk-{i}"), None, surf(i))).collect();
         finder.set_items(shrunk);
         let new_len = finder.ranked().len();
         let new_max = new_len.saturating_sub(1);
@@ -901,6 +884,9 @@ mod tests {
             finder.scroll
         );
         let visible_rows = (finder.scroll..new_len).take(rows_visible).count();
-        assert!(visible_rows >= 1, "viewport must be non-empty after narrowing, got {visible_rows}");
+        assert!(
+            visible_rows >= 1,
+            "viewport must be non-empty after narrowing, got {visible_rows}"
+        );
     }
 }

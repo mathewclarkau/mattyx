@@ -345,9 +345,8 @@ pub fn ghostty_config_paths() -> Vec<PathBuf> {
 pub fn chrome_user_data_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        let dir = home_dir().map(|home| {
-            home.join("Library").join("Application Support").join("mattyx")
-        });
+        let dir =
+            home_dir().map(|home| home.join("Library").join("Application Support").join("mattyx"));
         dir.map(honor_cmux_era_dir).map(|d| d.join("chrome-profile"))
     }
 
@@ -379,9 +378,7 @@ pub fn chrome_user_data_dir() -> Option<PathBuf> {
 /// holds no such component (nothing to fall back to).
 fn cmux_era_sibling(canonical: &Path) -> Option<PathBuf> {
     let components: Vec<_> = canonical.components().collect();
-    let idx = components
-        .iter()
-        .rposition(|c| c.as_os_str() == std::ffi::OsStr::new("mattyx"))?;
+    let idx = components.iter().rposition(|c| c.as_os_str() == std::ffi::OsStr::new("mattyx"))?;
     let mut out = PathBuf::new();
     for component in &components[..idx] {
         out.push(component.as_os_str());
@@ -551,10 +548,7 @@ mod tests {
     fn pick_runtime_socket_prefers_canonical_when_live() {
         let canonical = PathBuf::from("/run/user/1000/mtyx-1000/main.sock");
         let legacy = PathBuf::from("/run/user/1000/cmux-1000/main.sock");
-        assert_eq!(
-            pick_runtime_socket(canonical.clone(), legacy.clone(), true, true),
-            canonical
-        );
+        assert_eq!(pick_runtime_socket(canonical.clone(), legacy.clone(), true, true), canonical);
     }
 
     #[test]
@@ -563,10 +557,7 @@ mod tests {
         // still running. The client must talk to the old daemon.
         let canonical = PathBuf::from("/run/user/1000/mtyx-1000/main.sock");
         let legacy = PathBuf::from("/run/user/1000/cmux-1000/main.sock");
-        assert_eq!(
-            pick_runtime_socket(canonical.clone(), legacy.clone(), false, true),
-            legacy
-        );
+        assert_eq!(pick_runtime_socket(canonical.clone(), legacy.clone(), false, true), legacy);
     }
 
     #[test]
@@ -576,20 +567,14 @@ mod tests {
         // legacy location.
         let canonical = PathBuf::from("/run/user/1000/mtyx-1000/main.sock");
         let legacy = PathBuf::from("/run/user/1000/cmux-1000/main.sock");
-        assert_eq!(
-            pick_runtime_socket(canonical.clone(), legacy.clone(), false, false),
-            canonical
-        );
+        assert_eq!(pick_runtime_socket(canonical.clone(), legacy.clone(), false, false), canonical);
     }
 
     #[test]
     fn pick_runtime_socket_ignores_dead_legacy_when_canonical_live() {
         let canonical = PathBuf::from("/run/user/1000/mtyx-1000/main.sock");
         let legacy = PathBuf::from("/run/user/1000/cmux-1000/main.sock");
-        assert_eq!(
-            pick_runtime_socket(canonical.clone(), legacy.clone(), true, false),
-            canonical
-        );
+        assert_eq!(pick_runtime_socket(canonical.clone(), legacy.clone(), true, false), canonical);
     }
 
     #[test]
@@ -614,18 +599,12 @@ mod tests {
         std::fs::create_dir_all(base.join("cmux")).unwrap();
 
         // Canonical absent, legacy present -> honour the old dir.
-        assert_eq!(
-            honor_cmux_era_dir(base.join("mattyx")),
-            base.join("cmux")
-        );
+        assert_eq!(honor_cmux_era_dir(base.join("mattyx")), base.join("cmux"));
 
         // Canonical appears -> it wins from then on; the legacy dir is
         // left untouched (no deletion, no merge).
         std::fs::create_dir_all(base.join("mattyx")).unwrap();
-        assert_eq!(
-            honor_cmux_era_dir(base.join("mattyx")),
-            base.join("mattyx")
-        );
+        assert_eq!(honor_cmux_era_dir(base.join("mattyx")), base.join("mattyx"));
         assert!(base.join("cmux").is_dir());
     }
 
@@ -636,16 +615,10 @@ mod tests {
         let base = dir.join("xdg2");
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("cmux"), b"not a dir").unwrap();
-        assert_eq!(
-            honor_cmux_era_dir(base.join("mattyx")),
-            base.join("mattyx")
-        );
+        assert_eq!(honor_cmux_era_dir(base.join("mattyx")), base.join("mattyx"));
         // Neither exists: canonical (a fresh install has no legacy dir).
         let base2 = dir.join("xdg3");
         std::fs::create_dir_all(&base2).unwrap();
-        assert_eq!(
-            honor_cmux_era_dir(base2.join("mattyx")),
-            base2.join("mattyx")
-        );
+        assert_eq!(honor_cmux_era_dir(base2.join("mattyx")), base2.join("mattyx"));
     }
 }

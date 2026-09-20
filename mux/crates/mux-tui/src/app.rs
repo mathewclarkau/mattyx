@@ -766,10 +766,7 @@ pub fn run(
     }
     // If the session-manager overlay asked to switch sessions, drain its
     // pending reattach target before the App (and overlay state) drop.
-    let reattach = app
-        .session_manager
-        .as_mut()
-        .and_then(|state| state.take_reattach_target());
+    let reattach = app.session_manager.as_mut().and_then(|state| state.take_reattach_target());
     let _ = std::panic::take_hook();
     restore_terminal(Some(&stdout_lock))?;
     result?;
@@ -1567,11 +1564,8 @@ impl App {
         let own_socket = self.session.socket_path().unwrap_or_default();
         // Scope discovery to the same runtime dir as the running session
         // (honours a --socket override pointing outside the default dir).
-        let global = crate::cli::GlobalArgs {
-            session: None,
-            socket: Some(own_socket.clone()),
-            json: false,
-        };
+        let global =
+            crate::cli::GlobalArgs { session: None, socket: Some(own_socket.clone()), json: false };
         let mut sessions = crate::cli::discover_sessions(&global);
         // Newest-first, matching the pre-attach picker ordering.
         sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
@@ -1584,10 +1578,7 @@ impl App {
         // Land on the running session's row so the right column shows the
         // user's own workspaces immediately.
         let sessions = state.sessions.clone();
-        if let Some(idx) = crate::session_manager::current_index(
-            &sessions,
-            &state.own_socket,
-        ) {
+        if let Some(idx) = crate::session_manager::current_index(&sessions, &state.own_socket) {
             state.left_sel = idx;
         }
         self.session_manager = Some(state);
@@ -1681,11 +1672,8 @@ impl App {
         let Some(state) = self.session_manager.as_mut() else { return };
         let own = state.own_socket.clone();
         let seeded = state.workspaces.get(&own).cloned();
-        let global = crate::cli::GlobalArgs {
-            session: None,
-            socket: Some(own.clone()),
-            json: false,
-        };
+        let global =
+            crate::cli::GlobalArgs { session: None, socket: Some(own.clone()), json: false };
         let mut sessions = crate::cli::discover_sessions(&global);
         sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
         state.sessions = sessions;
@@ -1693,13 +1681,13 @@ impl App {
         if let Some(tree) = seeded {
             state.workspaces.insert(own, tree);
         } else if !self.tree.workspaces.is_empty() {
-            state.workspaces.insert(state.own_socket.clone(), WorkspaceColumn::Ready(self.tree.clone()));
+            state
+                .workspaces
+                .insert(state.own_socket.clone(), WorkspaceColumn::Ready(self.tree.clone()));
         }
         // Re-clamp the cursor to the current session if still present.
         let sessions = state.sessions.clone();
-        if let Some(idx) =
-            crate::session_manager::current_index(&sessions, &state.own_socket)
-        {
+        if let Some(idx) = crate::session_manager::current_index(&sessions, &state.own_socket) {
             state.left_sel = idx;
         } else {
             state.left_sel = 0;
@@ -1712,11 +1700,7 @@ impl App {
     /// `cli::kill_session_at` (the L1 path), then rebuilds the left column
     /// and clamps the cursor so a shrinking list doesn't drop focus.
     fn session_manager_kill(&mut self, index: usize) {
-        let target = self
-            .session_manager
-            .as_ref()
-            .and_then(|s| s.sessions.get(index))
-            .cloned();
+        let target = self.session_manager.as_ref().and_then(|s| s.sessions.get(index)).cloned();
         let Some(target) = target else { return };
         crate::cli::kill_session_at(&target.socket_path, target.pid);
         // Rebuild discovery in place (same scope as open/refresh).
@@ -1750,10 +1734,8 @@ impl App {
                 self.refresh_session_manager();
                 // Land on the renamed row (now listed under its new name).
                 if let Some(state) = self.session_manager.as_mut() {
-                    if let Some(idx) = state
-                        .sessions
-                        .iter()
-                        .position(|s| s.session == new_name && s.live)
+                    if let Some(idx) =
+                        state.sessions.iter().position(|s| s.session == new_name && s.live)
                     {
                         state.left_sel = idx;
                     }
@@ -1873,8 +1855,7 @@ impl App {
                 crate::ui::input::InputEvent::Cancel => {
                     // Esc clears an active state filter first; only a second
                     // Esc (filter already All) closes the finder (AC3).
-                    let close =
-                        finder.cancel() == crate::finder::FinderCancel::CloseFinder;
+                    let close = finder.cancel() == crate::finder::FinderCancel::CloseFinder;
                     if close {
                         self.finder = None;
                     }
@@ -1941,10 +1922,9 @@ impl App {
             return Ok(RenderAction::None);
         };
         let target = match self.finder.as_mut() {
-            Some(finder) => finder
-                .ranked()
-                .get(row)
-                .map(|(item_i, _)| finder.items[*item_i].target),
+            Some(finder) => {
+                finder.ranked().get(row).map(|(item_i, _)| finder.items[*item_i].target)
+            }
             None => None,
         };
         let Some(target) = target else { return Ok(RenderAction::None) };
@@ -3210,8 +3190,14 @@ impl App {
                 surface.write_bytes(&mouse_bytes);
             }
             None => {
-                if surface.with_terminal(|t| t.active_screen() == Screen::Alternate && !t.mouse_tracking()).unwrap_or(false) {
-                    let seq: &[u8] = if down { b"\x1b[B\x1b[B\x1b[B" } else { b"\x1b[A\x1b[A\x1b[A" };
+                if surface
+                    .with_terminal(|t| {
+                        t.active_screen() == Screen::Alternate && !t.mouse_tracking()
+                    })
+                    .unwrap_or(false)
+                {
+                    let seq: &[u8] =
+                        if down { b"\x1b[B\x1b[B\x1b[B" } else { b"\x1b[A\x1b[A\x1b[A" };
                     surface.write_bytes(seq);
                 }
             }

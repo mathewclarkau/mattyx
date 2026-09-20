@@ -472,7 +472,11 @@ impl Terminal {
                 }
             }
         }
-        if unwrap { self.plain_text_unwrapped() } else { self.plain_text() }
+        if unwrap {
+            self.plain_text_unwrapped()
+        } else {
+            self.plain_text()
+        }
     }
 
     /// VT-sequence replay of the terminal's current state: feeding the

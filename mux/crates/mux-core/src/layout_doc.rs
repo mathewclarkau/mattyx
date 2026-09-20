@@ -70,15 +70,8 @@ pub struct LayoutScreen {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum LayoutNode {
-    Leaf {
-        pane: usize,
-    },
-    Split {
-        dir: LayoutDir,
-        ratio: f32,
-        a: Box<LayoutNode>,
-        b: Box<LayoutNode>,
-    },
+    Leaf { pane: usize },
+    Split { dir: LayoutDir, ratio: f32, a: Box<LayoutNode>, b: Box<LayoutNode> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,8 +273,7 @@ pub fn capture_workspace(state: &State, ws_idx: usize) -> anyhow::Result<LayoutD
 fn capture_screen(state: &State, screen: &Screen) -> LayoutScreen {
     let mut pane_ids = Vec::new();
     screen.root.pane_ids(&mut pane_ids);
-    let index_of =
-        |id: crate::PaneId| pane_ids.iter().position(|&p| p == id).unwrap_or(usize::MAX);
+    let index_of = |id: crate::PaneId| pane_ids.iter().position(|&p| p == id).unwrap_or(usize::MAX);
 
     LayoutScreen {
         name: screen.name.clone(),
@@ -426,7 +418,9 @@ mod tests {
 
         // The strict JSON entry point applies the same gate.
         doc.schema_version = LAYOUT_SCHEMA_VERSION;
-        let json = serde_json::to_string(&doc).unwrap().replace("\"schema_version\":1", "\"schema_version\":7");
+        let json = serde_json::to_string(&doc)
+            .unwrap()
+            .replace("\"schema_version\":1", "\"schema_version\":7");
         let err = LayoutDocument::from_json_str(&json).unwrap_err().to_string();
         assert!(err.contains("schema_version"), "error was: {err}");
     }
@@ -546,13 +540,22 @@ mod tests {
             LayoutTab::Pty { command, env, cwd, .. } => {
                 assert_eq!(
                     command.as_deref(),
-                    Some(["/bin/sh".to_string(), "-c".to_string(), "sleep 30".to_string()].as_slice()),
+                    Some(
+                        ["/bin/sh".to_string(), "-c".to_string(), "sleep 30".to_string()]
+                            .as_slice()
+                    ),
                     "recorded argv should round-trip"
                 );
                 assert_eq!(env.get("FLEET_TIER").map(String::as_str), Some("A"));
                 assert_eq!(env.get("FLEET_WORKER").map(String::as_str), Some("9"));
-                assert!(!env.contains_key("MTYX_MUX_SOCKET"), "auto socket env must not be exported");
-                assert!(!env.contains_key("MTYX_SOCKET_PATH"), "auto socket env must not be exported");
+                assert!(
+                    !env.contains_key("MTYX_MUX_SOCKET"),
+                    "auto socket env must not be exported"
+                );
+                assert!(
+                    !env.contains_key("MTYX_SOCKET_PATH"),
+                    "auto socket env must not be exported"
+                );
                 assert_eq!(cwd.as_deref(), Some("/tmp"));
             }
             other => panic!("expected a pty tab, got {other:?}"),
@@ -583,12 +586,7 @@ mod tests {
     // -- fixtures ---------------------------------------------------------
 
     fn sample_tab() -> LayoutTab {
-        LayoutTab::Pty {
-            name: None,
-            cwd: None,
-            command: None,
-            env: BTreeMap::new(),
-        }
+        LayoutTab::Pty { name: None, cwd: None, command: None, env: BTreeMap::new() }
     }
 
     fn sample_doc() -> LayoutDocument {

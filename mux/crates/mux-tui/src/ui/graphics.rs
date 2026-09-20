@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
-use std::time::Duration;
 
 use mux_core::{Rect, SurfaceId};
 

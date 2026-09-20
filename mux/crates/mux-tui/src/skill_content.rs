@@ -114,6 +114,5 @@ they can kill it later). If any step failed (e.g. dev server didn't come up in t
 say so and what you'd try next — don't claim success you didn't verify.
 "#;
 
-pub const HOTFIX_RACE_SKILL: &str = include_str!(
-    "../../../../.agents/skills/mtyx-hotfix-race/SKILL.md"
-);
+pub const HOTFIX_RACE_SKILL: &str =
+    include_str!("../../../../.agents/skills/mtyx-hotfix-race/SKILL.md");

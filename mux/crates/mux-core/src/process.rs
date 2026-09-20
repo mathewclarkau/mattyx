@@ -364,10 +364,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn direct_children_finds_spawned_child() {
-        let mut child = Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().expect("spawn sleep");
         let pid = child.id();
         // Give the kernel a moment to publish the child in /proc.
         let deadline = Instant::now() + Duration::from_secs(2);

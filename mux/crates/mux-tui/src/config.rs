@@ -38,6 +38,9 @@
 //!   "scrollbar": {
 //!     "position": "column"
 //!   },
+//!   "headless": {
+//!     "vt_size": "100x30"
+//!   },
 //!   "keys": {
 //!     "prefix": "ctrl+b",
 //!     "alt_shortcuts": true,
@@ -54,6 +57,11 @@
 //! colors: explicit config value, then the user's Ghostty config
 //! (`selection-background`/`selection-foreground`), then the built-in
 //! default.
+//!
+//! `headless.vt_size` is the VT geometry (`"COLSxROWS"`, e.g.
+//! `"100x30"`) for surfaces spawned with no client attached and no
+//! explicit size (issue #99). The default is 120x40; the
+//! `MTYX_MUX_VT_SIZE` env var overrides the config file.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -101,6 +109,10 @@ struct RawConfig {
     browser: RawBrowser,
     #[serde(default)]
     scrollbar: RawScrollbar,
+    /// Headless spawn geometry (issue #99): `vt_size = "100x30"` for
+    /// surfaces created with no client attached.
+    #[serde(default)]
+    headless: RawHeadless,
     #[serde(default)]
     workspaces: Vec<WorkspaceConfig>,
     /// Issue #78 AC7: `[[agent_detection]]` — turn ambient agent detection
@@ -184,6 +196,14 @@ struct RawScrollbar {
     position: Option<ScrollbarPosition>,
 }
 
+/// Raw `[headless]` table (issue #99): `vt_size = "100x30"`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHeadless {
+    /// VT geometry for no-client spawns, `"COLSxROWS"`.
+    vt_size: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
@@ -215,6 +235,16 @@ impl Default for Scrollbar {
     fn default() -> Self {
         Scrollbar { position: ScrollbarPosition::Column }
     }
+}
+
+/// Headless spawn settings (issue #99).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Headless {
+    /// VT geometry `(cols, rows)` for surfaces spawned with no client
+    /// attached and no explicit size, parsed from `headless.vt_size`
+    /// (e.g. `"100x30"`). `None` keeps the mux-core default (120x40;
+    /// `MTYX_MUX_VT_SIZE` can still override it).
+    pub vt_size: Option<(u16, u16)>,
 }
 
 /// A color in the config file: "#rrggbb", "#rgb", or an xterm-256 index.
@@ -908,6 +938,7 @@ pub struct Config {
     pub sidebar: Sidebar,
     pub browser: Browser,
     pub scrollbar: Scrollbar,
+    pub headless: Headless,
     pub keys: Keys,
     pub workspaces: Vec<WorkspaceConfig>,
     pub agent_detection: AgentDetectionConfig,
@@ -1134,6 +1165,17 @@ pub fn load() -> Config {
     }
     if let Some(position) = raw.scrollbar.position {
         config.scrollbar.position = position;
+    }
+    // Issue #99: `headless.vt_size = "100x30"`; an unparseable value
+    // warns and is ignored (config degradation, matching the browser
+    // settings).
+    if let Some(raw_size) = &raw.headless.vt_size {
+        match mux_core::parse_vt_size(raw_size) {
+            Some(size) => config.headless.vt_size = Some(size),
+            None => eprintln!(
+                "mtyx: ignoring headless.vt_size={raw_size:?}; expected COLSxROWS, e.g. \"100x30\""
+            ),
+        }
     }
     config.keys.apply(&raw.keys);
     apply_worktree_pattern(&mut config, &raw.worktree_pattern);
@@ -1505,10 +1547,7 @@ min_confidence = "high"
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
         assert!(!config.agent_detection.enabled, "detection should resolve to disabled");
-        assert_eq!(
-            config.agent_detection.min_confidence,
-            mux_core::agent_detect::Confidence::High
-        );
+        assert_eq!(config.agent_detection.min_confidence, mux_core::agent_detect::Confidence::High);
     }
 
     /// Review fix F2: typos in `[[agent_detection]]` keys (e.g.
@@ -1520,9 +1559,8 @@ min_confidence = "high"
     #[test]
     fn agent_detection_rejects_unknown_keys() {
         // TOML: `enable` (missing `d`) and `min-confidences` (plural, hyphen).
-        let bad_toml: Result<RawConfig, _> = toml::from_str(
-            "[[agent_detection]]\nenable = false\nmin_confidences = \"high\"\n",
-        );
+        let bad_toml: Result<RawConfig, _> =
+            toml::from_str("[[agent_detection]]\nenable = false\nmin_confidences = \"high\"\n");
         assert!(bad_toml.is_err(), "unknown keys in [[agent_detection]] must be rejected");
 
         // JSON: `minConfidence` (camelCase) and `enable` (missing `d`).
@@ -1533,16 +1571,49 @@ min_confidence = "high"
 
         // Sanity: well-known keys still parse (this stays valid in both
         // directions; the negative case above is the lock-down).
-        let good_toml: RawConfig = toml::from_str(
-            "[[agent_detection]]\nenabled = false\nmin_confidence = \"high\"\n",
-        )
-        .unwrap();
+        let good_toml: RawConfig =
+            toml::from_str("[[agent_detection]]\nenabled = false\nmin_confidence = \"high\"\n")
+                .unwrap();
         assert_eq!(good_toml.agent_detection[0].enabled, Some(false));
         let good_json: RawConfig = serde_json::from_str(
             r##"{"agent_detection":[{"enabled":false,"min_confidence":"medium"}]}"##,
         )
         .unwrap();
         assert_eq!(good_json.agent_detection[0].enabled, Some(false));
+    }
+
+    /// Issue #99: `headless.vt_size` parses from TOML and JSON, resolves
+    /// through `load()`, and an unparseable value is ignored (with a
+    /// warning) rather than failing the config.
+    #[test]
+    fn headless_vt_size_loads_from_toml_and_json() {
+        let toml: RawConfig = toml::from_str("[headless]\nvt_size = \"100x30\"\n").unwrap();
+        assert_eq!(toml.headless.vt_size.as_deref(), Some("100x30"));
+
+        let json: RawConfig =
+            serde_json::from_str(r##"{"headless":{"vt_size":"100x30"}}"##).unwrap();
+        assert_eq!(json.headless.vt_size.as_deref(), Some("100x30"));
+
+        // Unknown keys in the table are rejected, like every other
+        // config table.
+        assert!(toml::from_str::<RawConfig>("[headless]\nbogus = true\n").is_err());
+
+        // Resolution through load(): a valid value reaches the resolved
+        // config; an unparseable one is dropped, keeping the default.
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("mux-headless-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mux.toml");
+        std::fs::write(&path, "[headless]\nvt_size = \"100x30\"\n").unwrap();
+        std::env::set_var("MTYX_MUX_CONFIG", &path);
+        let config = load();
+        assert_eq!(config.headless.vt_size, Some((100, 30)));
+        std::fs::write(&path, "[headless]\nvt_size = \"huge\"\n").unwrap();
+        let config = load();
+        assert_eq!(config.headless.vt_size, None, "unparseable vt_size must be ignored");
+        std::env::remove_var("MTYX_MUX_CONFIG");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

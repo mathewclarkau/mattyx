@@ -128,7 +128,8 @@ fn remote_workspace_survives_the_automatic_persist_and_restore_flow() {
     {
         let mux = Mux::new(session.clone(), SurfaceOptions::default());
         mux.enable_persistence();
-        let surface = mux.new_remote_workspace(spec, Some("auto-remote".to_string()), None).unwrap();
+        let surface =
+            mux.new_remote_workspace(spec, Some("auto-remote".to_string()), None).unwrap();
         surface.write_bytes(b"export MUX_MUX_AUTO_MARKER=auto-99\n").unwrap();
         wait_for(|| screen_text(&surface).contains('$').then_some(()), Duration::from_secs(10));
 

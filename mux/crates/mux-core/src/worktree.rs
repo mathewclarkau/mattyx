@@ -80,8 +80,7 @@ pub fn resolve_worktree_path(
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow::anyhow!("repository root {:?} has no name component", repo_root))?;
     let branch_component = sanitise_branch_component(branch)?;
-    let substituted =
-        pattern.replace("<repo>", repo_name).replace("<branch>", &branch_component);
+    let substituted = pattern.replace("<repo>", repo_name).replace("<branch>", &branch_component);
     let raw = PathBuf::from(substituted);
     let path = if raw.is_absolute() { raw } else { repo_root.join(raw) };
     let path = lexical_normalise(&path);
@@ -189,10 +188,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "mtyx-wt-{name}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -249,11 +245,7 @@ mod tests {
         let worktree = base.join("worktree");
         std::fs::create_dir_all(&admin).unwrap();
         std::fs::create_dir_all(worktree.join("src")).unwrap();
-        std::fs::write(
-            worktree.join(".git"),
-            format!("gitdir: {}\n", admin.display()),
-        )
-        .unwrap();
+        std::fs::write(worktree.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
         std::fs::write(admin.join("commondir"), "../..\n").unwrap();
 
         // From a nested dir inside the worktree, the repo root is the

@@ -160,15 +160,11 @@ fn try_write_with(tool: ClipboardWriteTool, text: &str) -> bool {
     // "Failed to connect to a Wayland server…" on stderr when
     // WAYLAND_DISPLAY is wrong/missing; that corrupts the alt-screen
     // frame and leaves the session unusable until restart (issue #61).
-    let mut child = match cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
+    let mut child =
+        match cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
     // Close stdin after writing so tools that read until EOF (wl-copy,
     // xclip) exit instead of hanging the TUI on child.wait().
     if let Some(mut stdin) = child.stdin.take() {
@@ -246,18 +242,12 @@ mod tests {
     fn pure_x11_session_skips_wl_copy() {
         // Linux Mint / Cinnamon default: DISPLAY set, WAYLAND_DISPLAY unset.
         // Spawning wl-copy here is what painted the error over the TUI in #61.
-        assert_eq!(
-            write_tools_for_env(false, true),
-            vec![ClipboardWriteTool::Xclip]
-        );
+        assert_eq!(write_tools_for_env(false, true), vec![ClipboardWriteTool::Xclip]);
     }
 
     #[test]
     fn pure_wayland_session_skips_xclip_first() {
-        assert_eq!(
-            write_tools_for_env(true, false),
-            vec![ClipboardWriteTool::WlCopy]
-        );
+        assert_eq!(write_tools_for_env(true, false), vec![ClipboardWriteTool::WlCopy]);
     }
 
     #[test]

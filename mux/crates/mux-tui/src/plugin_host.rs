@@ -159,7 +159,11 @@ impl HostState {
 
 /// Validate an inbound request shape (before dispatch). Pulled out so
 /// the tests can exercise it without a wasmtime engine.
-fn validate_request_shape(req: &PluginRequest, token_ctx: &TokenContext, expected_id: u64) -> Result<(), PluginError> {
+fn validate_request_shape(
+    req: &PluginRequest,
+    token_ctx: &TokenContext,
+    expected_id: u64,
+) -> Result<(), PluginError> {
     if req.id != expected_id {
         return Err(PluginError::StaleId { expected: expected_id, got: req.id });
     }
@@ -176,12 +180,31 @@ fn validate_request_shape(req: &PluginRequest, token_ctx: &TokenContext, expecte
 fn is_mutating_verb(verb: &str) -> bool {
     matches!(
         verb,
-        "set-default-colors" | "rename-workspace" | "rename-pane" | "rename-surface"
-            | "rename-screen" | "set-ratio" | "close-surface" | "close-pane"
-            | "close-screen" | "close-workspace" | "new-workspace" | "new-screen"
-            | "new-tab" | "split" | "send" | "browser-reload" | "select-tab"
-            | "select-screen" | "select-workspace" | "move-tab" | "move-workspace"
-            | "resize-surface" | "scroll-surface" | "focus-pane" | "report-agent"
+        "set-default-colors"
+            | "rename-workspace"
+            | "rename-pane"
+            | "rename-surface"
+            | "rename-screen"
+            | "set-ratio"
+            | "close-surface"
+            | "close-pane"
+            | "close-screen"
+            | "close-workspace"
+            | "new-workspace"
+            | "new-screen"
+            | "new-tab"
+            | "split"
+            | "send"
+            | "browser-reload"
+            | "select-tab"
+            | "select-screen"
+            | "select-workspace"
+            | "move-tab"
+            | "move-workspace"
+            | "resize-surface"
+            | "scroll-surface"
+            | "focus-pane"
+            | "report-agent"
             | "plugin"
     )
 }
@@ -226,9 +249,9 @@ pub fn build_wasi(
         for path_str in extra {
             let p = PathBuf::from(path_str);
             if p.exists() {
-                builder
-                    .preopened_dir(&p, ".", DirPerms::all(), FilePerms::all())
-                    .map_err(|e| format!("failed to preopen manifest filesystem path {p:?}: {e}"))?;
+                builder.preopened_dir(&p, ".", DirPerms::all(), FilePerms::all()).map_err(|e| {
+                    format!("failed to preopen manifest filesystem path {p:?}: {e}")
+                })?;
             }
         }
     }
@@ -258,19 +281,14 @@ pub fn validate_and_forward(
     let req: PluginRequest = serde_json::from_str(request_json)
         .map_err(|e| PluginError::InvalidRequest(e.to_string()))?;
     validate_request_shape(&req, token_ctx, expected_id)?;
-    let request_str = serde_json::to_string(&req)
-        .map_err(|e| PluginError::InvalidRequest(e.to_string()))?;
+    let request_str =
+        serde_json::to_string(&req).map_err(|e| PluginError::InvalidRequest(e.to_string()))?;
     let response_str = dispatcher
         .dispatch(request_str)
         .map_err(|e| PluginError::Trap(format!("dispatcher: {e}")))?;
-    let data: serde_json::Value = serde_json::from_str(&response_str)
-        .unwrap_or(serde_json::Value::String(response_str));
-    let resp = PluginResponse {
-        id: expected_id,
-        ok: true,
-        data: Some(data),
-        error: None,
-    };
+    let data: serde_json::Value =
+        serde_json::from_str(&response_str).unwrap_or(serde_json::Value::String(response_str));
+    let resp = PluginResponse { id: expected_id, ok: true, data: Some(data), error: None };
     serde_json::to_string(&resp).map_err(|e| PluginError::Trap(format!("serialize response: {e}")))
 }
 
@@ -286,18 +304,14 @@ pub fn define_host_imports(linker: &mut Linker<HostState>) -> Result<(), String>
     // the plugin reads via ptr+len and that we leak for the call's
     // duration.
     linker
-        .func_wrap(
-            "mtyx",
-            "token",
-            |mut caller: wasmtime::Caller<'_, HostState>| -> u64 {
-                let token = caller.data().token.as_str().to_string();
-                let bytes = token.into_bytes();
-                let ptr = bytes.as_ptr() as u32;
-                let len = bytes.len() as u32;
-                std::mem::forget(bytes);
-                ((ptr as u64) << 32) | (len as u64)
-            },
-        )
+        .func_wrap("mtyx", "token", |mut caller: wasmtime::Caller<'_, HostState>| -> u64 {
+            let token = caller.data().token.as_str().to_string();
+            let bytes = token.into_bytes();
+            let ptr = bytes.as_ptr() as u32;
+            let len = bytes.len() as u32;
+            std::mem::forget(bytes);
+            ((ptr as u64) << 32) | (len as u64)
+        })
         .map_err(|e| format!("failed to define cmux_token: {e}"))?;
 
     // cmux_log(level: i32, ptr: i32, len: i32) -> ()
@@ -325,10 +339,7 @@ pub fn define_host_imports(linker: &mut Linker<HostState>) -> Result<(), String>
                     2 => "error",
                     _ => "debug",
                 };
-                eprintln!(
-                    "[plugin:{}] {}: {}",
-                    caller.data().token_ctx.plugin_name, prefix, msg
-                );
+                eprintln!("[plugin:{}] {}: {}", caller.data().token_ctx.plugin_name, prefix, msg);
             },
         )
         .map_err(|e| format!("failed to define cmux_log: {e}"))?;
@@ -365,10 +376,12 @@ pub fn define_host_imports(linker: &mut Linker<HostState>) -> Result<(), String>
                         Some(wasmtime::Extern::Memory(m)) => m,
                         _ => return -1,
                     };
-                    let raw = match mem.data(&caller).get(req_ptr as usize..(req_ptr + req_len) as usize) {
-                        Some(d) => d.to_vec(),
-                        None => return -1,
-                    };
+                    let raw =
+                        match mem.data(&caller).get(req_ptr as usize..(req_ptr + req_len) as usize)
+                        {
+                            Some(d) => d.to_vec(),
+                            None => return -1,
+                        };
                     let s = match std::str::from_utf8(&raw) {
                         Ok(s) => s.to_string(),
                         Err(_) => return -1,
@@ -393,7 +406,10 @@ pub fn define_host_imports(linker: &mut Linker<HostState>) -> Result<(), String>
                             error: Some(e.to_string()),
                         };
                         serde_json::to_string(&resp).unwrap_or_else(|_| {
-                            format!(r#"{{"id":{},"ok":false,"error":"serialization"}}"#, expected_id)
+                            format!(
+                                r#"{{"id":{},"ok":false,"error":"serialization"}}"#,
+                                expected_id
+                            )
                         })
                     }
                 };
@@ -424,11 +440,14 @@ pub fn define_host_imports(linker: &mut Linker<HostState>) -> Result<(), String>
 }
 
 /// Build a Store with fuel + epoch deadline set per the manifest.
-pub fn build_store(engine: &Engine, state: HostState, fuel: u64, wall_clock_ms: u64) -> Store<HostState> {
+pub fn build_store(
+    engine: &Engine,
+    state: HostState,
+    fuel: u64,
+    wall_clock_ms: u64,
+) -> Store<HostState> {
     let mut store = Store::new(engine, state);
-    store
-        .set_fuel(fuel)
-        .expect("fuel should be consumable (consume_fuel=true)");
+    store.set_fuel(fuel).expect("fuel should be consumable (consume_fuel=true)");
     store.set_epoch_deadline(wall_clock_ms);
     store
 }
@@ -451,8 +470,8 @@ pub fn invoke(
         minted_at: Instant::now(),
     };
     let env_list: Vec<String> = cap.env.clone().unwrap_or_default();
-    let wasi = build_wasi(cap, plugin_data_dir, args, &env_list)
-        .map_err(PluginError::InvalidManifest)?;
+    let wasi =
+        build_wasi(cap, plugin_data_dir, args, &env_list).map_err(PluginError::InvalidManifest)?;
     let state = HostState::new(wasi, token, token_ctx, dispatcher);
     let fuel = cap.fuel.unwrap_or(1_000_000);
     let wall_clock_ms = cap.max_runtime_ms.unwrap_or(5_000);
@@ -471,7 +490,9 @@ pub fn invoke(
     let func_result = instance
         .get_typed_func::<(), ()>(&mut store, "_mtyx_plugin_main")
         .or_else(|_| instance.get_typed_func::<(), ()>(&mut store, "_start"))
-        .map_err(|e| PluginError::InstantiationFailed(format!("missing _mtyx_plugin_main or _start: {e}")))
+        .map_err(|e| {
+            PluginError::InstantiationFailed(format!("missing _mtyx_plugin_main or _start: {e}"))
+        })
         .and_then(|f| {
             f.call(&mut store, ()).map_err(|e| {
                 // In wasmtime 27, `func.call` returns `anyhow::Result`.
@@ -514,18 +535,14 @@ impl CmuxDispatcher for SocketDispatcher {
         let stream = mux_core::platform::transport::connect(&self.socket_path)
             .map_err(|e| format!("connect to {}: {e}", self.socket_path.display()))?;
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(20)));
-        let mut writer = stream
-            .try_clone_box()
-            .map_err(|e| format!("clone stream: {e}"))?;
+        let mut writer = stream.try_clone_box().map_err(|e| format!("clone stream: {e}"))?;
         writer
             .write_all(request_json.as_bytes())
             .and_then(|_| writer.write_all(b"\n"))
             .map_err(|e| format!("write request: {e}"))?;
         let mut reader = BufReader::new(stream);
         let mut response_line = String::new();
-        reader
-            .read_line(&mut response_line)
-            .map_err(|e| format!("read response: {e}"))?;
+        reader.read_line(&mut response_line).map_err(|e| format!("read response: {e}"))?;
         Ok(response_line)
     }
 }
@@ -625,7 +642,8 @@ mod tests {
             42,
             &token_ctx,
             dispatcher,
-        ).unwrap();
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(parsed["ok"], serde_json::Value::Bool(true));
         assert_eq!(parsed["id"], 42);
@@ -645,7 +663,8 @@ mod tests {
             42,
             &token_ctx,
             dispatcher,
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert!(matches!(err, PluginError::VerbNotAllowed(_)));
     }
 
@@ -663,7 +682,8 @@ mod tests {
             42,
             &token_ctx,
             dispatcher,
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert!(matches!(err, PluginError::WriteBlocked(_)));
     }
 
@@ -681,7 +701,8 @@ mod tests {
             42,
             &token_ctx,
             dispatcher,
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert!(matches!(err, PluginError::StaleId { expected: 42, got: 99 }));
     }
 
@@ -703,7 +724,8 @@ verbs = ["foo"]
     fn parse_manifest_accepts_full_capabilities() {
         // Nest [capabilities] under [plugin] so toml's per-table model
         // matches serde's per-struct model.
-        let m = plugin::parse_manifest(r#"[plugin]
+        let m = plugin::parse_manifest(
+            r#"[plugin]
 name = "pifactory-fleet"
 entry = "bin/fleet.wasm"
 verbs = ["deploy"]
@@ -716,7 +738,8 @@ network = "off"
 memory_mib = 128
 fuel = 5000000
 max_runtime_ms = 10000
-"#)
+"#,
+        )
         .unwrap_or_else(|e| panic!("parse failed: {e}"));
         assert_eq!(m.capabilities.as_ref().unwrap().socket.as_deref(), Some("write"));
         assert_eq!(m.capabilities.as_ref().unwrap().memory_mib, Some(128));

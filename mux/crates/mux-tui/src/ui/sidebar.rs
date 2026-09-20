@@ -167,7 +167,10 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
                 truncate(title, content_w.saturating_sub(13 + prefix_w + badge_w))
             )
         } else {
-            format!(" {prefix}{}{badge}", truncate(title, content_w.saturating_sub(3 + prefix_w + badge_w)))
+            format!(
+                " {prefix}{}{badge}",
+                truncate(title, content_w.saturating_sub(3 + prefix_w + badge_w))
+            )
         };
         let sub_style = if active { active_style.add_modifier(Modifier::DIM) } else { dim };
         let agent_state = pane.and_then(|p| p.active_agent_state());

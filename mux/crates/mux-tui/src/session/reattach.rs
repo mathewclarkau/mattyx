@@ -126,11 +126,7 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(out.is_err(), "always-Err must return Err");
         assert_eq!(count.load(Ordering::SeqCst), 2, "retries=1 => 2 total attempts");
-        assert!(
-            elapsed >= backoff,
-            "sleep must fire once between attempts, took {:?}",
-            elapsed
-        );
+        assert!(elapsed >= backoff, "sleep must fire once between attempts, took {:?}", elapsed);
     }
 
     /// T3: an op that fails then succeeds on the second call returns Ok
@@ -170,11 +166,7 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(out.is_err());
         assert_eq!(count.load(Ordering::SeqCst), 1, "no retries => one call");
-        assert!(
-            elapsed < Duration::from_millis(50),
-            "no sleep when retries=0, took {:?}",
-            elapsed
-        );
+        assert!(elapsed < Duration::from_millis(50), "no sleep when retries=0, took {:?}", elapsed);
     }
 
     // --- `plan_swap_recovery`: pure decision -----------------------------
@@ -261,21 +253,15 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(result.is_err(), "missing path must error");
-        assert!(
-            elapsed < Duration::from_millis(50),
-            "retries=0 => no sleep, took {:?}",
-            elapsed
-        );
+        assert!(elapsed < Duration::from_millis(50), "retries=0 => no sleep, took {:?}", elapsed);
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     /// Minimal temp dir helper (mirrors tests/cli.rs::unique_temp_dir).
     fn unique_temp_dir(name: &str) -> PathBuf {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let stamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         PathBuf::from("/tmp").join(format!("mtyx-reattach-{name}-{}-{stamp}", std::process::id()))
     }
 }
