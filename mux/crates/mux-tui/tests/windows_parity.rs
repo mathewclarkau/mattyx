@@ -274,6 +274,44 @@ fn pane_create_send_and_read_screen() {
     assert!(screen.contains(marker), "marker must appear on screen, got: {}", screen);
 }
 
+/// Issue #105 AC2: `wait-ready` on Windows must report `ready:true` with
+/// a non-null `child`. Windows already enumerated the PTY tree via
+/// `win::descendant_processes` (Toolhelp32), but `prompt_seen` stayed
+/// false because cmd/powershell/pwsh prompts end in `>` — not in the
+/// `$`/`#`/`%` set the prompt fallback accepted. The fallback now also
+/// accepts a trailing `>`, so both halves are truthful on Windows. This
+/// runs on the windows-latest CI leg via the existing "Windows parity
+/// tests" step (this file is `#![cfg(windows)]` and CI runs it with
+/// `--test-threads=1`).
+#[test]
+fn wait_ready_reports_ready_with_child() {
+    let server = HeadlessServer::start("wait-ready");
+    let created = server.cli("new-workspace", &["new-workspace", "--name", "ready"]);
+    assert_success("new-workspace", &created);
+    let surface = String::from_utf8_lossy(&created.stdout).trim().to_string();
+    assert!(!surface.is_empty(), "new-workspace: stdout is not a surface id: {:?}", created.stdout);
+    stage(&format!("wait-ready: surface {}", surface));
+
+    // Cold ConPTY shell startup on a CI runner is slow; the existing
+    // parity tests allow 30s for shell startup, so match that here.
+    let ready = server
+        .cli("wait-ready", &["--json", "wait-ready", "--surface", &surface, "--timeout", "30000"]);
+    assert_success("wait-ready", &ready);
+    let value: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap_or_else(|e| {
+        panic!(
+            "wait-ready: --json output not valid JSON ({}): {}",
+            e,
+            String::from_utf8_lossy(&ready.stdout)
+        )
+    });
+    assert_eq!(value["ready"].as_bool(), Some(true), "payload: {value}");
+    assert_eq!(value["prompt_seen"].as_bool(), Some(true), "payload: {value}");
+    assert!(value["child"]["pid"].as_u64().unwrap_or(0) > 0, "payload: {value}");
+    // comm is the image name lowercased without `.exe` (pwsh/powershell/cmd);
+    // assert non-empty rather than a specific value to stay runner-agnostic.
+    assert!(!value["child"]["comm"].as_str().unwrap_or("").is_empty(), "payload: {value}");
+}
+
 #[test]
 fn claude_hook_installer_round_trip() {
     // One agent-hook installer round-trip: `claude install-hooks`

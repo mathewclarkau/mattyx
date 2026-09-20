@@ -130,6 +130,15 @@ impl SurfaceReadiness {
 /// token instead, which survives the trim. Deliberately conservative:
 /// only well-known prompt terminators count, so ordinary output (e.g. a
 /// line ending in `"3"`) is not mistaken for a prompt.
+///
+/// A trailing `>` is also accepted: it is the prompt terminator for
+/// cmd.exe, PowerShell and pwsh (`PS C:\>`, `cmd> `), and bash's PS2
+/// continuation prompt. Applied unconditionally (not cfg-gated) so a
+/// Windows-pane screen read on any host and a bash continuation both
+/// resolve to `prompt_seen`. Trade-off: a command whose last output
+/// line happens to end in `>` (e.g. `echo a->b`) reads as a prompt.
+/// Accepted, same conservative single-line rule as today — the only
+/// fully-robust fix would be a PTY-level prompt marker, out of scope here.
 fn screen_shows_shell_prompt(text: &str) -> bool {
     let Some(last) = text.lines().rev().find(|line| !line.trim().is_empty()) else {
         return false;
@@ -142,9 +151,11 @@ fn screen_shows_shell_prompt(text: &str) -> bool {
     if line.ends_with('❯') || line.ends_with('λ') {
         return true;
     }
-    // Agent REPL prompts: `pi> `, `codex>`. These also lose their
-    // trailing space to the trim, so match the token without it.
-    line.ends_with("pi>") || line.ends_with("codex>")
+    // A trailing `>` covers agent REPL prompts (`pi> `, `codex>`, which
+    // lose their trailing space to the trim), cmd/powershell/pwsh prompts
+    // (`PS C:\>`, `cmd> `), and bash's PS2 continuation `> `. All resolve
+    // to `prompt_seen` after the trim drops the trailing space.
+    line.ends_with('>')
 }
 
 /// The multiplexer. Shared by frontends and the control socket server.
@@ -3019,6 +3030,12 @@ mod tests {
         assert!(screen_shows_shell_prompt("pi>"));
         assert!(screen_shows_shell_prompt("codex>"));
         assert!(screen_shows_shell_prompt("❯"));
+        // Issue #105: cmd/powershell/pwsh prompts end in `>` (and bash's
+        // PS2 continuation is a bare `>`). After the plain-text trim
+        // drops the trailing space, the last char is `>`.
+        assert!(screen_shows_shell_prompt("PS C:\\Users\\me>"));
+        assert!(screen_shows_shell_prompt("cmd>"));
+        assert!(screen_shows_shell_prompt(">"));
         // Trailing blank rows are skipped to find the prompt line.
         assert!(screen_shows_shell_prompt("out$\n\n  \n"));
         // Ordinary output must not read as a prompt.

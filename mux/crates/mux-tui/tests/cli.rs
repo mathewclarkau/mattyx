@@ -5263,19 +5263,16 @@ fn wait_ready_json_reports_ready_with_child() {
     assert!(value["elapsed_ms"].is_u64());
 }
 
-/// Non-Linux counterpart to the test above: with no `/proc` there is no
-/// process-tree child to observe, so `ready` stays false (exit 1) while
-/// `prompt_seen` still reports the screen half — a caller can tell "shell
-/// up, exit gate not satisfiable here" from "nothing yet".
-///
-/// This pins the *existing* degraded behaviour so it cannot change
-/// silently; making `wait-ready` usably ready on macOS/Windows needs a
-/// per-platform child enumeration (sysctl/`KERN_PROC` on macOS, job
-/// objects on Windows) and is tracked in #105.
+/// macOS counterpart to the Linux test above (issue #105): with
+/// `proc_listchildpids` + `proc_pidinfo` now enumerating the PTY
+/// child tree, `wait-ready` observes a real child on macOS too, so
+/// `ready` is true with a non-null `child`. Pins the macOS evidence
+/// source so a regression to the old "empty on non-Linux" fallback is
+/// caught here rather than only at runtime.
 #[test]
-#[cfg(not(target_os = "linux"))]
-fn wait_ready_without_process_enumeration_reports_prompt_seen_only() {
-    let server = HeadlessServer::start("wait-ready-noproc");
+#[cfg(target_os = "macos")]
+fn wait_ready_macos_reports_ready_with_child() {
+    let server = HeadlessServer::start("wait-ready-macos");
     let workspace = cli(&server, &["new-workspace", "--name", "ready"]);
     assert_success(&workspace);
     let surface = String::from_utf8(workspace.stdout).unwrap().trim().parse::<u64>().unwrap();
@@ -5284,17 +5281,14 @@ fn wait_ready_without_process_enumeration_reports_prompt_seen_only() {
         &server,
         &["--json", "wait-ready", "--surface", &surface.to_string(), "--timeout", "5000"],
     );
-    assert_eq!(
-        ready.status.code(),
-        Some(1),
-        "no child can be observed without /proc, so ready must stay false:\n{}",
-        String::from_utf8_lossy(&ready.stdout)
-    );
+    assert_success(&ready);
     let value: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
-    assert_eq!(value["ready"].as_bool(), Some(false), "payload: {value}");
-    assert_eq!(value["prompt_seen"].as_bool(), Some(true), "payload: {value}");
-    assert!(value["child"].is_null(), "payload: {value}");
+    assert_eq!(value["ready"].as_bool(), Some(true), "payload: {value}");
     assert_eq!(value["surface"].as_u64(), Some(surface));
+    assert_eq!(value["prompt_seen"].as_bool(), Some(true), "payload: {value}");
+    assert!(value["child"]["pid"].as_u64().unwrap_or(0) > 0, "payload: {value}");
+    assert!(!value["child"]["comm"].as_str().unwrap_or("").is_empty(), "payload: {value}");
+    assert!(value["elapsed_ms"].is_u64());
 }
 
 /// AC2 end to end: a surface that cannot become ready (here: one already
