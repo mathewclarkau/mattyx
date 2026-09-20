@@ -5160,7 +5160,14 @@ fn read_screen_pipe_close_exits_quietly_without_panic() {
 /// AC3: kill-session matches the session name EXACTLY (case-sensitive):
 /// only "mux" exists (the fixture's socket is mux.sock), so "MUX" must
 /// fail with not-found and leave the session alive to prove it.
+///
+/// Not run on macOS: the default APFS volume is case-INsensitive, so the
+/// fixture's `mux.sock` and the lookup for `MUX.sock` are the same
+/// directory entry. The premise (two names differing only in case are
+/// distinct paths) does not hold there, and no CLI-level change can make
+/// it hold. Linux/Windows CI keep the exact-match contract pinned.
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn kill_session_matches_name_case_sensitively() {
     let server = HeadlessServer::start("kill-case");
 
@@ -5227,7 +5234,13 @@ fn json_errors_return_structured_envelope() {
 /// AC1 end to end through the real binary: a freshly spawned shell pane
 /// becomes `ready:true` with spawn metadata (`child.pid`/`child.comm` and
 /// `prompt_seen`) and exits 0.
+///
+/// Linux-only: `ready` requires an observed process-tree child, and child
+/// enumeration is `/proc`-based (`mux_core::process::direct_children`
+/// documents "empty on non-Linux"). Its non-Linux counterpart below pins
+/// what the verb does there instead.
 #[test]
+#[cfg(target_os = "linux")]
 fn wait_ready_json_reports_ready_with_child() {
     let server = HeadlessServer::start("wait-ready");
     let workspace = cli(&server, &["new-workspace", "--name", "ready"]);
@@ -5248,6 +5261,40 @@ fn wait_ready_json_reports_ready_with_child() {
     assert!(value["child"]["pid"].as_u64().unwrap_or(0) > 0, "payload: {value}");
     assert!(!value["child"]["comm"].as_str().unwrap_or("").is_empty(), "payload: {value}");
     assert!(value["elapsed_ms"].is_u64());
+}
+
+/// Non-Linux counterpart to the test above: with no `/proc` there is no
+/// process-tree child to observe, so `ready` stays false (exit 1) while
+/// `prompt_seen` still reports the screen half — a caller can tell "shell
+/// up, exit gate not satisfiable here" from "nothing yet".
+///
+/// This pins the *existing* degraded behaviour so it cannot change
+/// silently; making `wait-ready` usably ready on macOS/Windows needs a
+/// per-platform child enumeration (sysctl/`KERN_PROC` on macOS, job
+/// objects on Windows) and is tracked in #105.
+#[test]
+#[cfg(not(target_os = "linux"))]
+fn wait_ready_without_process_enumeration_reports_prompt_seen_only() {
+    let server = HeadlessServer::start("wait-ready-noproc");
+    let workspace = cli(&server, &["new-workspace", "--name", "ready"]);
+    assert_success(&workspace);
+    let surface = String::from_utf8(workspace.stdout).unwrap().trim().parse::<u64>().unwrap();
+
+    let ready = cli(
+        &server,
+        &["--json", "wait-ready", "--surface", &surface.to_string(), "--timeout", "5000"],
+    );
+    assert_eq!(
+        ready.status.code(),
+        Some(1),
+        "no child can be observed without /proc, so ready must stay false:\n{}",
+        String::from_utf8_lossy(&ready.stdout)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+    assert_eq!(value["ready"].as_bool(), Some(false), "payload: {value}");
+    assert_eq!(value["prompt_seen"].as_bool(), Some(true), "payload: {value}");
+    assert!(value["child"].is_null(), "payload: {value}");
+    assert_eq!(value["surface"].as_u64(), Some(surface));
 }
 
 /// AC2 end to end: a surface that cannot become ready (here: one already
