@@ -122,7 +122,18 @@ fn install_signal_handlers() {
     unsafe {
         libc::signal(libc::SIGTERM, handle_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, handle_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGHUP, handle_signal as *const () as libc::sighandler_t);
+        // A detached session daemon (issue #107) must survive the
+        // terminal closing. setsid keeps it out of the client's
+        // session; ignoring SIGHUP covers a hangup that still arrives
+        // (the pre-exec ignore is replaced by this call after exec).
+        // Foreground `--headless` still shuts down on SIGHUP.
+        let detached = std::env::var_os("MTYX_DETACHED").is_some()
+            && std::env::args().any(|arg| arg == "--headless");
+        if detached {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        } else {
+            libc::signal(libc::SIGHUP, handle_signal as *const () as libc::sighandler_t);
+        }
     }
 }
 
@@ -571,6 +582,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Args {
 fn main() {
     honor_legacy_env();
     install_signal_handlers();
+    // Consumed by install_signal_handlers. Don't leak it into PTY
+    // children: a nested `mtyx --headless` should still die on SIGHUP.
+    std::env::remove_var("MTYX_DETACHED");
     let mut raw_args = std::env::args().skip(1).collect::<Vec<_>>();
     if raw_args.first().map(|arg| arg.as_str()) == Some("help") {
         print!("{USAGE}");

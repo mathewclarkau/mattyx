@@ -9,7 +9,8 @@
 //! TUI: by the time the mux is running the process is multithreaded
 //! (PTY readers, accept thread), and fork-without-exec is unsafe.
 
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -48,15 +49,44 @@ pub(crate) fn ensure_session_daemon(
     if mux_core::server::is_session_socket_live(socket) {
         return Ok(());
     }
-    let mut child = spawn_detached_headless(exe, session, socket, term)?;
+    let (mut child, log_path) = spawn_detached_headless(exe, session, socket, term)?;
     match wait_until_ready(socket, &mut child, READY_TIMEOUT) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // The daemon keeps its own fd on this file. Unlink the
+            // directory entry so a good start leaves no log behind.
+            let _ = std::fs::remove_file(&log_path);
+            // Reap when the daemon eventually exits. Dropping `Child`
+            // without waiting would zombie it for the life of the TUI.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Ok(())
+        }
         Err(err) => {
             let _ = child.kill();
             let _ = child.wait();
-            Err(err)
+            let log = read_log_tail(&log_path);
+            let _ = std::fs::remove_file(&log_path);
+            if log.is_empty() {
+                Err(err)
+            } else {
+                Err(err.context(log))
+            }
         }
     }
+}
+
+fn daemon_log_path(socket: &Path) -> PathBuf {
+    let name = socket.file_name().and_then(|s| s.to_str()).unwrap_or("session");
+    std::env::temp_dir().join(format!("mtyx-daemon-{}-{name}.log", std::process::id()))
+}
+
+fn read_log_tail(path: &Path) -> String {
+    let Ok(bytes) = std::fs::read(path) else {
+        return String::new();
+    };
+    let start = bytes.len().saturating_sub(4096);
+    String::from_utf8_lossy(&bytes[start..]).trim().to_string()
 }
 
 fn spawn_detached_headless(
@@ -64,16 +94,30 @@ fn spawn_detached_headless(
     session: &str,
     socket: &Path,
     term: Option<&str>,
-) -> anyhow::Result<Child> {
+) -> anyhow::Result<(Child, PathBuf)> {
+    let log_path = daemon_log_path(socket);
+    let mut opts = OpenOptions::new();
+    opts.create(true).read(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let log = opts.open(&log_path).map_err(|err| {
+        anyhow::anyhow!("opening daemon log {}: {err}", log_path.display())
+    })?;
+    let log_out = log.try_clone().map_err(|err| anyhow::anyhow!("cloning daemon log: {err}"))?;
     let mut cmd = Command::new(exe);
     cmd.args(headless_argv(session, socket, term))
+        .env("MTYX_DETACHED", "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::from(log_out))
+        .stderr(Stdio::from(log));
     detach_stdio_session(&mut cmd);
-    cmd.spawn().map_err(|err| {
+    let child = cmd.spawn().map_err(|err| {
         anyhow::anyhow!("spawning session daemon ({} --headless): {err}", exe.display())
-    })
+    })?;
+    Ok((child, log_path))
 }
 
 /// Put the child in its own session so closing the TUI's terminal does
@@ -86,6 +130,11 @@ fn detach_stdio_session(cmd: &mut Command) {
         // fork and exec, so only async-signal-safe calls are allowed.
         unsafe {
             cmd.pre_exec(|| {
+                // Persist across exec: main() installs handlers after
+                // startup, and a SIGHUP in that window would kill the
+                // daemon under the default disposition. main() keeps
+                // the ignore when MTYX_DETACHED is set.
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
                 if libc::setsid() < 0 {
                     return Err(std::io::Error::last_os_error());
                 }

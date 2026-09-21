@@ -5,7 +5,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::symlink;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
@@ -2842,17 +2842,34 @@ fn local_start_leaves_daemon_after_client_exits() {
     fs::create_dir_all(&dir).unwrap();
     let name = "detach107";
     let socket = dir.join(format!("{name}.sock"));
-    let mut client = Command::new(bin())
+    // Own session, no controlling terminal. Otherwise crossterm opens
+    // /dev/tty, enables raw mode on the caller's terminal, and the
+    // SIGKILL below never restores it.
+    let mut client = Command::new(bin());
+    client
         .args(["--session", name, "--socket"])
         .arg(&socket)
         .env("XDG_STATE_HOME", &dir)
         .env("XDG_RUNTIME_DIR", &dir)
         .env("SHELL", "/bin/sh")
+        .env_remove("MTYX_MUX_SOCKET")
+        .env_remove("CMUX_MUX_SOCKET")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    unsafe {
+        client.pre_exec(|| {
+            extern "C" {
+                fn setsid() -> i32;
+            }
+            if setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut client = client.spawn().unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut ready = false;
@@ -2875,8 +2892,9 @@ fn local_start_leaves_daemon_after_client_exits() {
         panic!("daemon did not become live at {}", socket.display());
     }
 
-    // Tear down only the TUI client. SIGKILL skips raw-mode teardown; the
-    // daemon is a setsid child and must survive.
+    // The client has no controlling terminal, so it fails out of the TUI
+    // on its own once the daemon is up. SIGKILL is the backstop if it is
+    // still sitting there. The daemon is a setsid grandchild and must survive.
     let _ = client.kill();
     let _ = client.wait();
 
