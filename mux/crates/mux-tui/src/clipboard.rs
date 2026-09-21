@@ -1,8 +1,10 @@
 //! System clipboard helpers for the TUI.
 //!
-//! mtyx only *writes* the host clipboard via OSC 52. Reads shell out to
-//! `wl-paste` (Wayland) or `xclip` (X11) so we can paste into browser panes
-//! and inject clipboard images into PTY panes (issue #30 — Claude Code's
+//! mtyx writes the host clipboard via OSC 52 and falls back to system tools
+//! (`pbcopy` on macOS, `wl-copy`/`xclip` on Linux) for terminals lacking OSC 52
+//! support (such as default macOS Terminal.app). Reads shell out to `pbpaste`
+//! (macOS), `wl-paste` (Wayland), or `xclip` (X11) so we can paste into browser
+//! panes and inject clipboard images into PTY panes (issue #30 — Claude Code's
 //! own clipboard read often fails inside nested terminal multiplexers).
 //!
 //! Clipboard child processes must never inherit the TUI's stdout/stderr
@@ -18,6 +20,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Read text from the desktop clipboard. Returns `None` if no tool is
 /// available or the clipboard is empty/unreadable.
 pub fn read_text() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let bytes = run_capture(&["pbpaste"])?;
+    #[cfg(not(target_os = "macos"))]
     let bytes = read_clipboard_bytes(
         &["wl-paste", "--no-newline"],
         &["xclip", "-selection", "clipboard", "-o"],
@@ -26,15 +31,16 @@ pub fn read_text() -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Write text to the desktop clipboard via a system tool (`wl-copy` for
-/// Wayland, `xclip` for X11). Returns true if a tool succeeded.
+/// Write text to the desktop clipboard via a system tool (`pbcopy` for
+/// macOS, `wl-copy` for Wayland, `xclip` for X11). Returns true if a tool succeeded.
 ///
 /// This is a fallback for when OSC 52 (the terminal-protocol clipboard
 /// write) doesn't reach the host terminal — e.g. when mtyx is nested
-/// inside another terminal multiplexer, run over SSH, or the host
-/// terminal has `clipboard-write = deny`. OSC 52 is still tried first
-/// by the caller (it works over SSH when the host allows it); this
-/// function is the local-system safety net.
+/// inside another terminal multiplexer, run over SSH, run in macOS
+/// Terminal.app (which ignores OSC 52), or the host terminal has
+/// `clipboard-write = deny`. OSC 52 is still tried first by the caller
+/// (it works over SSH when the host allows it); this function is the
+/// local-system safety net.
 ///
 /// Child stdout/stderr are discarded so a failing tool cannot paint over
 /// the TUI (issue #61). Tools that are clearly wrong for the session
@@ -50,25 +56,37 @@ pub fn write_text(text: &str) -> bool {
 
 /// Read a PNG image from the desktop clipboard, if one is present.
 pub fn read_image_png() -> Option<Vec<u8>> {
-    // Prefer explicit image MIME types so we don't pull text as "image".
-    if let Some(bytes) = read_clipboard_bytes(
-        &["wl-paste", "--type", "image/png"],
-        &["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
-    ) {
-        if looks_like_png(&bytes) {
-            return Some(bytes);
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(bytes) = run_capture(&["pngpaste", "-"]) {
+            if looks_like_png(&bytes) {
+                return Some(bytes);
+            }
         }
+        None
     }
-    // Some compositors only expose image/jpeg or omit type filters.
-    if let Some(bytes) = read_clipboard_bytes(
-        &["wl-paste", "--type", "image/jpeg"],
-        &["xclip", "-selection", "clipboard", "-t", "image/jpeg", "-o"],
-    ) {
-        if !bytes.is_empty() {
-            return Some(bytes);
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Prefer explicit image MIME types so we don't pull text as "image".
+        if let Some(bytes) = read_clipboard_bytes(
+            &["wl-paste", "--type", "image/png"],
+            &["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
+        ) {
+            if looks_like_png(&bytes) {
+                return Some(bytes);
+            }
         }
+        // Some compositors only expose image/jpeg or omit type filters.
+        if let Some(bytes) = read_clipboard_bytes(
+            &["wl-paste", "--type", "image/jpeg"],
+            &["xclip", "-selection", "clipboard", "-t", "image/jpeg", "-o"],
+        ) {
+            if !bytes.is_empty() {
+                return Some(bytes);
+            }
+        }
+        None
     }
-    None
 }
 
 /// Write `png` bytes to a unique temp file under the runtime dir and return
@@ -115,9 +133,17 @@ fn looks_like_png(bytes: &[u8]) -> bool {
 ///
 /// Preference is driven by display env vars so we do not spawn a Wayland
 /// tool on a pure X11 session (Linux Mint/Cinnamon, many Ubuntu installs)
-/// and dump its connection error into the TUI.
+/// and dump its connection error into the TUI. On macOS, pbcopy is the
+/// native tool.
 fn write_tools_for_session() -> Vec<ClipboardWriteTool> {
-    write_tools_for_env(env_is_set("WAYLAND_DISPLAY"), env_is_set("DISPLAY"))
+    #[cfg(target_os = "macos")]
+    {
+        vec![ClipboardWriteTool::Pbcopy]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        write_tools_for_env(env_is_set("WAYLAND_DISPLAY"), env_is_set("DISPLAY"))
+    }
 }
 
 fn write_tools_for_env(wayland: bool, x11: bool) -> Vec<ClipboardWriteTool> {
@@ -145,6 +171,8 @@ fn write_tools_for_env(wayland: bool, x11: bool) -> Vec<ClipboardWriteTool> {
 enum ClipboardWriteTool {
     WlCopy,
     Xclip,
+    #[allow(dead_code)]
+    Pbcopy,
 }
 
 fn try_write_with(tool: ClipboardWriteTool, text: &str) -> bool {
@@ -155,6 +183,7 @@ fn try_write_with(tool: ClipboardWriteTool, text: &str) -> bool {
             c.args(["-selection", "clipboard"]);
             c
         }
+        ClipboardWriteTool::Pbcopy => Command::new("pbcopy"),
     };
     // Critical: never inherit the TUI's terminal fds. wl-copy prints
     // "Failed to connect to a Wayland server…" on stderr when
@@ -271,5 +300,19 @@ mod tests {
         // On a CI/headless box neither tool may work; must not panic or
         // write to the terminal.
         let _ = write_text("issue-61 regression probe");
+    }
+
+    #[test]
+    fn write_tools_for_macos_returns_pbcopy() {
+        if cfg!(target_os = "macos") {
+            assert_eq!(write_tools_for_session(), vec![ClipboardWriteTool::Pbcopy]);
+        }
+    }
+
+    #[test]
+    fn try_write_pbcopy_fails_gracefully_when_missing() {
+        if !cfg!(target_os = "macos") {
+            assert!(!try_write_with(ClipboardWriteTool::Pbcopy, "sample"));
+        }
     }
 }
