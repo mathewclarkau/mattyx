@@ -66,6 +66,19 @@ These defaults come from `Keys::default`.
 
 The screen bindings intentionally use tmux verbs: `c` creates a screen, `n` and `p` switch screens, `&` closes a screen, and `,` renames a screen. Tabs use `t`, `Tab`, `BackTab`, fixed number selectors, and tab-bar mouse actions.
 
+## Copy and paste
+
+These chords are handled by mtyx and do not need the prefix. They are not in the `keys` table.
+
+| Binding | Action |
+| --- | --- |
+| `Ctrl-Shift-C` or `Cmd-C` | Copy the current selection |
+| `Ctrl-Shift-V` or `Cmd-V` | Paste the system clipboard into the focused pane |
+
+Bare `Ctrl-C` is still interrupt for the program in the pane. Bare `Ctrl-V` is still passed through to that program.
+
+Apple Terminal.app does not send `Cmd` or `Ctrl-Shift` to the program. `Cmd-C` and `Cmd-V` are Terminal.app menu shortcuts, and `Ctrl-Shift-C` / `Ctrl-Shift-V` beep because Terminal.app has no binding for them. Drag to select instead: mtyx writes the text with `pbcopy`, and `Cmd-V` pastes it. Hold Option while dragging to make a native Terminal.app selection that `Cmd-C` can copy.
+
 ## Modeless Alt Layer
 
 Any configured Alt chord is active without the prefix. Default modeless commands are `Alt-t`, `Alt-n`, `Alt-[`, `Alt-]`, `Alt-h/j/k/l`, Alt arrows, `Alt-=`, and `Alt--`. `Alt-n` is the default zellij-style smart split binding.

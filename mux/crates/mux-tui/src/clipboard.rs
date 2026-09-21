@@ -17,6 +17,43 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+/// Copy or paste requested by a host-terminal chord (issue #109).
+///
+/// Bare Ctrl-C stays interrupt and bare Ctrl-V stays a key for the pane.
+/// Ctrl-Shift-C/V is the usual terminal copy/paste pair. Cmd-C/V arrives
+/// as Super on terminals that forward the Command key (iTerm2, Ghostty,
+/// kitty, WezTerm). Apple Terminal.app never delivers either chord.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardChord {
+    Copy,
+    Paste,
+}
+
+pub fn clipboard_chord(key: &KeyEvent) -> Option<ClipboardChord> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    let which = match key.code {
+        KeyCode::Char('c') | KeyCode::Char('C') => ClipboardChord::Copy,
+        KeyCode::Char('v') | KeyCode::Char('V') => ClipboardChord::Paste,
+        _ => return None,
+    };
+    let mods = key.modifiers;
+    let ctrl = mods.contains(KeyModifiers::CONTROL);
+    let shift = mods.contains(KeyModifiers::SHIFT);
+    let super_key = mods.contains(KeyModifiers::SUPER);
+    let alt = mods.contains(KeyModifiers::ALT);
+    if super_key && !ctrl && !alt {
+        return Some(which);
+    }
+    if ctrl && shift && !alt && !super_key {
+        return Some(which);
+    }
+    None
+}
+
 /// Read text from the desktop clipboard. Returns `None` if no tool is
 /// available or the clipboard is empty/unreadable.
 pub fn read_text() -> Option<String> {
@@ -314,5 +351,46 @@ mod tests {
         if !cfg!(target_os = "macos") {
             assert!(!try_write_with(ClipboardWriteTool::Pbcopy, "sample"));
         }
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn ctrl_shift_c_copies_and_bare_ctrl_c_does_not() {
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert_eq!(
+            clipboard_chord(&key(KeyCode::Char('c'), ctrl_shift)),
+            Some(ClipboardChord::Copy)
+        );
+        assert_eq!(
+            clipboard_chord(&key(KeyCode::Char('C'), ctrl_shift)),
+            Some(ClipboardChord::Copy)
+        );
+        assert_eq!(clipboard_chord(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)), None);
+    }
+
+    #[test]
+    fn ctrl_shift_v_and_super_v_paste() {
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert_eq!(
+            clipboard_chord(&key(KeyCode::Char('v'), ctrl_shift)),
+            Some(ClipboardChord::Paste)
+        );
+        assert_eq!(
+            clipboard_chord(&key(KeyCode::Char('v'), KeyModifiers::SUPER)),
+            Some(ClipboardChord::Paste)
+        );
+        assert_eq!(clipboard_chord(&key(KeyCode::Char('v'), KeyModifiers::CONTROL)), None);
+    }
+
+    #[test]
+    fn clipboard_chord_ignores_release_and_alt() {
+        let mut ev = key(KeyCode::Char('c'), KeyModifiers::SUPER);
+        ev.kind = KeyEventKind::Release;
+        assert_eq!(clipboard_chord(&ev), None);
+        let ctrl_shift_alt = KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT;
+        assert_eq!(clipboard_chord(&key(KeyCode::Char('c'), ctrl_shift_alt)), None);
     }
 }
