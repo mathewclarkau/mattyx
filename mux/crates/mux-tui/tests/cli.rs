@@ -5,7 +5,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::symlink;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
@@ -2832,6 +2832,114 @@ impl Drop for SymlinkSkillFixture {
         let _ = fs::remove_file(&self.target_path);
         let _ = fs::remove_dir_all(&self.project_dir);
     }
+}
+
+/// Issue #107: a non-headless `mtyx` start must leave a session daemon
+/// running after the TUI process exits, so attach/identify still work.
+#[test]
+fn local_start_leaves_daemon_after_client_exits() {
+    let dir = unique_temp_dir("detach-107");
+    fs::create_dir_all(&dir).unwrap();
+    let name = "detach107";
+    let socket = dir.join(format!("{name}.sock"));
+    // Own session, no controlling terminal. Otherwise crossterm opens
+    // /dev/tty, enables raw mode on the caller's terminal, and the
+    // SIGKILL below never restores it.
+    let mut client = Command::new(bin());
+    client
+        .args(["--session", name, "--socket"])
+        .arg(&socket)
+        .env("XDG_STATE_HOME", &dir)
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env("SHELL", "/bin/sh")
+        .env_remove("MTYX_MUX_SOCKET")
+        .env_remove("CMUX_MUX_SOCKET")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    unsafe {
+        client.pre_exec(|| {
+            extern "C" {
+                fn setsid() -> i32;
+            }
+            if setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut client = client.spawn().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        if mux_core::server::is_session_socket_live(&socket) {
+            ready = true;
+            break;
+        }
+        if let Ok(Some(status)) = client.try_wait() {
+            let err = client.stderr.take().map(drain_stderr).unwrap_or_default();
+            let _ = fs::remove_dir_all(&dir);
+            panic!("client exited before the daemon socket was live: {status}; stderr:\n{err}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if !ready {
+        let _ = client.kill();
+        let _ = client.wait();
+        let _ = fs::remove_dir_all(&dir);
+        panic!("daemon did not become live at {}", socket.display());
+    }
+
+    // The client has no controlling terminal, so it fails out of the TUI
+    // on its own once the daemon is up. SIGKILL is the backstop if it is
+    // still sitting there. The daemon is a setsid grandchild and must survive.
+    let _ = client.kill();
+    let _ = client.wait();
+
+    assert!(
+        mux_core::server::is_session_socket_live(&socket),
+        "session socket must survive TUI exit (issue #107)"
+    );
+
+    let identify = Command::new(bin())
+        .args(["--socket"])
+        .arg(&socket)
+        .arg("identify")
+        .output()
+        .unwrap();
+    if !identify.status.success() {
+        let _ = Command::new(bin())
+            .args(["--socket"])
+            .arg(&socket)
+            .args(["kill-session", "--session", name])
+            .status();
+        let _ = fs::remove_dir_all(&dir);
+        panic!(
+            "identify against surviving session failed: status {:?} stdout {:?} stderr {:?}",
+            identify.status,
+            String::from_utf8_lossy(&identify.stdout),
+            String::from_utf8_lossy(&identify.stderr)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&identify.stdout);
+    assert!(stdout.contains("mtyx session="), "identify stdout: {stdout}");
+
+    let kill = Command::new(bin())
+        .args(["--socket"])
+        .arg(&socket)
+        .args(["kill-session", "--session", name])
+        .output()
+        .unwrap();
+    assert_success(&kill);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn drain_stderr(mut stderr: impl std::io::Read) -> String {
+    let mut buf = String::new();
+    let _ = stderr.read_to_string(&mut buf);
+    buf
 }
 
 #[test]
