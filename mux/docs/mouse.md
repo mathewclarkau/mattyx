@@ -36,7 +36,9 @@ Menus draw bordered overlays. Up and Down move the selected row, Enter activates
 
 ## Selection and Clipboard
 
-Drag inside a PTY pane to select text. Releasing copies non-empty selected text to the host clipboard with OSC 52. The selection stores absolute scrollback rows, so it remains stable while the viewport scrolls.
+Drag inside a PTY pane to select text. Releasing copies non-empty selected text to the host clipboard with OSC 52 and falls back to system clipboard tools (`pbcopy` on macOS, `wl-copy`/`xclip` on Linux) when the terminal lacks OSC 52 support (such as Apple's default `Terminal.app`). `Ctrl-Shift-C` and `Cmd-C` copy that selection when the host terminal delivers them. `Ctrl-Shift-V` and `Cmd-V` paste the system clipboard.
+
+Apple Terminal.app keeps `Cmd-C`, `Cmd-V`, and `Ctrl-Shift-C` / `Ctrl-Shift-V` for itself (`Ctrl-Shift` beeps and never reaches mtyx). After a drag-select, `Cmd-V` pastes what mtyx wrote with `pbcopy`. Holding Option while dragging bypasses mtyx's mouse capture and makes a native Terminal.app selection, which `Cmd-C` can copy. The selection stores absolute scrollback rows, so it remains stable while the viewport scrolls.
 
 Holding a selection drag at the top or bottom content edge auto-scrolls and extends the selection. Typing clears the selection. If the selected surface exits, the selection is cleared.
 

@@ -1269,6 +1269,12 @@ impl App {
             self.prefix_armed = true;
             return Ok(RenderAction::Draw);
         }
+        // Issue #109: copy/paste chords must not fall through to the pane.
+        // A forwarded Ctrl-Shift-C/V is what rings the bell.
+        if let Some(chord) = crate::clipboard::clipboard_chord(&key) {
+            self.handle_clipboard_chord(chord);
+            return Ok(RenderAction::Draw);
+        }
         // Typing replaces any selection highlight.
         self.selection = None;
         self.forward_key(&key);
@@ -2873,6 +2879,28 @@ impl App {
                 // A plain click: no selection to keep.
                 self.selection = None;
                 Ok(RenderAction::Draw)
+            }
+        }
+    }
+
+    fn handle_clipboard_chord(&mut self, chord: crate::clipboard::ClipboardChord) {
+        match chord {
+            crate::clipboard::ClipboardChord::Copy => {
+                if let Some(sel) = self.selection.filter(|sel| sel.anchor != sel.head) {
+                    self.copy_selection(sel);
+                } else {
+                    self.show_toast("Nothing selected".to_string());
+                }
+            }
+            crate::clipboard::ClipboardChord::Paste => {
+                self.selection = None;
+                if let Some(text) = crate::clipboard::read_text() {
+                    self.paste(&text);
+                } else if let Some(payload) = crate::clipboard::image_paste_payload() {
+                    self.paste(&payload);
+                } else {
+                    self.show_toast("Clipboard empty".to_string());
+                }
             }
         }
     }
