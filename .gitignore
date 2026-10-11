@@ -1,3 +1,5 @@
 /.tools/
 /mux/target/
 /.venv/
+/.agents/teamwork/
+/daemon/remote/bin/

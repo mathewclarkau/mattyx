@@ -1179,6 +1179,7 @@ fn build_screen(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(json!({ "screen": flags.required_u64("screen")? }))
 }
 
+#[allow(dead_code)]
 fn build_workspace(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(json!({ "workspace": flags.required_u64("workspace")? }))
 }
@@ -2031,7 +2032,7 @@ fn signal_session_pid(pid: u32, _kill: bool) {
 /// `run_kill_session` behaviour.
 pub(crate) fn kill_session_at(socket_path: &std::path::Path, pid: Option<u32>) -> bool {
     if let Some(pid) = pid {
-        if mux_core::server::is_cmux_process(pid) {
+        if mux_core::server::is_mtyx_process(pid) {
             signal_session_pid(pid, false);
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             while std::time::Instant::now() < deadline {
@@ -3251,7 +3252,7 @@ mod tests {
                 // parse, so both spellings dispatch identically.
                 continue;
             }
-            let mut long = vec!["--json".to_string(), canonical.to_string()];
+            let long = vec!["--json".to_string(), canonical.to_string()];
             match (parse(&args), parse(&long)) {
                 (Ok(Parsed::Command(short)), Ok(Parsed::Command(full))) => {
                     assert!(

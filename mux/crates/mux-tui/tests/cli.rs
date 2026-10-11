@@ -99,7 +99,7 @@ impl HeadlessServer {
     fn wait_for_socket(&self) {
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
-            if self.socket.exists() {
+            if self.socket.exists() && std::os::unix::net::UnixStream::connect(&self.socket).is_ok() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -663,7 +663,7 @@ fn list_workspaces_json_exposes_agent_name_per_tab() {
     assert_eq!(other_tab["agent_confidence"], serde_json::Value::Null);
 }
 
-/// Issue #78 AC7: `[[agent_detection]] enabled = false` in cmux.toml
+/// Issue #78 AC7: `[[agent_detection]] enabled = false` in mux.toml
 /// turns detection off — both detect verbs error with a clear message
 /// instead of detecting.
 #[test]
@@ -2385,7 +2385,7 @@ fn close_workspace_worktree_child_guard_reports_and_groups() {
     assert!(names.contains(&"child-1") && !names.contains(&"parent-1"), "workspaces: {names:?}");
 
     // --- Plain output also reports the survivor (never silent).
-    let (parent2, child2, worktree2, _inside2) =
+    let (parent2, _child2, worktree2, _inside2) =
         worktree_child_fixture(&server, &repo, "feat-b", "parent-2", "child-2");
     let plain = cli(&server, &["close-workspace", "--workspace", &parent2.to_string()]);
     assert_success(&plain);
@@ -2399,7 +2399,7 @@ fn close_workspace_worktree_child_guard_reports_and_groups() {
     assert!(!text.contains("[agent running]"), "child-2 has no agent report: {text}");
 
     // --- `--group` (bare boolean flag) closes parent AND child.
-    let (parent3, child3, _worktree3, _inside3) =
+    let (parent3, _child3, _worktree3, _inside3) =
         worktree_child_fixture(&server, &repo, "feat-c", "parent-3", "child-3");
     let grouped =
         cli(&server, &["close-workspace", "--workspace", &parent3.to_string(), "--group"]);
@@ -3702,7 +3702,10 @@ fn plugin_shipped_example_manifest_installs() {
         list_out.contains("bin/fleet.wasm"),
         "installed entry path should be preserved: {list_out}"
     );
-    assert!(list_out.contains("cmux_call"), "verb allowlist should include cmux_call: {list_out}");
+    assert!(
+        list_out.contains("mtyx_call") || list_out.contains("cmux_call"),
+        "verb allowlist should include mtyx_call: {list_out}"
+    );
 }
 
 /// Issue #59: `mtyx --version` / `-V` print `mtyx <version>` and exit 0.
@@ -3797,7 +3800,7 @@ fn spawn_named_headless(dir: &std::path::Path, name: &str) -> Child {
     let pid_file = dir.join(format!("{name}.pid"));
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        if socket.exists() && pid_file.exists() {
+        if socket.exists() && pid_file.exists() && std::os::unix::net::UnixStream::connect(&socket).is_ok() {
             return child;
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -4497,7 +4500,7 @@ fn layout_export_writes_versioned_workspace_json() {
 
     let doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
     assert_eq!(doc["schema_version"].as_u64(), Some(1), "doc was {doc}");
-    assert_eq!(doc["cmux_version"].as_str(), Some(mux_core::VERSION));
+    assert_eq!(doc["mtyx_version"].as_str(), Some(mux_core::VERSION));
     assert_eq!(doc["workspace"]["name"].as_str(), Some("fleet"));
     let layout = &doc["workspace"]["screens"][0]["layout"];
     assert_eq!(layout["type"].as_str(), Some("split"));
@@ -4627,7 +4630,7 @@ fn layout_apply_rejects_unknown_schema_version_loudly() {
     let bad = server.dir.join("v2.json");
     fs::write(
         &bad,
-        r#"{"schema_version":2,"cmux_version":"x","workspace":{"name":"w","active_screen":0,"screens":[{"active_pane":0,"layout":{"type":"leaf","pane":0},"panes":[{"tabs":[{"kind":"pty"}]}]}]}}"#,
+        r#"{"schema_version":2,"mtyx_version":"x","workspace":{"name":"w","active_screen":0,"screens":[{"active_pane":0,"layout":{"type":"leaf","pane":0},"panes":[{"tabs":[{"kind":"pty"}]}]}]}}"#,
     )
     .unwrap();
 
@@ -5153,6 +5156,9 @@ fn flag_forms_and_orders_produce_the_same_request() {
     assert_success(&send);
     let screen = wait_for_screen(&server, surface, "ff-marker");
     assert!(screen.contains("ff-marker"));
+    // Let the shell settle (next prompt) so all captures below see the
+    // same static screen (matches screenshot_writes_read_screen_bytes_to_file).
+    std::thread::sleep(Duration::from_millis(300));
 
     // The two read-screen spellings agree byte-for-byte.
     let spaced = cli(&server, &["read-screen", "--surface", &surface.to_string()]);

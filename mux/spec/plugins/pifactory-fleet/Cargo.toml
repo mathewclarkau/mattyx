@@ -8,17 +8,19 @@
 #      main workspace's `package.resolver`.
 #   3. `cargo build --release` here compiles only this crate; it
 #      does not pull in wasmtime or any other mattyx deps.
-name = "cmux-pifactory-fleet"
+name = "mtyx-pifactory-fleet"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 publish = false
 description = "WASM adapter for the pifactory-fleet example mtyx plugin (issue #42 AC6)"
 
+[workspace]
+
 [lib]
 # `cdylib` is required for the wasm32-unknown-unknown target — it
 # produces a `.wasm` file with an exported `_start` (and our
-# `_cmux_plugin_main`) symbol that the mtyx loader
+# `_mtyx_plugin_main`) symbol that the mtyx loader
 # (`mux/crates/mux-tui/src/plugin_host.rs::invoke`) can instantiate.
 crate-type = ["cdylib"]
 
@@ -29,7 +31,7 @@ crate-type = ["cdylib"]
 
 # We do NOT list mattyx as a dependency. The plugin's WASM talks
 # to a running mtyx through `mux/crates/mux-tui/src/plugin_host.rs`
-# host imports (cmux_token / cmux_call / cmux_log). At runtime the
+# host imports (mtyx_token / mtyx_call / mtyx_log). At runtime the
 # mtyx binary is on the user's machine, not in this crate's
 # dependency graph.
 

@@ -6,7 +6,7 @@
 #   [plugin]
 #   name         = "<plugin id>"           # required, single path component
 #   entry        = "<relative path>"       # required, relative to install dir
-#   verbs        = ["cmux_call", "<verb>", ...]   # required, non-empty
+#   verbs        = ["mtyx_call", "<verb>", ...]   # required, non-empty
 #
 #   [plugin.capabilities]
 #   socket        = "off" | "read" | "write"
@@ -18,13 +18,13 @@
 #   max_runtime_ms = <1..=600_000>
 #
 # Notes:
-#   - "cmux_call" must appear in `verbs` so the loader
+#   - "mtyx_call" must appear in `verbs` so the loader
 #     (plugin::lookup_plugin) treats this as an executable plugin.
 #   - The remaining verbs in `verbs` are BOTH the plugin's high-level
 #     verbs (the user's `mtyx pifactory-fleet <verb>` argv) AND the
-#     cmux_call verbs the plugin is allowed to forward to the control
+#     mtyx_call verbs the plugin is allowed to forward to the control
 #     socket. The loader validates them against the per-call token's
-#     verb_allowlist on every cmux_call (plugin_host::validate_and_forward).
+#     verb_allowlist on every mtyx_call (plugin_host::validate_and_forward).
 
 [plugin]
 name = "pifactory-fleet"
@@ -34,13 +34,14 @@ entry = "bin/fleet.wasm"
 #   ping      identify the parent mtyx (read-only smoke test)
 #   status    list-workspaces snapshot
 #   deploy    create a fresh fleet: one workspace per role
-#   dispatch  one new-workspace + one send (single cmux_call, see note)
+#   dispatch  one new-workspace + one send (single mtyx_call, see note)
 #   rollback  close a workspace
 #
-# cmux_call verbs the plugin will forward to the control socket:
+# mtyx_call verbs the plugin will forward to the control socket:
 #   identify, list-workspaces, read-screen, new-workspace, send,
 #   close-workspace.
 verbs = [
+    "mtyx_call",
     "cmux_call",
     "ping",
     "status",

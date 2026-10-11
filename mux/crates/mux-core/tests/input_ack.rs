@@ -35,7 +35,7 @@ fn connect(path: &Path) -> Box<dyn transport::Stream> {
 
 /// One request → one response on a fresh connection (the `mtyx` CLI shape).
 fn rpc(socket: &Path, request: Value) -> Value {
-    let mut stream = connect(socket);
+    let stream = connect(socket);
     let mut writer = stream.try_clone_box().unwrap();
     let mut reader = BufReader::new(stream);
     writeln!(writer, "{}", serde_json::to_string(&request).unwrap()).unwrap();

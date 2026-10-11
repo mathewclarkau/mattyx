@@ -25,11 +25,11 @@ the mtyx CLI verbs `split`, `rename-surface`, `send --text ...` (often
 | ---------- | ----------------------- | ---------------------------------- |
 | `ping`     | `identify`              | read-only smoke test               |
 | `status`   | `list-workspaces`       | read-only snapshot                 |
-| `deploy`   | `new-workspace`         | one cmux_call per role             |
-| `dispatch` | `new-workspace`         | one cmux_call (anchor for workers) |
-| `rollback` | `close-workspace`       | one cmux_call per closed workspace |
+| `deploy`   | `new-workspace`         | one mtyx_call per role             |
+| `dispatch` | `new-workspace`         | one mtyx_call (anchor for workers) |
+| `rollback` | `close-workspace`       | one mtyx_call per closed workspace |
 
-All `cmux_call` traffic is mediated by the wasmtime host
+All `mtyx_call` traffic is mediated by the wasmtime host
 (`mux/crates/mux-tui/src/plugin_host.rs`): the plugin receives a
 per-call auth token, and every forwarded request is checked against
 the manifest's verb allowlist and `socket = "write"` capability
@@ -44,7 +44,7 @@ mux/spec/plugins/pifactory-fleet/
 ├── Cargo.toml              Crate manifest for the WASM adapter source.
 ├── build.sh                Builds src/lib.rs to bin/fleet.wasm.
 ├── src/
-│   └── lib.rs              WASM source: thin cmux_call dispatcher.
+│   └── lib.rs              WASM source: thin mtyx_call dispatcher.
 ├── bin/
 │   ├── fleet.wasm          Compiled artifact (commit after running build.sh).
 │   └── fleet.sh            Shell adapter (cmux-panel-lib idiom) for reference.
@@ -85,9 +85,9 @@ talks to mtyx through the three host imports defined in
 `mux/crates/mux-tui/src/plugin_host.rs`:
 
 ```rust
-fn cmux_token() -> u64;        // (ptr << 32) | len of token bytes
-fn cmux_call(req_ptr, req_len, out_ptr, out_cap) -> i32;
-fn cmux_log(level, ptr, len);  // 0=info, 1=warn, 2=error, other=debug
+fn mtyx_token() -> u64;        // (ptr << 32) | len of token bytes
+fn mtyx_call(req_ptr, req_len, out_ptr, out_cap) -> i32;
+fn mtyx_log(level, ptr, len);  // 0=info, 1=warn, 2=error, other=debug
 ```
 
 ## Install
@@ -122,13 +122,13 @@ returns non-zero on any failure.
 ## Single-call-per-invocation limitation
 
 The loader's `expected_request_id` is initialised to 0 and never
-incremented after `cmux_call` (see
+incremented after `mtyx_call` (see
 `plugin_host.rs::define_host_imports`, which reads but does not
-bump the counter). A second `cmux_call` from the same plugin
+bump the counter). A second `mtyx_call` from the same plugin
 invocation therefore fails with `StaleId { expected: 0, got: 1 }`.
 
 `pifactory-fleet`'s verbs are designed around this constraint: each
-verb makes at most one `cmux_call`. The README of a future loader
+verb makes at most one `mtyx_call`. The README of a future loader
 fix that increments `expected_request_id` per call can lift this
 restriction without changing the manifest schema. This is tracked
 as a known issue — see `mattyx/AGENTS.md` follow-ups.
@@ -138,8 +138,8 @@ as a known issue — see `mattyx/AGENTS.md` follow-ups.
 To add a new verb:
 
 1. Add it to `verbs` in `mtyx-plugin.toml` (so the loader accepts it
-   on the argv path AND so it appears in the cmux_call allowlist).
-2. Add a `cmux_call` branch in `src/lib.rs` that builds the
+   on the argv path AND so it appears in the mtyx_call allowlist).
+2. Add a `mtyx_call` branch in `src/lib.rs` that builds the
    `{"id":0,"verb":"<mtyx-verb>","args":{...}}` request.
 3. Mirror the logic in `bin/fleet.sh` so the shell reference stays
    in sync.

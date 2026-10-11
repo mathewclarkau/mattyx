@@ -55,7 +55,7 @@ cd mux && cargo build                       # build.rs falls back to `zig` (PATH
 
 Consequences worth knowing before you touch any of this:
 
-- **Read `mux_core::VERSION`, never `env!("CARGO_PKG_VERSION")`,** anywhere a version is shown to a user or sent to a peer (`-V`, the socket `identify` reply, the `-ldflags` stamp on the cross-compiled `cmuxd-remote`).
+- **Read `mux_core::VERSION`, never `env!("CARGO_PKG_VERSION")`,** anywhere a version is shown to a user or sent to a peer (`-V`, the socket `identify` reply, the `-ldflags` stamp on the cross-compiled `mtyxd-remote`).
 - **Dirtiness ignores submodules.** `bootstrap.sh` patches `ghostty/` on every checkout, so a plain `git describe --dirty` would mark *every* build dirty, CI included. `build.rs` uses `git status --ignore-submodules=all` instead.
 - **`build.rs` lists its `rerun-if-changed` inputs explicitly** (`build.rs`, `.git/HEAD`, `.git/packed-refs`, `.git/refs/tags`) because emitting any one of them opts out of cargo's default whole-package watch. Drop the git refs and an incremental rebuild after tagging silently reuses the stale version. Only paths that exist are emitted — cargo treats an unstattable path as permanently dirty and would rerun the script on every build.
 - **Every tier keeps a leading semver triple**, which is the invariant `version_is_not_the_stale_placeholder` pins; only the suffix marking a build as *not* a release varies. Never resolve with `describe --always`: its bare-SHA fallback (`79e84a4`) drops the triple entirely, which is what broke PR CI on the first cut of this.

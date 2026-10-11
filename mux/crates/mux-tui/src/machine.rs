@@ -14,7 +14,7 @@
 //!    one, with no TUI. The transport is `ssh -o BatchMode=yes <host> mtyx
 //!    <verb> …`: a mux verb needs a mux server to run it, and the remote
 //!    mtyx (headless or attended) owns exactly that. (`mtyx ssh <host>`
-//!    boots `cmuxd-remote` for *PTY bytes* — see `ssh_bootstrap` and
+//!    boots `mtyxd-remote` for *PTY bytes* — see `ssh_bootstrap` and
 //!    `mux_core::remote_pty` — which is the wrong layer for
 //!    `list-workspaces`/`send`/`read-screen`: those read and write *mux
 //!    state*, not a single pty.) The cached remote platform probe and

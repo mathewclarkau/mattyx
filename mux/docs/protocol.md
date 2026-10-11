@@ -203,10 +203,10 @@ The bundled TUI forwards this to the host desktop via `notify-send`. There is no
 
 ## Remote Workspaces
 
-`new-remote-workspace` creates a workspace whose tab is a `cmuxd-remote` session over SSH instead of a local shell (see `getting-started.md`'s "Remote (SSH) workspaces" and `remote_pty.rs`'s module doc for the transport). Building/caching the daemon binary for the remote's OS/arch is the caller's job — the bundled `mtyx ssh <host>` CLI command does it and is the intended way to use this, not calling the socket command directly:
+`new-remote-workspace` creates a workspace whose tab is a `mtyxd-remote` session over SSH instead of a local shell (see `getting-started.md`'s "Remote (SSH) workspaces" and `remote_pty.rs`'s module doc for the transport). Building/caching the daemon binary for the remote's OS/arch is the caller's job — the bundled `mtyx ssh <host>` CLI command does it and is the intended way to use this, not calling the socket command directly:
 
 ```json
-{"id":60,"cmd":"new-remote-workspace","host":"myhost","slot":"mtyx","session_id":"mtyx-...","local_binary_path":"/home/me/.cache/mattyx/cmuxd-remote-linux-amd64","name":"work"}
+{"id":60,"cmd":"new-remote-workspace","host":"myhost","slot":"mtyx","session_id":"mtyx-...","local_binary_path":"/home/me/.cache/mattyx/mtyxd-remote-linux-amd64","name":"work"}
 {"id":60,"ok":true,"data":{"surface":7}}
 ```
 

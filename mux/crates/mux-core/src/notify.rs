@@ -61,6 +61,7 @@ impl NotificationRing {
         NotificationRing { records: std::collections::VecDeque::new(), capacity: capacity.max(1) }
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.records.len()
     }

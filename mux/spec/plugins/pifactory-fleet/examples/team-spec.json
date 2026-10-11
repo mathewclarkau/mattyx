@@ -1,5 +1,5 @@
 {
-  "$schema": "https://example.invalid/cmux-pifactory-fleet/team-spec.schema.json",
+  "$schema": "https://example.invalid/mtyx-pifactory-fleet/team-spec.schema.json",
   "fleet": "example",
   "roles": [
     {

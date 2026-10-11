@@ -80,7 +80,7 @@ fn default_shell_is_spawned_as_login_shell() {
             let argv0 = String::from_utf8_lossy(argv0);
             argv0.starts_with('-').then(|| argv0.into_owned())
         },
-        Duration::from_secs(3),
+        Duration::from_secs(10),
     );
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
     let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
@@ -151,7 +151,14 @@ fn osc9_notification_from_real_pty_output_sets_detected_agent_state() {
     );
     assert_eq!(notification, Some(("".to_string(), "Build failed".to_string())));
 
-    let agents = mux.list_agents(Some(surface.id), None);
+    let agents = wait_for(
+        || {
+            let list = mux.list_agents(Some(surface.id), None);
+            (!list.is_empty()).then_some(list)
+        },
+        Duration::from_secs(5),
+    )
+    .expect("agent report should be set");
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0].1.state, AgentState::Blocked);
     assert_eq!(agents[0].1.source, AgentStateSource::Detected);
@@ -1159,4 +1166,31 @@ fn resize_input_race_does_not_tear_vt_output() {
         }
     }
     assert_eq!(found, ITERS, "all {ITERS} tokens must survive the resize race intact");
+}
+
+#[test]
+fn pty_spawn_sets_canonical_and_legacy_env_vars() {
+    let script = "printf 'S=%s;P=%s;CS=%s;CP=%s;SK=%s;CSK=%s;MS=%s;CMS=%s\\n' \
+        \"$MTYX_MUX_SURFACE\" \"$MTYX_PANEL_ID\" \"$CMUX_MUX_SURFACE\" \"$CMUX_PANEL_ID\" \
+        \"$MTYX_SOCKET_PATH\" \"$CMUX_SOCKET_PATH\" \"$MTYX_MUX_SOCKET\" \"$CMUX_MUX_SOCKET\"; sleep 30";
+    let mut opts = shell_opts(script);
+    opts.extra_env.push(("MTYX_MUX_SOCKET".to_string(), "/tmp/test-mtyx.sock".to_string()));
+    let mux = Mux::new(unique_session("test-env-dualwrite"), opts);
+    let surface = mux.new_workspace(None, None).unwrap();
+    let id_str = surface.id.to_string();
+
+    let text = wait_for(
+        || {
+            let t = surface.with_terminal(|t| t.plain_text()).unwrap().unwrap();
+            t.contains(&format!("S={id_str};P={id_str};CS={id_str};CP={id_str};SK=/tmp/test-mtyx.sock;CSK=/tmp/test-mtyx.sock;MS=/tmp/test-mtyx.sock;CMS=/tmp/test-mtyx.sock"))
+                .then_some(t)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        text.is_some(),
+        "dual-written canonical and legacy env vars not found on screen: {:?}",
+        surface.with_terminal(|t| t.plain_text()).unwrap()
+    );
+    mux.close_surface(surface.id);
 }

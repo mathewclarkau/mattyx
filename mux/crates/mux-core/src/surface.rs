@@ -64,7 +64,7 @@ pub struct SurfaceOptions {
     pub browser_max_capture_megapixels: f64,
     /// Optional fixed browser capture scale, where 1.0 captures at pane pixels.
     pub browser_capture_scale: Option<f64>,
-    /// When set, this PTY is backed by `cmuxd-remote` over SSH instead of
+    /// When set, this PTY is backed by `mtyxd-remote` over SSH instead of
     /// a local child process (see `remote_pty.rs`). Per-spawn, not part
     /// of a `Mux`'s default template.
     pub remote: Option<crate::remote_pty::RemoteSpec>,
@@ -513,14 +513,19 @@ impl Surface {
         // this pty call back into `mtyx report-agent --surface
         // $MTYX_MUX_SURFACE ...` without needing to know its own surface id.
         cmd.env("MTYX_MUX_SURFACE", id.to_string());
-        // Grok Build's multiplexer detector (and macOS mtyx) look for these
-        // names. Dual-write so an unpatched grok still classifies the pane
-        // as MultiplexerKind::Cmux.
+        cmd.env("CMUX_MUX_SURFACE", id.to_string());
+        // Grok Build's multiplexer detector (and macOS cmux) look for these
+        // names. Dual-write canonical MTYX_* and legacy CMUX_* so an unpatched
+        // grok still classifies the pane as MultiplexerKind::Cmux and legacy
+        // scripts continue to work.
         cmd.env("MTYX_PANEL_ID", id.to_string());
+        cmd.env("CMUX_PANEL_ID", id.to_string());
         for (k, v) in &opts.extra_env {
             cmd.env(k, v);
             if k == "MTYX_MUX_SOCKET" {
                 cmd.env("MTYX_SOCKET_PATH", v);
+                cmd.env("CMUX_MUX_SOCKET", v);
+                cmd.env("CMUX_SOCKET_PATH", v);
             }
         }
         // The local-home-dir fallback only makes sense for a local child;
@@ -658,8 +663,8 @@ impl Surface {
                     if let Some(watcher) = osc_watcher.as_mut() {
                         for (title, body) in watcher.feed(&buf[..n]) {
                             if let Some(mux) = mux.upgrade() {
-                                mux.report_agent(
-                                    surface.id,
+                                mux.report_surface_agent(
+                                    &surface,
                                     crate::AgentState::Blocked,
                                     crate::AgentStateSource::Detected,
                                     None,
@@ -953,7 +958,7 @@ impl Surface {
     }
 
     /// The `RemoteSpec` this surface was spawned with, if it's a
-    /// `cmuxd-remote` session rather than a local shell.
+    /// `mtyxd-remote` session rather than a local shell.
     pub fn remote_spec(&self) -> Option<crate::remote_pty::RemoteSpec> {
         self.as_pty().and_then(|pty| pty.remote.clone())
     }

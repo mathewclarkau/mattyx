@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use mux_core::server::{is_cmux_process, is_process_alive, pid_path};
+use mux_core::server::{is_mtyx_process, is_process_alive, pid_path};
 
 const POLL_MS: u64 = 200;
 /// Upper bound matching issue #27 acceptance (≤5s). Used only in tests /
@@ -115,7 +115,7 @@ fn watch_until_dead(pid: u32, _socket: &Path) {
         }
         // PID reused by something that is not mtyx → treat as dead so we
         // don't hold the socket forever for the wrong owner.
-        if !is_cmux_process(pid) {
+        if !is_mtyx_process(pid) {
             break;
         }
         std::thread::sleep(Duration::from_millis(POLL_MS));
