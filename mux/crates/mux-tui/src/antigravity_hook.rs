@@ -190,6 +190,20 @@ fn run_install_skill(uninstall: bool, global: bool) -> i32 {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
+        // Refuse to overwrite a symlink: same rationale as claude_hook.rs
+        // (PR #18 / issue #10 hardening) and aider_hook.rs (PR #3) — fs::write
+        // on a symlink path overwrites the symlink target, not the symlink
+        // itself. An attacker-placed symlink in a user-writable target path
+        // could redirect the write to an arbitrary file.
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() {
+                eprintln!(
+                    "error: refusing to overwrite symlink at {}. Remove it manually if you want to install the skill.",
+                    path.display()
+                );
+                return 1;
+            }
+        }
         if let Err(e) = fs::write(&path, crate::skill_content::ORCHESTRATION_SKILL) {
             eprintln!("error writing {}: {e}", path.display());
             return 1;
@@ -304,6 +318,31 @@ mod tests {
         assert_eq!(config.hooks.len(), 1, "only the unrelated user hook survives");
         assert_eq!(config.hooks[0].command, "echo keep me");
         assert_eq!(config.hooks[0].event, "UserEvent");
+
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_skill_refuses_symlink() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = temp_home("symlink-skill");
+        std::env::set_var("HOME", &home);
+
+        let target_file = home.join("sensitive.txt");
+        fs::write(&target_file, "original content").unwrap();
+
+        let skill_p = skill_path(true).unwrap();
+        fs::create_dir_all(skill_p.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target_file, &skill_p).unwrap();
+
+        assert_eq!(run_install_skill(false, true), 1);
+        assert_eq!(
+            fs::read_to_string(&target_file).unwrap(),
+            "original content",
+            "symlink target must not be overwritten"
+        );
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(&home);
