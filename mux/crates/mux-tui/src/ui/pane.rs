@@ -251,6 +251,11 @@ fn draw_tab_bar(app: &mut App, frame: &mut Frame, area: &PaneArea, focused: bool
         buf.set_stringn(x, bar.y, " + ", plus_w as usize, ctrl_style(rect));
         hits.push((rect, Hit::NewTab { pane: pane_id }));
     }
+    if screen_view.zoomed == Some(pane_id) && bar.width >= 6 {
+        let z_badge = "[Z]";
+        let z_x = x1.saturating_sub(3);
+        buf.set_stringn(z_x, bar.y, z_badge, 3, style.add_modifier(Modifier::BOLD));
+    }
     app.hits.extend(hits);
 }
 

@@ -39,6 +39,7 @@ pub struct ScreenView {
     pub layout: Node,
     pub active_pane: PaneId,
     pub panes: Vec<PaneView>,
+    pub zoomed: Option<PaneId>,
 }
 
 #[derive(Clone)]
@@ -302,6 +303,7 @@ pub fn tree_from_state(state: &State) -> TreeView {
                             layout: screen.root.clone(),
                             active_pane: screen.active_pane,
                             panes: pane_ids.iter().filter_map(pane_view).collect(),
+                            zoomed: screen.zoomed,
                         }
                     })
                     .collect(),
@@ -424,6 +426,7 @@ fn parse_screen(value: &Value) -> Option<ScreenView> {
         name: value.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
         layout: value.get("layout").and_then(parse_layout)?,
         active_pane: value.get("active_pane").and_then(|v| v.as_u64()).unwrap_or(0),
+        zoomed: value.get("zoomed").and_then(|v| v.as_u64()),
         panes: value
             .get("panes")
             .and_then(|v| v.as_array())

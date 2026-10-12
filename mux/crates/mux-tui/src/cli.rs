@@ -40,7 +40,7 @@ pub(crate) struct GlobalArgs {
 /// forms (`--group 1`, `--group 0`) still work. `confirm`/`no-confirm`
 /// (issue #88) join the same convention.
 const BARE_BOOL_FLAGS: &[&str] =
-    &["group", "confirm", "no-confirm", "force", "wait", "require-transition", "all"];
+    &["group", "confirm", "no-confirm", "force", "wait", "require-transition", "all", "new-workspace"];
 
 /// Verbs that accept one bare positional argument alongside their flags
 /// (issue #84: `mtyx screenshot --surface <id> <file>`), mapped onto the
@@ -124,6 +124,20 @@ const VERBS: &[VerbSpec] = &[
         stream: false,
     },
     VerbSpec {
+        name: "wait-for",
+        allowed: &["surface", "pattern", "timeout-ms"],
+        build: build_wait_for,
+        print: print_empty,
+        stream: false,
+    },
+    VerbSpec {
+        name: "run",
+        allowed: &["command", "pane", "new-workspace", "cwd", "name", "cols", "rows"],
+        build: build_run,
+        print: print_surface,
+        stream: false,
+    },
+    VerbSpec {
         name: "vt-state",
         allowed: &["surface"],
         build: build_surface,
@@ -194,6 +208,13 @@ const VERBS: &[VerbSpec] = &[
         allowed: &["pane"],
         build: build_pane,
         print: print_empty,
+        stream: false,
+    },
+    VerbSpec {
+        name: "zoom-pane",
+        allowed: &["pane"],
+        build: build_zoom_pane,
+        print: print_zoom_pane,
         stream: false,
     },
     VerbSpec {
@@ -684,6 +705,11 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             // token after it is ever parsed as a flag. Distinct from
             // the `--` that must follow `--exec`: that one is consumed
             // by the `--exec` arm below.
+            "--" if verb.map(|v| v.name) == Some("run") => {
+                let argv: Vec<String> = args[i + 1..].to_vec();
+                flags.exec = Some(argv);
+                i = args.len();
+            }
             "--" if verb.is_some() => {
                 positional_only = true;
                 i += 1;
@@ -926,6 +952,13 @@ fn run_command(args: CliArgs) -> i32 {
             .optional("timeout")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(mux_core::server::DEFAULT_WAIT_READY_MS);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(wait_ms.saturating_add(5_000))));
+    } else if args.verb.name == "wait-for" {
+        let wait_ms = args
+            .flags
+            .optional("timeout-ms")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
         let _ = stream.set_read_timeout(Some(Duration::from_millis(wait_ms.saturating_add(5_000))));
     } else if args.verb.name == "send"
         && (request.get("confirm").and_then(Value::as_bool) == Some(true)
@@ -1173,6 +1206,14 @@ fn build_subscribe(flags: &FlagMap) -> Result<Value, UsageError> {
 
 fn build_pane(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(json!({ "pane": flags.required_u64("pane")? }))
+}
+
+fn build_zoom_pane(flags: &FlagMap) -> Result<Value, UsageError> {
+    let pane = match flags.optional("pane") {
+        Some(s) => Some(parse_u64("pane", &s)?),
+        None => None,
+    };
+    Ok(json!({ "pane": pane }))
 }
 
 fn build_screen(flags: &FlagMap) -> Result<Value, UsageError> {
@@ -1729,6 +1770,44 @@ fn build_agent_send(flags: &FlagMap) -> Result<Value, UsageError> {
         }
         value["shell"] = json!(shell);
     }
+    Ok(value)
+}
+
+fn build_wait_for(flags: &FlagMap) -> Result<Value, UsageError> {
+    Ok(json!({
+        "surface": flags.required_u64("surface")?,
+        "pattern": flags.required("pattern")?,
+        "timeout_ms": flags.required_u64("timeout-ms")?,
+    }))
+}
+
+fn build_run(flags: &FlagMap) -> Result<Value, UsageError> {
+    let has_argv = flags.exec.as_ref().map(|a| !a.is_empty()).unwrap_or(false);
+    let has_cmd = flags.optional("command").is_some();
+    if has_argv && has_cmd {
+        return Err(UsageError("argv and command are mutually exclusive".to_string()));
+    }
+    if !has_argv && !has_cmd {
+        return Err(UsageError("argv or command is required".to_string()));
+    }
+    let has_pane = flags.optional("pane").is_some();
+    let is_new_ws = flags.optional_bool("new-workspace").unwrap_or(false);
+    if has_pane && is_new_ws {
+        return Err(UsageError("--pane and --new-workspace are mutually exclusive".to_string()));
+    }
+
+    let mut value = json!({});
+    if let Some(argv) = &flags.exec {
+        value["argv"] = json!(argv);
+    }
+    flags.insert_optional_string(&mut value, "command");
+    flags.insert_optional_string(&mut value, "cwd");
+    flags.insert_optional_u64(&mut value, "pane")?;
+    if is_new_ws {
+        value["new_workspace"] = json!(true);
+    }
+    flags.insert_optional_string(&mut value, "name");
+    flags.insert_optional_size(&mut value)?;
     Ok(value)
 }
 
@@ -2923,6 +3002,15 @@ fn print_vt_state(data: &Value, out: &mut dyn Write) -> io::Result<()> {
 
 fn print_surface(data: &Value, out: &mut dyn Write) -> io::Result<()> {
     writeln!(out, "{}", data.get("surface").and_then(Value::as_u64).unwrap_or(0))
+}
+
+fn print_zoom_pane(data: &Value, out: &mut dyn Write) -> io::Result<()> {
+    match data.get("zoomed") {
+        Some(val) if !val.is_null() => {
+            writeln!(out, "zoomed pane {}", val.as_u64().unwrap_or(0))
+        }
+        _ => writeln!(out, "unzoomed"),
+    }
 }
 
 fn print_tree(data: &Value, out: &mut dyn Write) -> io::Result<()> {

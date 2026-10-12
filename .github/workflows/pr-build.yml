@@ -139,6 +139,21 @@ jobs:
         working-directory: mux
         run: cargo +1.97 test -p mux-tui
 
+      - name: Cargo test (mux-core)
+        working-directory: mux
+        run: cargo +1.97 test -p mux-core
+
+      - name: Setup Go
+        if: runner.os != 'Windows'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: daemon/remote/go.mod
+
+      - name: Go daemon tests (daemon/remote)
+        if: runner.os != 'Windows'
+        working-directory: daemon/remote
+        run: go test ./...
+
       # Windows parity integration tests with live diagnostics. Round 8
       # (run 35394419102): a hung ConPTY read suppressed this binary's
       # failure summary, so two sibling failures printed nothing at all.

@@ -346,6 +346,17 @@ impl Session {
         }
     }
 
+    pub fn toggle_zoom(&self, pane: Option<PaneId>) {
+        match self {
+            Session::Local(mux) => {
+                let _ = mux.toggle_zoom(pane);
+            }
+            Session::Remote(remote) => {
+                let _ = remote.request(json!({"cmd": "zoom-pane", "pane": pane}));
+            }
+        }
+    }
+
     pub fn select_tab(&self, pane: Option<PaneId>, index: Option<usize>, delta: Option<isize>) {
         match self {
             Session::Local(mux) => mux.select_tab(pane, index, delta),

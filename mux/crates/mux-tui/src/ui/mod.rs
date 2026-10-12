@@ -87,7 +87,8 @@ fn draw_status_bar(app: &mut App, frame: &mut Frame) {
     put(frame, &mut x, " screens ", base.fg(Color::Indexed(244)));
     for (i, screen) in ws.screens.iter().enumerate() {
         let active = i == ws.active_screen;
-        let label = format!(" {} ", truncate(&screen.display_name(i), 20));
+        let zoom_badge = if screen.zoomed.is_some() { "[Z] " } else { "" };
+        let label = format!(" {zoom_badge}{} ", truncate(&screen.display_name(i), 20));
         let (start, width) = put(frame, &mut x, &label, if active { active_style } else { base });
         if width > 0 {
             hits.push((
