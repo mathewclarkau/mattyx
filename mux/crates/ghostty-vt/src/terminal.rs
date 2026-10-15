@@ -560,3 +560,35 @@ impl Drop for Terminal {
         }
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scrollbar_scrolled_back() {
+        // Scrolled back: viewport offset + len is less than total rows
+        let sb_scrolled = Scrollbar { total: 100, offset: 50, len: 24 };
+        assert!(sb_scrolled.scrolled_back());
+
+        // Live bottom: viewport offset + len equals total rows
+        let sb_at_bottom = Scrollbar { total: 100, offset: 76, len: 24 };
+        assert!(!sb_at_bottom.scrolled_back());
+
+        // Past total rows: offset + len exceeds total
+        let sb_past = Scrollbar { total: 100, offset: 80, len: 24 };
+        assert!(!sb_past.scrolled_back());
+
+        // Zero total rows (empty terminal / uninitialized)
+        let sb_zero = Scrollbar { total: 0, offset: 0, len: 0 };
+        assert!(!sb_zero.scrolled_back());
+
+        // Large total rows
+        let sb_large = Scrollbar { total: 10_000, offset: 9_000, len: 1_000 };
+        assert!(!sb_large.scrolled_back());
+
+        let sb_large_scrolled = Scrollbar { total: 10_000, offset: 8_999, len: 1_000 };
+        assert!(sb_large_scrolled.scrolled_back());
+    }
+}
