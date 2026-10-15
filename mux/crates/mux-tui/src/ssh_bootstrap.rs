@@ -1,4 +1,4 @@
-//! `mtyx ssh <host>` — creates a workspace backed by a `cmuxd-remote`
+//! `mtyx ssh <host>` — creates a workspace backed by a `mtyxd-remote`
 //! session over SSH (see `mux_core::remote_pty`).
 //!
 //! This is where the Go-toolchain-and-repo-layout knowledge lives, kept
@@ -6,7 +6,7 @@
 //! remote's OS/arch, cache the result locally, then ask the *running*
 //! `mtyx` session (over the control socket, like every other verb) to
 //! open a remote workspace with that binary. Uploading it to the remote
-//! host and speaking `cmuxd-remote`'s wire protocol both happen
+//! host and speaking `mtyxd-remote`'s wire protocol both happen
 //! server-side in `mux_core::remote_pty` — this module only gets a local
 //! binary path onto disk and makes one socket call.
 
@@ -109,7 +109,7 @@ fn ensure_remote_binary(host: &str) -> anyhow::Result<PathBuf> {
     // -ldflags (below), so a cache entry from an older/newer mtyx must
     // not be reused — it would run a daemon whose wire protocol/config
     // expectations may not match the mtyx talking to it.
-    eprintln!("mtyx: building cmuxd-remote for {os}/{arch} (version {version})...");
+    eprintln!("mtyx: building mtyxd-remote for {os}/{arch} (version {version})...");
     build_mtyxd_remote(&os, &arch, &cache_path)?;
     write_stamp(&stamp_path_for(&cache_path), version)?;
     Ok(cache_path)
@@ -118,11 +118,11 @@ fn ensure_remote_binary(host: &str) -> anyhow::Result<PathBuf> {
 /// Cache filename for a cross-compiled daemon. Kept as a function so the
 /// naming scheme has a single home (and a unit test).
 fn cache_binary_name(os: &str, arch: &str) -> String {
-    format!("cmuxd-remote-{os}-{arch}")
+    format!("mtyxd-remote-{os}-{arch}")
 }
 
 /// The version stamp sibling of a cached daemon binary, e.g.
-/// `cmuxd-remote-linux-amd64.version`. A sidecar file rather than a
+/// `mtyxd-remote-linux-amd64.version`. A sidecar file rather than a
 /// version-suffixed binary name so a stale entry is overwritten in place
 /// instead of accumulating one never-reused binary per mtyx release.
 fn stamp_path_for(binary: &Path) -> PathBuf {
@@ -200,13 +200,13 @@ fn build_mtyxd_remote(os: &str, arch: &str, out: &Path) -> anyhow::Result<()> {
         // Issue #71: stamp the daemon with the version of the mtyx that
         // built it. `main.go` declares `var version = "dev"` purely as
         // the fallback for a bare `go build`; nothing else ever set it,
-        // so `cmuxd-remote version` reported "dev" on every host. The
+        // so `mtyxd-remote version` reported "dev" on every host. The
         // daemon is vendored in this repo and built from this checkout,
         // so mtyx's own version is its correct identity.
         .arg(format!("-ldflags=-X main.version={}", crate::VERSION))
         .arg("-o")
         .arg(out)
-        .arg("./cmd/cmuxd-remote")
+        .arg("./cmd/mtyxd-remote")
         .status()
         .map_err(|e| {
             anyhow::anyhow!("failed to run `go build` (is Go installed and on PATH?): {e}")
@@ -290,16 +290,16 @@ mod tests {
 
     #[test]
     fn cache_binary_name_is_platform_scoped() {
-        assert_eq!(cache_binary_name("linux", "amd64"), "cmuxd-remote-linux-amd64");
-        assert_eq!(cache_binary_name("darwin", "arm64"), "cmuxd-remote-darwin-arm64");
+        assert_eq!(cache_binary_name("linux", "amd64"), "mtyxd-remote-linux-amd64");
+        assert_eq!(cache_binary_name("darwin", "arm64"), "mtyxd-remote-darwin-arm64");
     }
 
     #[test]
     fn stamp_path_is_a_sibling_of_the_binary() {
-        let binary = Path::new("/tmp/cache/cmuxd-remote-linux-amd64");
+        let binary = Path::new("/tmp/cache/mtyxd-remote-linux-amd64");
         assert_eq!(
             stamp_path_for(binary),
-            PathBuf::from("/tmp/cache/cmuxd-remote-linux-amd64.version")
+            PathBuf::from("/tmp/cache/mtyxd-remote-linux-amd64.version")
         );
     }
 

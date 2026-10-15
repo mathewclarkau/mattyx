@@ -138,11 +138,11 @@ cargo run -p mux-tui -- ssh <host> --name my-remote-work
 ```
 
 Opens a workspace whose tab is a shell on `<host>` instead of local, backed by
-[`cmuxd-remote`](../../daemon/remote) (vendored from upstream cmux, unmodified) speaking
+[`mtyxd-remote`](../../daemon/remote) (vendored from upstream cmux, repurposed) speaking
 NDJSON RPC over an SSH-exec'd pipe (not a real allocated local pty — see
 `mux-core/src/remote_pty.rs`'s module doc for how `portable_pty`'s traits get
 implemented against that RPC channel instead). The first connection to a host
-builds and caches a `cmuxd-remote` binary for its OS/arch (needs Go on `PATH`;
+builds and caches a `mtyxd-remote` binary for its OS/arch (needs Go on `PATH`;
 cross-compiles via `GOOS`/`GOARCH`, no toolchain needed on the remote), uploads
 it, and starts it in **persistent** mode: it forks a detached background daemon
 on the remote that outlives both the SSH connection and this local process.
@@ -163,7 +163,7 @@ Two consequences:
 
 There's no verb to actually end a remote session (only detach it) — a stale one
 needs manual cleanup on the remote host (`rm -rf ~/.mattyx/daemon ~/.cache/mattyx`
-there, or `kill` its `cmuxd-remote serve --persistent-server` process).
+there, or `kill` its `mtyxd-remote serve --persistent-server` process).
 
 ## Platforms and XDG
 

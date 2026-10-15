@@ -7,7 +7,7 @@
 //! manifest's `fuel`, `memory_mib`, and `max_runtime_ms` budgets.
 //!
 //! Adapter model: thin. The plugin takes one user verb, decides which
-//! cmux_call(s) to make, and returns. The actual fleet decision
+//! mtyx_call(s) to make, and returns. The actual fleet decision
 //! (which roles to spawn, which prompts to send) is made by the
 //! calling operator, not by the plugin. This mirrors the
 //! `cmux_dispatch_worker_pane*` family of helpers in
@@ -20,13 +20,13 @@
 //! `mux/crates/mux-tui/src/plugin_host.rs::define_host_imports`):
 //!
 //! ```text
-//! cmux_token() -> u64            // high 32 = ptr, low 32 = len
-//! cmux_call(req_ptr, req_len, out_ptr, out_cap) -> i32   // returns resp len, or -1 on err
-//! cmux_log(level, ptr, len)       // 0=info, 1=warn, 2=error
+//! mtyx_token() -> u64            // high 32 = ptr, low 32 = len
+//! mtyx_call(req_ptr, req_len, out_ptr, out_cap) -> i32   // returns resp len, or -1 on err
+//! mtyx_log(level, ptr, len)       // 0=info, 1=warn, 2=error
 //! ```
 //!
 //! Plus standard WASI preview1 imports. We only import `proc_exit`
-//! (so `_cmux_plugin_main` returns with a real exit code) and the
+//! (so `_mtyx_plugin_main` returns with a real exit code) and the
 //! `args_get` / `args_sizes_get` family (so we can read argv[1] = the
 //! verb the user typed).
 //!
@@ -34,16 +34,26 @@
 //!
 //! The loader's `expected_request_id` starts at 0 and is never
 //! incremented (a known loader limitation; see the plugin's README).
-//! Each verb here therefore makes at most one `cmux_call` and uses
+//! Each verb here therefore makes at most one `mtyx_call` and uses
 //! `id: 0` in the request. A multi-call plugin would fail the
 //! second call with `StaleId`.
 //!
 //! ## Memory
 //!
-//! Two static byte buffers for the cmux_call request and response.
+//! Two static byte buffers for the mtyx_call request and response.
 //! Sized at the manifest's `memory_mib` default (64 MiB) minus what
 //! the rest of the WASM linear memory needs — well over what the
-//! JSON shapes below need.
+//! plugin ever needs to transfer.
+//!
+//! ## Building
+//!
+//! See `build.sh` in this directory:
+//!
+//! ```bash
+//! ./build.sh
+//! ```
+//!
+//! Generates `bin/fleet.wasm` (a wasm32-unknown-unknown cdylib).
 
 #![no_std]
 #![no_main]
@@ -59,21 +69,25 @@ use core::ptr;
 
 // ---------- mtyx host imports ----------
 
+#[link(wasm_import_module = "mtyx")]
 extern "C" {
     /// Returns a packed pointer/length to the per-call auth token
     /// bytes. The plugin does NOT need to free the memory; the host
     /// does after the call.
-    fn cmux_token() -> u64;
+    #[link_name = "token"]
+    fn mtyx_token() -> u64;
     /// Sends a JSON request to mtyx through the dispatcher. Returns
     /// the response byte length on success (>=0), or -1 on error
     /// (out-of-cap, invalid JSON, validation failure, etc.). On a
     /// validation failure the host writes a structured error response
     /// to `out_ptr` regardless, so the plugin can read it.
-    fn cmux_call(req_ptr: i32, req_len: i32, out_ptr: i32, out_cap: i32) -> i32;
+    #[link_name = "call"]
+    fn mtyx_call(req_ptr: i32, req_len: i32, out_ptr: i32, out_cap: i32) -> i32;
     /// Emits a log line tagged with the plugin name. Plugin-side
     /// stderr/stdout are not wired up; this is the only diagnostics
     /// channel.
-    fn cmux_log(level: i32, ptr: i32, len: i32);
+    #[link_name = "log"]
+    fn mtyx_log(level: i32, ptr: i32, len: i32);
 }
 
 // ---------- WASI preview1 imports ----------
@@ -84,6 +98,7 @@ extern "C" {
 // loader does not validate the import *count* (it wires all of
 // preview1 in), but for portability we only import the slice we use.
 
+#[link(wasm_import_module = "wasi_snapshot_preview1")]
 extern "C" {
     fn proc_exit(exit_code: i32);
     /// Writes the argument pointer array to `argv` (each slot is a
@@ -112,13 +127,13 @@ fn panic(_info: &PanicInfo) -> ! {
 
 // ---------- static buffers ----------
 
-/// Scratch space for the JSON request we send via `cmux_call`. Each
+/// Scratch space for the JSON request we send via `mtyx_call`. Each
 /// verb's request fits in a few hundred bytes (see the constants in
 /// `verb_request`); 512 is plenty with room to grow.
 static mut REQUEST_BUF: [u8; 512] = [0; 512];
 
 /// Scratch space for the JSON response we read back from
-/// `cmux_call`. Worst case is a `list-workspaces` JSON dump, which
+/// `mtyx_call`. Worst case is a `list-workspaces` JSON dump, which
 /// fits well under 8 KiB for a pifactory-sized fleet.
 static mut RESPONSE_BUF: [u8; 8192] = [0; 8192];
 
@@ -180,9 +195,9 @@ fn read_argv1(out: &mut [u8]) -> i32 {
 
 // ---------- verb dispatch ----------
 
-/// Dispatch the user verb to one cmux_call. Returns the cmux_call
+/// Dispatch the user verb to one mtyx_call. Returns the mtyx_call
 /// response length on success (>=0), or -1 if the verb is unknown or
-/// the call failed. On a successful cmux_call the response bytes are
+/// the call failed. On a successful mtyx_call the response bytes are
 /// in RESPONSE_BUF[0..len].
 fn dispatch(verb: &[u8]) -> i32 {
     if eq(verb, b"ping") {
@@ -238,7 +253,7 @@ fn call_close_workspace() -> i32 {
     // The plugin is single-call; we close by name (the "fleet lead"
     // workspace, the conventional first member of a deployed fleet).
     // Multi-workspace rollback is a manifest-side concern; the loader
-    // limit on cmux_call count (one per invocation) prevents a true
+    // limit on mtyx_call count (one per invocation) prevents a true
     // multi-call rollback without the loader-side fix.
     const REQ: &[u8] = b"{\"id\":0,\"verb\":\"close-workspace\",\"args\":{\"name\":\"fleet-scout\"}}";
     send_request(REQ)
@@ -259,7 +274,7 @@ fn send_request(req: &[u8]) -> i32 {
 
 fn send_request_bytes(req_len: usize) -> i32 {
     let resp_len = unsafe {
-        cmux_call(
+        mtyx_call(
             REQUEST_BUF.as_ptr() as i32,
             req_len as i32,
             RESPONSE_BUF.as_ptr() as i32,
@@ -267,7 +282,7 @@ fn send_request_bytes(req_len: usize) -> i32 {
         )
     };
     if resp_len < 0 {
-        log_error(b"cmux_call failed");
+        log_error(b"mtyx_call failed");
         return -1;
     }
     log_info_bytes(unsafe { RESPONSE_BUF.as_ptr() }, resp_len as usize);
@@ -290,22 +305,22 @@ fn eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn log_error(msg: &[u8]) {
-    unsafe { cmux_log(2, msg.as_ptr() as i32, msg.len() as i32) }
+    unsafe { mtyx_log(2, msg.as_ptr() as i32, msg.len() as i32) }
 }
 
 fn log_info_bytes(ptr: *const u8, len: usize) {
-    unsafe { cmux_log(0, ptr as i32, len as i32) }
+    unsafe { mtyx_log(0, ptr as i32, len as i32) }
 }
 
 /// Read the mtyx per-call auth token into `out`. The host mints a
 /// fresh token at every plugin invocation (see
-/// `plugin_host::mint_token`) and validates every cmux_call against
+/// `plugin_host::mint_token`) and validates every mtyx_call against
 /// it; the plugin doesn't *need* the token (the host validates
 /// each call) but we log it on startup so a developer running the
 /// plugin under `wasmtime` directly can confirm the token mint is
 /// firing.
 fn read_token_into(out: &mut [u8; 64]) -> usize {
-    let packed = unsafe { cmux_token() };
+    let packed = unsafe { mtyx_token() };
     let ptr = (packed >> 32) as usize as *const u8;
     let len = (packed & 0xFFFF_FFFF) as usize;
     let n = if len > out.len() { out.len() } else { len };
@@ -317,17 +332,18 @@ fn read_token_into(out: &mut [u8; 64]) -> usize {
 
 // ---------- entrypoint ----------
 
-/// Plugin entrypoint. The mtyx loader tries `_cmux_plugin_main`
-/// first (project convention) and falls back to `_start` if absent
+/// Plugin entrypoint. The mtyx loader tries `_mtyx_plugin_main`
+/// first (project convention) and falls back to `_cmux_plugin_main`
+/// and `_start` if absent
 /// (`mux/crates/mux-tui/src/plugin_host.rs::invoke`). Exporting
-/// `_cmux_plugin_main` matches what the README documents.
+/// `_mtyx_plugin_main` matches what the README documents.
 ///
 /// Returns nothing (`()`) — the loader's typed signature is
 /// `fn() -> ()`. We use `proc_exit` to surface errors so the
 /// process exit code matches the failure.
 #[no_mangle]
-pub extern "C" fn _cmux_plugin_main() {
-    // Surface the per-call token to cmux_log so a developer
+pub extern "C" fn _mtyx_plugin_main() {
+    // Surface the per-call token to mtyx_log so a developer
     // running the plugin outside of `mtyx` can confirm token mint
     // is firing. The token itself is 32 hex chars; the loader
     // produces it from `mint_token()` and discards it after this
@@ -349,9 +365,15 @@ pub extern "C" fn _cmux_plugin_main() {
     unsafe { proc_exit(0) }
 }
 
+/// Compatibility entrypoint for loaders expecting `_cmux_plugin_main`.
+#[no_mangle]
+pub extern "C" fn _cmux_plugin_main() {
+    _mtyx_plugin_main()
+}
+
 // Fallback entrypoint for WASI runtimes that expect `_start`. Same
-// body as `_cmux_plugin_main`.
+// body as `_mtyx_plugin_main`.
 #[no_mangle]
 pub extern "C" fn _start() {
-    _cmux_plugin_main()
+    _mtyx_plugin_main()
 }

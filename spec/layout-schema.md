@@ -80,7 +80,7 @@ ids are session-local and never stable across restarts.
 |---|---|---|
 | `pty` | `name?`, `cwd?`, `command?`, `env?` | `command` is the exact argv the tab was spawned with, recorded **at spawn time**. `null` for a default login shell. `env` is a map of injected variables. |
 | `browser` | `name?`, `url` | the browser tab's URL. |
-| `remote` | `name?`, `host`, `slot`, `session_id`, `local_binary_path` | a `cmuxd-remote` session (see below for the reattach limits). |
+| `remote` | `name?`, `host`, `slot`, `session_id`, `local_binary_path` | a `mtyxd-remote` session (see below for the reattach limits). |
 
 ### Env exclusion list
 
@@ -141,7 +141,7 @@ closing the partial workspace.
 - Browser tabs re-open their URL (the page state itself — logins,
   scroll — is not captured).
 - **Remote tabs (R3):** only a workspace's *first* tab can reattach to
-  the same `cmuxd-remote` session (via the `new-remote` workspace
+  the same `mtyxd-remote` session (via the `new-remote` workspace
   bootstrap — the inherited `persist.rs` limitation). A remote tab
   anywhere else downgrades to a local shell with a loud
   `MuxEvent::Status` rather than failing silently. If the recorded

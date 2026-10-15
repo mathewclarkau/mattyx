@@ -83,6 +83,7 @@ pub struct TabView {
     /// Last agent message (issue #75): the `--message` free-text from
     /// the surface's latest applied agent report. The status string
     /// itself is derivable (`agent_state` or "unknown").
+    #[allow(dead_code)]
     pub agent_message: Option<String>,
     pub kind: SurfaceKind,
     pub browser_source: Option<BrowserSource>,

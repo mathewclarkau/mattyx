@@ -32,6 +32,7 @@ set -euo pipefail
 # directly (not sourced — see scripts/cmux-panel-lib.sh:23 for the
 # sourced-library caveat).
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -d "$HOME/.cargo/bin" ] && export PATH="$HOME/.cargo/bin:$PATH"
 cd "$HERE"
 
 # Sanity-check the toolchain before doing any work. Failing fast
@@ -69,8 +70,8 @@ cargo build \
 
 # Cargo's wasm32 cdylib output is named after the crate, not the
 # binary (we have no [[bin]] in Cargo.toml — only a [lib]). The
-# output is target/wasm32-unknown-unknown/release/cmux_pifactory_fleet.wasm.
-ARTIFACT="$HERE/target/wasm32-unknown-unknown/release/cmux_pifactory_fleet.wasm"
+# output is target/wasm32-unknown-unknown/release/mtyx_pifactory_fleet.wasm.
+ARTIFACT="$HERE/target/wasm32-unknown-unknown/release/mtyx_pifactory_fleet.wasm"
 if [[ ! -f "$ARTIFACT" ]]; then
     echo "build.sh: expected artifact missing at $ARTIFACT" >&2
     echo "  (cargo's cdylib output name may have changed; inspect target/)" >&2

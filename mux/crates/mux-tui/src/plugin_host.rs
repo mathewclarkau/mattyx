@@ -4,9 +4,9 @@
 //! design spec at `spec/mtyx-plugin-execution.md`:
 //!
 //!   - Plugin WASM is loaded from the manifest's `entry` path.
-//!   - Three host imports are exposed to the plugin: `cmux_token`,
-//!     `cmux_call`, `cmux_log`.
-//!   - Every `cmux_call` request carries a per-call auth token that was
+//!   - Three host imports are exposed to the plugin: `mtyx_token`,
+//!     `mtyx_call`, `mtyx_log`.
+//!   - Every `mtyx_call` request carries a per-call auth token that was
 //!     minted when the plugin was invoked; the token is scoped to
 //!     (plugin_name, verb_allowlist, socket_capability).
 //!   - Fuel + wall-clock timeout are enforced.
@@ -18,17 +18,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use wasmtime::{Config, Engine, Instance, Linker, Module, Store, Trap};
 use wasmtime_wasi::preview1::{add_to_linker_sync, WasiP1Ctx};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
-use crate::plugin::{self, Capabilities, PluginEntry};
+use crate::plugin::{Capabilities, PluginEntry};
 
 /// Per-call auth token. Minted by `PluginCall::invoke`, validated by
-/// `validate_and_forward` on every `cmux_call` request.
+/// `validate_and_forward` on every `mtyx_call` request.
 ///
 /// A token is a 32-byte random value hex-encoded; the mtyx side keeps a
 /// `HashMap<token, TokenContext>` keyed by token and removes the entry
@@ -43,9 +43,10 @@ impl CallToken {
 }
 
 /// Per-token metadata captured at mint time. The forward step uses
-/// this to validate every cmux_call request without re-reading the
+/// this to validate every mtyx_call request without re-reading the
 /// registry on the hot path.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TokenContext {
     pub plugin_name: String,
     pub verb_allowlist: Vec<String>,
@@ -71,7 +72,7 @@ impl SocketCapability {
     }
 }
 
-/// JSON shape the plugin sends in `cmux_call`.
+/// JSON shape the plugin sends in `mtyx_call`.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct PluginRequest {
     pub id: u64,
@@ -80,7 +81,7 @@ pub struct PluginRequest {
     pub args: serde_json::Value,
 }
 
-/// JSON shape mtyx returns from `cmux_call`.
+/// JSON shape mtyx returns from `mtyx_call`.
 #[derive(Debug, Serialize)]
 pub struct PluginResponse {
     pub id: u64,
@@ -91,16 +92,22 @@ pub struct PluginResponse {
     pub error: Option<String>,
 }
 
-/// Trait the host uses to forward a validated `cmux_call` request to the
+/// Trait the host uses to forward a validated `mtyx_call` request to the
 /// real mtyx control socket. Production wiring in `main.rs` builds an
 /// adapter that writes a JSON request to the mux-core socket and reads
 /// the response; tests can supply an in-memory mock.
-pub trait CmuxDispatcher: Send + Sync {
+pub trait MtyxDispatcher: Send + Sync {
     fn dispatch(&self, request_json: String) -> Result<String, String>;
 }
 
+/// Backwards compatibility trait alias for `MtyxDispatcher`.
+#[allow(dead_code)]
+pub trait CmuxDispatcher: MtyxDispatcher {}
+impl<T: MtyxDispatcher + ?Sized> CmuxDispatcher for T {}
+
 /// Errors a plugin invocation can produce.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum PluginError {
     EntryNotFound(String),
     InvalidManifest(String),
@@ -120,7 +127,7 @@ impl std::fmt::Display for PluginError {
         match self {
             Self::EntryNotFound(p) => write!(f, "plugin entry not found: {p}"),
             Self::InvalidManifest(m) => write!(f, "invalid manifest: {m}"),
-            Self::UnknownToken => write!(f, "plugin cmux_call had unknown token"),
+            Self::UnknownToken => write!(f, "plugin mtyx_call had unknown token"),
             Self::VerbNotAllowed(v) => write!(f, "verb {v:?} not in plugin allowlist"),
             Self::WriteBlocked(v) => write!(f, "verb {v:?} requires socket=write"),
             Self::FuelExhausted => write!(f, "plugin exhausted fuel"),
@@ -142,7 +149,7 @@ pub struct HostState {
     pub wasi: WasiP1Ctx,
     pub token: CallToken,
     pub token_ctx: TokenContext,
-    pub dispatcher: Arc<dyn CmuxDispatcher>,
+    pub dispatcher: Arc<dyn MtyxDispatcher>,
     pub expected_request_id: u64,
 }
 
@@ -151,7 +158,7 @@ impl HostState {
         wasi: WasiP1Ctx,
         token: CallToken,
         token_ctx: TokenContext,
-        dispatcher: Arc<dyn CmuxDispatcher>,
+        dispatcher: Arc<dyn MtyxDispatcher>,
     ) -> Self {
         Self { wasi, token, token_ctx, dispatcher, expected_request_id: 0 }
     }
@@ -270,13 +277,13 @@ pub fn mint_token() -> CallToken {
     CallToken(format!("{:032x}", raw))
 }
 
-/// Validate + forward a `cmux_call` request to the dispatcher. Pulled
+/// Validate + forward a `mtyx_call` request to the dispatcher. Pulled
 /// out of the Linker closure for unit-testability.
 pub fn validate_and_forward(
     request_json: &str,
     expected_id: u64,
     token_ctx: &TokenContext,
-    dispatcher: Arc<dyn CmuxDispatcher>,
+    dispatcher: Arc<dyn MtyxDispatcher>,
 ) -> Result<String, PluginError> {
     let req: PluginRequest = serde_json::from_str(request_json)
         .map_err(|e| PluginError::InvalidRequest(e.to_string()))?;
@@ -298,143 +305,133 @@ pub fn validate_and_forward(
 /// an indirect call into the dispatcher; we work around that by
 /// copying the small pieces we need out of caller.data() first.
 pub fn define_host_imports(linker: &mut Linker<HostState>) -> Result<(), String> {
-    // cmux_token() -> u64 (high 32 bits = ptr, low 32 = len, both in
-    // plugin's linear memory; plugin unpacks). Token string lives in
-    // static-ish storage inside the HostState; we use a Vec<u8> that
-    // the plugin reads via ptr+len and that we leak for the call's
-    // duration.
-    linker
-        .func_wrap("mtyx", "token", |mut caller: wasmtime::Caller<'_, HostState>| -> u64 {
-            let token = caller.data().token.as_str().to_string();
-            let bytes = token.into_bytes();
-            let ptr = bytes.as_ptr() as u32;
-            let len = bytes.len() as u32;
-            std::mem::forget(bytes);
-            ((ptr as u64) << 32) | (len as u64)
-        })
-        .map_err(|e| format!("failed to define cmux_token: {e}"))?;
+    for ns in ["mtyx", "cmux"] {
+        // token() -> u64 (high 32 bits = ptr, low 32 = len, both in
+        // plugin's linear memory; plugin unpacks). Token string lives in
+        // static-ish storage inside the HostState; we use a Vec<u8> that
+        // the plugin reads via ptr+len and that we leak for the call's
+        // duration.
+        linker
+            .func_wrap(ns, "token", |caller: wasmtime::Caller<'_, HostState>| -> u64 {
+                let token = caller.data().token.as_str().to_string();
+                let bytes = token.into_bytes();
+                let ptr = bytes.as_ptr() as u32;
+                let len = bytes.len() as u32;
+                std::mem::forget(bytes);
+                ((ptr as u64) << 32) | (len as u64)
+            })
+            .map_err(|e| format!("failed to define {ns}_token: {e}"))?;
 
-    // cmux_log(level: i32, ptr: i32, len: i32) -> ()
-    linker
-        .func_wrap(
-            "mtyx",
-            "log",
-            |mut caller: wasmtime::Caller<'_, HostState>, level: i32, ptr: i32, len: i32| {
-                let mem = match caller.get_export("memory") {
-                    Some(wasmtime::Extern::Memory(m)) => m,
-                    _ => return,
-                };
-                let data = mem.data(&caller);
-                let slice = match data.get(ptr as usize..(ptr + len) as usize) {
-                    Some(s) => s,
-                    None => return,
-                };
-                let msg = match std::str::from_utf8(slice) {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                let prefix = match level {
-                    0 => "info",
-                    1 => "warn",
-                    2 => "error",
-                    _ => "debug",
-                };
-                eprintln!("[plugin:{}] {}: {}", caller.data().token_ctx.plugin_name, prefix, msg);
-            },
-        )
-        .map_err(|e| format!("failed to define cmux_log: {e}"))?;
+        // log(level: i32, ptr: i32, len: i32) -> ()
+        linker
+            .func_wrap(
+                ns,
+                "log",
+                |mut caller: wasmtime::Caller<'_, HostState>, level: i32, ptr: i32, len: i32| {
+                    let mem = match caller.get_export("memory") {
+                        Some(wasmtime::Extern::Memory(m)) => m,
+                        _ => return,
+                    };
+                    let data = mem.data(&caller);
+                    let slice = match data.get(ptr as usize..(ptr + len) as usize) {
+                        Some(s) => s,
+                        None => return,
+                    };
+                    let msg = match std::str::from_utf8(slice) {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    let prefix = match level {
+                        0 => "info",
+                        1 => "warn",
+                        2 => "error",
+                        _ => "debug",
+                    };
+                    eprintln!("[plugin:{}] {}: {}", caller.data().token_ctx.plugin_name, prefix, msg);
+                },
+            )
+            .map_err(|e| format!("failed to define {ns}_log: {e}"))?;
 
-    // cmux_call(req_ptr, req_len, out_ptr, out_cap) -> i32 (response length).
-    linker
-        .func_wrap(
-            "mtyx",
-            "call",
-            |mut caller: wasmtime::Caller<'_, HostState>,
-             req_ptr: i32,
-             req_len: i32,
-             out_ptr: i32,
-             out_cap: i32|
-             -> i32 {
-                // Pull everything we need out of caller.data() while we
-                // have a shared borrow, then drop it before doing the
-                // validate-and-forward (which mutably borrows caller
-                // again to write the response).
-                let (request_json, expected_id, token_ctx, dispatcher) = {
-                    // Borrow the data first, then the memory separately
-                    // — wasmtime's Caller API forbids simultaneous &mut
-                    // and & borrows of caller.
-                    let state = caller.data();
-                    let (expected_id, token_ctx, dispatcher) = (
-                        state.expected_request_id,
-                        state.token_ctx.clone(),
-                        state.dispatcher.clone(),
-                    );
-                    // Drop the &T borrow before getting &mut access via
-                    // get_export.
-                    drop(state);
+        // call(req_ptr, req_len, out_ptr, out_cap) -> i32 (response length).
+        linker
+            .func_wrap(
+                ns,
+                "call",
+                |mut caller: wasmtime::Caller<'_, HostState>,
+                 req_ptr: i32,
+                 req_len: i32,
+                 out_ptr: i32,
+                 out_cap: i32|
+                 -> i32 {
+                    let (request_json, expected_id, token_ctx, dispatcher) = {
+                        let (expected_id, token_ctx, dispatcher) = {
+                            let state = caller.data();
+                            (
+                                state.expected_request_id,
+                                state.token_ctx.clone(),
+                                state.dispatcher.clone(),
+                            )
+                        };
+                        let mem = match caller.get_export("memory") {
+                            Some(wasmtime::Extern::Memory(m)) => m,
+                            _ => return -1,
+                        };
+                        let raw =
+                            match mem.data(&caller).get(req_ptr as usize..(req_ptr + req_len) as usize)
+                            {
+                                Some(d) => d.to_vec(),
+                                None => return -1,
+                            };
+                        let s = match std::str::from_utf8(&raw) {
+                            Ok(s) => s.to_string(),
+                            Err(_) => return -1,
+                        };
+                        (s, expected_id, token_ctx, dispatcher)
+                    };
+                    let response_json = match validate_and_forward(
+                        &request_json,
+                        expected_id,
+                        &token_ctx,
+                        dispatcher,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let resp = PluginResponse {
+                                id: expected_id,
+                                ok: false,
+                                data: None,
+                                error: Some(e.to_string()),
+                            };
+                            serde_json::to_string(&resp).unwrap_or_else(|_| {
+                                format!(
+                                    r#"{{"id":{},"ok":false,"error":"serialization"}}"#,
+                                    expected_id
+                                )
+                            })
+                        }
+                    };
                     let mem = match caller.get_export("memory") {
                         Some(wasmtime::Extern::Memory(m)) => m,
                         _ => return -1,
                     };
-                    let raw =
-                        match mem.data(&caller).get(req_ptr as usize..(req_ptr + req_len) as usize)
-                        {
-                            Some(d) => d.to_vec(),
+                    let resp_bytes = response_json.into_bytes();
+                    let len = resp_bytes.len() as i32;
+                    if len > out_cap {
+                        return -1;
+                    }
+                    {
+                        let mem_data = mem.data_mut(&mut caller);
+                        let dst = match mem_data.get_mut(out_ptr as usize..(out_ptr + len) as usize) {
+                            Some(d) => d,
                             None => return -1,
                         };
-                    let s = match std::str::from_utf8(&raw) {
-                        Ok(s) => s.to_string(),
-                        Err(_) => return -1,
-                    };
-                    (s, expected_id, token_ctx, dispatcher)
-                };
-                let response_json = match validate_and_forward(
-                    &request_json,
-                    expected_id,
-                    &token_ctx,
-                    dispatcher,
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        // Convert PluginError into a structured
-                        // PluginResponse so the plugin can read its
-                        // own failures.
-                        let resp = PluginResponse {
-                            id: expected_id,
-                            ok: false,
-                            data: None,
-                            error: Some(e.to_string()),
-                        };
-                        serde_json::to_string(&resp).unwrap_or_else(|_| {
-                            format!(
-                                r#"{{"id":{},"ok":false,"error":"serialization"}}"#,
-                                expected_id
-                            )
-                        })
+                        dst.copy_from_slice(&resp_bytes);
                     }
-                };
-                // Write the response back into the plugin's memory.
-                let mem = match caller.get_export("memory") {
-                    Some(wasmtime::Extern::Memory(m)) => m,
-                    _ => return -1,
-                };
-                let resp_bytes = response_json.into_bytes();
-                let len = resp_bytes.len() as i32;
-                if len > out_cap {
-                    return -1;
-                }
-                {
-                    let mem_data = mem.data_mut(&mut caller);
-                    let dst = match mem_data.get_mut(out_ptr as usize..(out_ptr + len) as usize) {
-                        Some(d) => d,
-                        None => return -1,
-                    };
-                    dst.copy_from_slice(&resp_bytes);
-                }
-                len
-            },
-        )
-        .map_err(|e| format!("failed to define cmux_call: {e}"))?;
+                    len
+                },
+            )
+            .map_err(|e| format!("failed to define {ns}_call: {e}"))?;
+    }
 
     Ok(())
 }
@@ -460,7 +457,7 @@ pub fn invoke(
     cap: &Capabilities,
     plugin_data_dir: &Path,
     args: &[String],
-    dispatcher: Arc<dyn CmuxDispatcher>,
+    dispatcher: Arc<dyn MtyxDispatcher>,
 ) -> PluginResult {
     let token = mint_token();
     let token_ctx = TokenContext {
@@ -489,9 +486,10 @@ pub fn invoke(
     // Project-conventional entrypoint first, fall back to standard WASM `_start`.
     let func_result = instance
         .get_typed_func::<(), ()>(&mut store, "_mtyx_plugin_main")
+        .or_else(|_| instance.get_typed_func::<(), ()>(&mut store, "_cmux_plugin_main"))
         .or_else(|_| instance.get_typed_func::<(), ()>(&mut store, "_start"))
         .map_err(|e| {
-            PluginError::InstantiationFailed(format!("missing _mtyx_plugin_main or _start: {e}"))
+            PluginError::InstantiationFailed(format!("missing _mtyx_plugin_main, _cmux_plugin_main, or _start: {e}"))
         })
         .and_then(|f| {
             f.call(&mut store, ()).map_err(|e| {
@@ -512,8 +510,8 @@ pub fn invoke(
     func_result.map(|_| String::new())
 }
 
-/// Production `CmuxDispatcher` implementation that writes
-/// `cmux_call` requests to the real mtyx control socket and reads
+/// Production `MtyxDispatcher` implementation that writes
+/// `mtyx_call` requests to the real mtyx control socket and reads
 /// back the response. Constructed per-invocation so the socket can be
 /// lazy-opened (errors surface as `PluginError::Trap` with the
 /// underlying connect/write/read error).
@@ -527,7 +525,7 @@ impl SocketDispatcher {
     }
 }
 
-impl CmuxDispatcher for SocketDispatcher {
+impl MtyxDispatcher for SocketDispatcher {
     fn dispatch(&self, request_json: String) -> Result<String, String> {
         use std::io::{BufRead, BufReader, Write};
         // Connect + write the request + read one line back. Modeled on
@@ -550,6 +548,7 @@ impl CmuxDispatcher for SocketDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin;
 
     #[test]
     fn capabilities_default_matches_spec() {
@@ -619,7 +618,7 @@ mod tests {
     struct MockDispatcher {
         captured: std::sync::Mutex<Vec<String>>,
     }
-    impl CmuxDispatcher for MockDispatcher {
+    impl MtyxDispatcher for MockDispatcher {
         fn dispatch(&self, request_json: String) -> Result<String, String> {
             self.captured.lock().unwrap().push(request_json.clone());
             let req: serde_json::Value = serde_json::from_str(&request_json).unwrap();

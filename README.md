@@ -46,7 +46,7 @@ Built by [`.github/workflows/release.yml`](./.github/workflows/release.yml) from
   confirmed by patching around both and hitting more.
 - **Go** is only needed for [remote/SSH workspaces](./mux/docs/getting-started.md#remote-ssh-workspaces) — `mtyx
   ssh <host>` shells out to `go build` on first connection to a given host, to cross-compile the vendored
-  `cmuxd-remote` daemon for that host's OS/arch. Everything else builds and runs without Go installed.
+  `mtyxd-remote` daemon for that host's OS/arch. Everything else builds and runs without Go installed.
 
 #### Clone, build, and put it on your `PATH`
 
@@ -112,12 +112,12 @@ What's missing before this feels like `mtyx` rather than a bare multiplexer:
    Verified via a real kill-and-restart of the compiled binary, not just
    library tests — see `mux/docs/getting-started.md`'s "Session persistence".
 5. ~~Remote/SSH workspaces~~ — done. `mtyx ssh <host>` opens a workspace
-   backed by upstream's existing Go `cmuxd-remote` daemon (vendored unmodified
-   in `daemon/remote/`, already cross-compiles for `linux/{amd64,arm64}`) instead
-   of a local shell. `mux-core/src/remote_pty.rs` implements `portable_pty`'s
+   backed by the Go `mtyxd-remote` daemon (vendored in `daemon/remote/`,
+   already cross-compiles for `linux/{amd64,arm64}`) instead of a local shell.
+   `mux-core/src/remote_pty.rs` implements `portable_pty`'s
    `MasterPty`/`SlavePty`/`Child` traits against an SSH-exec'd NDJSON RPC pipe —
    no real local pty involved. The first connection to a host builds/uploads/
-   starts `cmuxd-remote` in persistent mode, so it survives both the SSH
+   starts `mtyxd-remote` in persistent mode, so it survives both the SSH
    connection and the local `mtyx` process dying; closing the tab detaches
    rather than kills, and restarting the session daemon reattaches
    automatically for a workspace's first tab (same mechanism as #4). Verified

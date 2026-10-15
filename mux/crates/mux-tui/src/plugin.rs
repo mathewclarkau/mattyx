@@ -199,7 +199,7 @@ pub struct ManifestPlugin {
 /// 64MB memory, 1M fuel, and a 5s wall-clock timeout per call.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Capabilities {
-    /// Socket access scope: `"off"` (no cmux_call), `"read"` (only
+    /// Socket access scope: `"off"` (no mtyx_call), `"read"` (only
     /// read-only verbs), `"write"` (read + mutating verbs).
     pub socket: Option<String>,
     /// WASI preopen directory paths the plugin can access. Each entry
@@ -454,6 +454,7 @@ fn format_list_output(reg: &Registry, json: bool) -> Result<String, String> {
 
 /// Resolve the mtyx data base dir (XDG_DATA_HOME or ~/.local/share/mattyx).
 /// Public so `main.rs` can call it from the `mtyx <plugin>` argv path.
+#[allow(dead_code)]
 pub fn base_dir_public() -> Result<std::path::PathBuf, String> {
     base_dir()
 }
@@ -472,8 +473,8 @@ pub fn lookup_plugin(name: &str) -> Result<(PluginEntry, std::path::PathBuf), St
     if !entry.enabled {
         return Err(format!("plugin {name:?} is disabled (run `mtyx plugin enable {name}`)"));
     }
-    if !entry.verbs.iter().any(|v| v == "cmux_call") {
-        return Err(format!("plugin {name:?} manifest does not declare the cmux_call verb"));
+    if !entry.verbs.iter().any(|v| v == "mtyx_call" || v == "cmux_call") {
+        return Err(format!("plugin {name:?} manifest does not declare the mtyx_call verb"));
     }
     let dir = plugins_dir(&base).join(&entry.name);
     Ok((entry, dir))
@@ -1260,8 +1261,8 @@ mod tests {
         assert_eq!(plugin.name, "pifactory-fleet");
         assert_eq!(plugin.entry, "bin/fleet.wasm");
         assert!(
-            plugin.verbs.iter().any(|v| v == "cmux_call"),
-            "pifactory-fleet manifest must declare the cmux_call verb"
+            plugin.verbs.iter().any(|v| v == "mtyx_call" || v == "cmux_call"),
+            "pifactory-fleet manifest must declare the mtyx_call verb"
         );
         for verb in ["ping", "status", "deploy", "dispatch", "rollback"] {
             assert!(
@@ -1269,7 +1270,7 @@ mod tests {
                 "pifactory-fleet manifest must expose {verb:?} as a plugin verb"
             );
         }
-        // cmux_call verbs the plugin forwards to the control socket.
+        // mtyx_call verbs the plugin forwards to the control socket.
         for verb in [
             "identify",
             "list-workspaces",
@@ -1280,7 +1281,7 @@ mod tests {
         ] {
             assert!(
                 plugin.verbs.iter().any(|v| v == verb),
-                "pifactory-fleet manifest must declare {verb:?} in its cmux_call allowlist"
+                "pifactory-fleet manifest must declare {verb:?} in its mtyx_call allowlist"
             );
         }
 

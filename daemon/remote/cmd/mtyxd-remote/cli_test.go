@@ -45,7 +45,7 @@ func captureStdout(t *testing.T, fn func()) string {
 
 func makeShortUnixSocketPath(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "cmuxd-")
+	dir, err := os.MkdirTemp("/tmp", "mtyxd-")
 	if err != nil {
 		t.Fatalf("mkdtemp: %v", err)
 	}
@@ -655,9 +655,9 @@ func TestBusyboxArgv0Detection(t *testing.T) {
 	if base2 != "mtyx" {
 		t.Fatalf("expected base 'mtyx', got %q", base2)
 	}
-	base3 := filepath.Base("cmuxd-remote")
+	base3 := filepath.Base("mtyxd-remote")
 	if base3 == "mtyx" {
-		t.Fatalf("cmuxd-remote should not match mtyx")
+		t.Fatalf("mtyxd-remote should not match mtyx")
 	}
 }
 

@@ -36,7 +36,8 @@ pub struct LayoutDocument {
     pub schema_version: u32,
     /// The mtyx build that produced the file (`mux_core::VERSION`, never
     /// `CARGO_PKG_VERSION` — see issue #71). Informational; not gated.
-    pub cmux_version: String,
+    #[serde(alias = "cmux_version")]
+    pub mtyx_version: String,
     pub workspace: LayoutWorkspace,
 }
 
@@ -259,7 +260,7 @@ pub fn capture_workspace(state: &State, ws_idx: usize) -> anyhow::Result<LayoutD
         .ok_or_else(|| anyhow::anyhow!("no workspace at index {ws_idx}"))?;
     Ok(LayoutDocument {
         schema_version: LAYOUT_SCHEMA_VERSION,
-        cmux_version: crate::VERSION.to_string(),
+        mtyx_version: crate::VERSION.to_string(),
         workspace: LayoutWorkspace {
             name: ws.name.clone(),
             color: ws.color.map(|c| format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b)),
@@ -396,12 +397,18 @@ mod tests {
 
         let doc = mux.with_state(|s| capture_workspace(s, 0)).unwrap();
         assert_eq!(doc.schema_version, LAYOUT_SCHEMA_VERSION);
-        assert_eq!(doc.cmux_version, crate::VERSION);
+        assert_eq!(doc.mtyx_version, crate::VERSION);
 
         let json = serde_json::to_string_pretty(&doc).unwrap();
         assert!(json.contains("\"schema_version\": 1"), "json was: {json}");
+        assert!(json.contains("\"mtyx_version\":"), "json was: {json}");
         let restored = LayoutDocument::from_json_str(&json).unwrap();
         assert_eq!(restored, doc);
+
+        // Verify backwards-compatibility alias for legacy cmux_version field
+        let legacy_json = json.replace("\"mtyx_version\":", "\"cmux_version\":");
+        let restored_legacy = LayoutDocument::from_json_str(&legacy_json).unwrap();
+        assert_eq!(restored_legacy.mtyx_version, doc.mtyx_version);
     }
 
     // 2. `layout_doc_rejects_unknown_schema_version`
@@ -430,7 +437,7 @@ mod tests {
     fn layout_doc_rejects_leaf_index_out_of_range() {
         let doc = LayoutDocument {
             schema_version: LAYOUT_SCHEMA_VERSION,
-            cmux_version: crate::VERSION.to_string(),
+            mtyx_version: crate::VERSION.to_string(),
             workspace: LayoutWorkspace {
                 name: "bad".into(),
                 color: None,
@@ -457,7 +464,7 @@ mod tests {
     fn layout_doc_rejects_unknown_tab_kind() {
         let json = r#"{
             "schema_version": 1,
-            "cmux_version": "test",
+            "mtyx_version": "test",
             "workspace": {
                 "name": "w",
                 "active_screen": 0,
@@ -508,9 +515,9 @@ mod tests {
         }
     }
 
-    // 6. `layout_doc_capture_records_command_and_env_dropping_cmux_auto_vars`
+    // 6. `layout_doc_capture_records_command_and_env_dropping_mtyx_auto_vars`
     #[test]
-    fn layout_doc_capture_records_command_and_env_dropping_cmux_auto_vars() {
+    fn layout_doc_capture_records_command_and_env_dropping_mtyx_auto_vars() {
         let mux = test_mux();
         let s1 = mux.new_workspace(Some("fleet".into()), None).unwrap();
         let pane = pane_of(&mux, s1.id);
@@ -592,7 +599,7 @@ mod tests {
     fn sample_doc() -> LayoutDocument {
         LayoutDocument {
             schema_version: LAYOUT_SCHEMA_VERSION,
-            cmux_version: crate::VERSION.to_string(),
+            mtyx_version: crate::VERSION.to_string(),
             workspace: LayoutWorkspace {
                 name: "sample".into(),
                 color: None,

@@ -138,10 +138,10 @@ func main() {
 
 func shouldRunCLIForInvocation(argv0 string, args []string) bool {
 	base := filepath.Base(argv0)
-	if base == "mtyx" {
+	if base == "mtyx" || base == "cmux" {
 		return true
 	}
-	if !strings.HasPrefix(base, "cmuxd-remote") || len(args) == 0 {
+	if (!strings.HasPrefix(base, "mtyxd-remote") && !strings.HasPrefix(base, "cmuxd-remote")) || len(args) == 0 {
 		return false
 	}
 	return !isDaemonEntryCommand(args[0])
@@ -250,11 +250,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 func usage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "Usage:")
-	_, _ = fmt.Fprintln(w, "  cmuxd-remote version")
-	_, _ = fmt.Fprintln(w, "  cmuxd-remote serve --stdio")
-	_, _ = fmt.Fprintln(w, "  cmuxd-remote serve --stdio --persistent --slot <slot>")
-	_, _ = fmt.Fprintln(w, "  cmuxd-remote serve --ws --auth-lease-file <path> [--rpc-auth-lease-file <path>] [--listen 127.0.0.1:7777]")
-	_, _ = fmt.Fprintln(w, "  cmuxd-remote cli <command> [args...]")
+	_, _ = fmt.Fprintln(w, "  mtyxd-remote version")
+	_, _ = fmt.Fprintln(w, "  mtyxd-remote serve --stdio")
+	_, _ = fmt.Fprintln(w, "  mtyxd-remote serve --stdio --persistent --slot <slot>")
+	_, _ = fmt.Fprintln(w, "  mtyxd-remote serve --ws --auth-lease-file <path> [--rpc-auth-lease-file <path>] [--listen 127.0.0.1:7777]")
+	_, _ = fmt.Fprintln(w, "  mtyxd-remote cli <command> [args...]")
 }
 
 func runStdioServer(stdin io.Reader, stdout io.Writer) error {
@@ -411,10 +411,10 @@ func persistentDaemonVersionComponent() string {
 func persistentDaemonSocketPath(root string, slot string) string {
 	socketBase, overrideSet := persistentDaemonSocketBase()
 	if !overrideSet {
-		socketBase = filepath.Join("/tmp", fmt.Sprintf("cmuxd-remote-%d", os.Getuid()))
+		socketBase = filepath.Join("/tmp", fmt.Sprintf("mtyxd-remote-%d", os.Getuid()))
 	}
 	digest := sha256.Sum256([]byte(root + "\x00" + slot))
-	return filepath.Join(socketBase, "cmuxd-"+hex.EncodeToString(digest[:8])+".sock")
+	return filepath.Join(socketBase, "mtyxd-"+hex.EncodeToString(digest[:8])+".sock")
 }
 
 func persistentDaemonSocketBase() (string, bool) {
@@ -422,7 +422,7 @@ func persistentDaemonSocketBase() (string, bool) {
 	if socketBase == "" {
 		return "", false
 	}
-	return filepath.Join(socketBase, fmt.Sprintf("cmuxd-remote-%d", os.Getuid())), true
+	return filepath.Join(socketBase, fmt.Sprintf("mtyxd-remote-%d", os.Getuid())), true
 }
 
 func validatePersistentDaemonSlot(rawSlot string) (string, error) {
@@ -548,7 +548,7 @@ func createPersistentDaemonFallbackSocketDir(root string) (string, error) {
 		}
 		socketDir := filepath.Join(
 			os.TempDir(),
-			fmt.Sprintf("cmuxd-remote-%d-%s", os.Getuid(), hex.EncodeToString(raw)),
+			fmt.Sprintf("mtyxd-remote-%d-%s", os.Getuid(), hex.EncodeToString(raw)),
 		)
 		if err := os.Mkdir(socketDir, 0o700); err != nil {
 			if errors.Is(err, os.ErrExist) {
@@ -1303,7 +1303,7 @@ func (s *rpcServer) handleRequest(req rpcRequest) rpcResponse {
 			ID: req.ID,
 			OK: true,
 			Result: map[string]any{
-				"name":    "cmuxd-remote",
+				"name":    "mtyxd-remote",
 				"version": version,
 				"capabilities": []string{
 					"session.basic",
@@ -1405,7 +1405,7 @@ func (s *rpcServer) handleNotificationResponse(req rpcRequest, resp rpcResponse)
 				detail += message
 			}
 		}
-		_, _ = fmt.Fprintf(os.Stderr, "cmuxd-remote: %s notification failed without response writer: %s\n", req.Method, detail)
+		_, _ = fmt.Fprintf(os.Stderr, "mtyxd-remote: %s notification failed without response writer: %s\n", req.Method, detail)
 		return nil
 	}
 	sessionID, attachmentID, attachmentToken, badResp := parsePTYAttachmentIdentity(req, req.Method)

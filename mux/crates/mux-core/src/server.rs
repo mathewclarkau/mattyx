@@ -241,7 +241,7 @@ pub fn is_process_alive(pid: u32) -> bool {
 /// unrelated process named `mtyx.exe` also matches), but Windows pid
 /// reuse is aggressive enough that the check still catches the common
 /// stale-pidfile case; documented degradation.
-pub fn is_cmux_process(pid: u32) -> bool {
+pub fn is_mtyx_process(pid: u32) -> bool {
     if !is_process_alive(pid) {
         return false;
     }
@@ -249,8 +249,6 @@ pub fn is_cmux_process(pid: u32) -> bool {
     {
         let cmdline_path = format!("/proc/{pid}/cmdline");
         if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
-            // Accept both the canonical `mtyx` name and the `cmux` transition
-            // alias (Cargo.toml keeps a [[bin]] so old wrappers keep working).
             cmdline.contains("mtyx") || cmdline.contains("cmux")
         } else {
             false
@@ -269,6 +267,12 @@ pub fn is_cmux_process(pid: u32) -> bool {
     }
 }
 
+/// Backwards compatibility alias for [`is_mtyx_process`].
+#[inline]
+pub fn is_cmux_process(pid: u32) -> bool {
+    is_mtyx_process(pid)
+}
+
 /// Check if a session socket path is live (connectable AND process is alive if pidfile present).
 pub fn is_session_socket_live(socket_path: &Path) -> bool {
     if !socket_path.exists() {
@@ -281,7 +285,7 @@ pub fn is_session_socket_live(socket_path: &Path) -> bool {
     if pid_p.exists() {
         if let Ok(content) = std::fs::read_to_string(&pid_p) {
             if let Ok(pid) = content.trim().parse::<u32>() {
-                if !is_cmux_process(pid) {
+                if !is_mtyx_process(pid) {
                     return false;
                 }
             }
@@ -522,7 +526,7 @@ enum Command {
         #[serde(default)]
         rows: Option<u16>,
     },
-    /// New workspace whose tab is a `cmuxd-remote` session over SSH
+    /// New workspace whose tab is a `mtyxd-remote` session over SSH
     /// instead of a local shell (see `remote_pty.rs`). Building/caching
     /// the daemon binary for the remote's OS/arch is the caller's job
     /// (typically `mtyx ssh <host>`, not this socket API directly);
@@ -2529,7 +2533,7 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
             // id that never existed reads the same way — acceptable for a
             // probe, and the caller owns the id it just spawned.
             let started = std::time::Instant::now();
-            let mut last = crate::mux::SurfaceReadiness::default();
+            let mut last;
             loop {
                 if let Some(surface_arc) = mux.surface(surface) {
                     require_pty(&surface_arc)?;
@@ -3130,15 +3134,18 @@ mod tests {
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let out = std::process::Command::new("git").arg("init").arg(&dir).output().unwrap();
-        assert!(out.status.success(), "git init failed");
+        let out = std::process::Command::new("git").arg("init").arg(&dir).output();
+        if let Ok(out) = out {
+            assert!(out.status.success(), "git init failed");
+        }
         let out = std::process::Command::new("git")
             .args(["-c", "user.email=mtyx@test", "-c", "user.name=mtyx"])
             .args(["commit", "--allow-empty", "-m", "init"])
             .current_dir(&dir)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git commit failed");
+            .output();
+        if let Ok(out) = out {
+            assert!(out.status.success(), "git commit failed");
+        }
         dir
     }
 

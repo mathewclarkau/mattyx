@@ -237,6 +237,23 @@ pub fn reap_zombies() {
     }
 }
 
+/// Reap specific child/descendant pids (non-blocking).
+/// Only reaps the specified pids so concurrent commands in other threads
+/// are not inadvertently stolen.
+pub fn reap_pids(pids: &[u32]) {
+    #[cfg(unix)]
+    {
+        for &pid in pids {
+            let mut status: libc::c_int = 0;
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        }
+    }
+    #[cfg(windows)]
+    {
+        crate::win::reap_tracked_handles();
+    }
+}
+
 /// Send `sig` to every pid in `pids`. Ignores ESRCH / EPERM.
 ///
 /// Windows residual limitation: `GenerateConsoleCtrlEvent` only
@@ -292,7 +309,7 @@ pub fn kill_process_tree(root: u32) {
     let grace = Duration::from_secs(2);
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
-        reap_zombies();
+        reap_pids(&list);
         // Catch late reparents / new children under still-living nodes.
         let mut still = false;
         for &pid in &list {
@@ -306,6 +323,7 @@ pub fn kill_process_tree(root: u32) {
             if d != self_pid && is_alive(d) {
                 still = true;
                 signal_pid(d, libc::SIGTERM);
+                reap_pids(&[d]);
             }
         }
         if !still && !is_alive(root) {
@@ -332,13 +350,13 @@ pub fn kill_process_tree(root: u32) {
     // Brief wait for SIGKILL to take effect.
     let hard_deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < hard_deadline {
-        reap_zombies();
+        reap_pids(&survivors);
         if survivors.iter().all(|&p| !is_alive(p)) {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    reap_zombies();
+    reap_pids(&survivors);
 }
 
 /// Kill every remaining child process of *this* process (and their
