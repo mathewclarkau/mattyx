@@ -52,7 +52,7 @@ pub const VERSION: &str = env!("MTYX_VERSION");
 
 pub use browser::normalize_url;
 pub use layout::{
-    directional_neighbor, layout_screen, split_for_pane_edge, split_sides, LayoutResult, Rect,
+    directional_neighbor, layout_screen, layout_screen_with_zoom, split_for_pane_edge, split_sides, LayoutResult, Rect,
     SplitEdge, SplitResize,
 };
 pub use layout_doc::{

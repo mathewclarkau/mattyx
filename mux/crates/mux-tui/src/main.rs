@@ -241,9 +241,9 @@ MOUSE
   screen entries to switch screens (+ for a new screen).
 
 CLI VERBS
-  identify, list-workspaces, send, read-screen, screenshot, vt-state,
+  identify, list-workspaces, send, read-screen, wait-for, run, screenshot, vt-state,
   new-tab, new-browser-tab, new-workspace, new-screen, split, set-ratio,
-  set-default-colors, close-surface, close-pane, close-screen,
+  set-default-colors, close-surface, close-pane, zoom-pane, close-screen,
   close-workspace, rename-pane, rename-surface, rename-screen,
   rename-workspace, set-workspace-color, set-status, workspace-color,
   trigger-flash, resize-surface,

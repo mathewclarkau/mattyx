@@ -149,6 +149,7 @@ pub struct Screen {
     pub name: Option<String>,
     pub root: Node,
     pub active_pane: PaneId,
+    pub zoomed: Option<PaneId>,
 }
 
 #[derive(Debug)]

@@ -24,7 +24,7 @@ use crossterm::terminal::{
 use crossterm::ExecutableCommand;
 use ghostty_vt::{KeyEncoder, RenderState, Screen};
 use mux_core::{
-    layout_screen, split_for_pane_edge, split_sides, BrowserSource, BrowserStatus, MuxEvent,
+    layout_screen_with_zoom, split_for_pane_edge, split_sides, BrowserSource, BrowserStatus, MuxEvent,
     PaneId, Rect, SplitDir, SplitEdge, SurfaceId, SurfaceKind, WorkspaceId,
 };
 use ratatui::backend::CrosstermBackend;
@@ -971,7 +971,7 @@ impl App {
         let layout = self
             .tree
             .active_screen()
-            .map(|screen| layout_screen(&screen.layout, area))
+            .map(|screen| layout_screen_with_zoom(&screen.layout, area, screen.zoomed))
             .unwrap_or_default();
 
         self.pane_areas.clear();
@@ -1464,6 +1464,7 @@ impl App {
                     self.split_pane(pane, SplitDir::Down)?;
                 }
             }
+            Action::ToggleZoom => self.session.toggle_zoom(pane),
             Action::CloseTab => {
                 // Close the active tab; the pane collapses with its last
                 // tab, so this is also "close pane" for single-tab panes.

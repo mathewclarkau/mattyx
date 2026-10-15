@@ -1118,8 +1118,20 @@ reattaching to remote session {session_id} on {host} \
         size: Option<(u16, u16)>,
         overrides: Option<&SpawnOverrides>,
     ) -> anyhow::Result<Arc<Surface>> {
+        self.new_workspace_topology_with_overrides(name, size, overrides)
+            .map(|(surf, _, _, _)| surf)
+    }
+
+    /// Spawns a surface with overrides and attaches it to a new workspace,
+    /// returning the surface and the allocated topology identifiers `(surface, pane_id, screen_id, ws_id)`.
+    pub fn new_workspace_topology_with_overrides(
+        self: &Arc<Self>,
+        name: Option<String>,
+        size: Option<(u16, u16)>,
+        overrides: Option<&SpawnOverrides>,
+    ) -> anyhow::Result<(Arc<Surface>, PaneId, ScreenId, WorkspaceId)> {
         let surface = self.spawn_surface(None, size, overrides)?;
-        Ok(self.attach_new_workspace(surface, name))
+        Ok(self.attach_new_workspace_topology(surface, name))
     }
 
     /// Like [`Self::new_workspace`], but the tab is a `mtyxd-remote`
@@ -1138,15 +1150,13 @@ reattaching to remote session {session_id} on {host} \
         Ok(self.attach_new_workspace(surface, name))
     }
 
-    /// Wraps an already-spawned surface in a brand new workspace/screen/
-    /// pane and makes it active. Shared by [`Self::new_workspace`] and
-    /// [`Self::new_remote_workspace`], which only differ in how the
-    /// surface itself gets spawned.
-    fn attach_new_workspace(
+    /// Attaches an already-spawned surface to a new workspace, returning the
+    /// surface alongside the allocated topology identifiers `(pane_id, screen_id, ws_id)`.
+    pub fn attach_new_workspace_topology(
         self: &Arc<Self>,
         surface: Arc<Surface>,
         name: Option<String>,
-    ) -> Arc<Surface> {
+    ) -> (Arc<Surface>, PaneId, ScreenId, WorkspaceId) {
         // Issue #95: opening a workspace (new, remote, or a restore) makes
         // this a live session, so an empty tree at shutdown means the user
         // really emptied it.
@@ -1166,6 +1176,7 @@ reattaching to remote session {session_id} on {host} \
                     name: None,
                     root: Node::Leaf(pane_id),
                     active_pane: pane_id,
+                    zoomed: None,
                 }],
                 active_screen: 0,
                 color: None,
@@ -1175,7 +1186,19 @@ reattaching to remote session {session_id} on {host} \
         }
         self.emit(MuxEvent::TreeChanged);
         self.reap_if_dead(&surface);
-        surface
+        (surface, pane_id, screen_id, ws_id)
+    }
+
+    /// Wraps an already-spawned surface in a brand new workspace/screen/
+    /// pane and makes it active. Shared by [`Self::new_workspace`] and
+    /// [`Self::new_remote_workspace`], which only differ in how the
+    /// surface itself gets spawned.
+    fn attach_new_workspace(
+        self: &Arc<Self>,
+        surface: Arc<Surface>,
+        name: Option<String>,
+    ) -> Arc<Surface> {
+        self.attach_new_workspace_topology(surface, name).0
     }
 
     /// Create a screen in a workspace (default: the active one) with one
@@ -1227,6 +1250,7 @@ reattaching to remote session {session_id} on {host} \
                         name: None,
                         root: Node::Leaf(pane_id),
                         active_pane: pane_id,
+                        zoomed: None,
                     });
                     ws.active_screen = ws.screens.len() - 1;
                     state.panes.insert(pane_id, pane);
@@ -1274,6 +1298,20 @@ reattaching to remote session {session_id} on {host} \
         overrides: Option<&SpawnOverrides>,
         worktree: Option<&crate::worktree::WorktreeRecord>,
     ) -> anyhow::Result<Arc<Surface>> {
+        self.new_tab_topology_with_overrides(pane, cwd, size, overrides, worktree)
+            .map(|(surf, _, _, _)| surf)
+    }
+
+    /// Like [`Self::new_tab_with_overrides`], but also returns the allocated
+    /// topology identifiers `(surface, pane_id, screen_id, ws_id)`.
+    pub fn new_tab_topology_with_overrides(
+        self: &Arc<Self>,
+        pane: Option<PaneId>,
+        cwd: Option<String>,
+        size: Option<(u16, u16)>,
+        overrides: Option<&SpawnOverrides>,
+        worktree: Option<&crate::worktree::WorktreeRecord>,
+    ) -> anyhow::Result<(Arc<Surface>, PaneId, ScreenId, WorkspaceId)> {
         // Resolve and validate the target before spawning a child.
         let target = {
             let state = self.state.lock().unwrap();
@@ -1292,19 +1330,19 @@ reattaching to remote session {session_id} on {host} \
             // requested, then attach the record to the new pane.
             if let Some(record) = worktree {
                 let surface = self.spawn_surface(Some(record.path.clone()), size, overrides)?;
-                let attached = self.attach_new_workspace(surface, None);
-                let pane = self.with_state(|s| s.pane_of(attached.id).unwrap());
+                let (attached, pane_id, screen_id, ws_id) =
+                    self.attach_new_workspace_topology(surface, None);
                 {
                     let mut state = self.state.lock().unwrap();
-                    if let Some(p) = state.panes.get_mut(&pane) {
+                    if let Some(p) = state.panes.get_mut(&pane_id) {
                         p.worktrees.push(record.clone());
                     }
                 }
                 self.emit(MuxEvent::TreeChanged);
                 self.reap_if_dead(&attached);
-                return Ok(attached);
+                return Ok((attached, pane_id, screen_id, ws_id));
             }
-            return self.new_workspace_with_overrides(None, size, overrides);
+            return self.new_workspace_topology_with_overrides(None, size, overrides);
         };
 
         let cwd = cwd.or_else(|| self.pane_cwd(target));
@@ -1312,8 +1350,19 @@ reattaching to remote session {session_id} on {host} \
         let size = size.or_else(|| self.pane_size(target));
         let surface = self.spawn_surface(cwd, size, overrides)?;
         let active_at = self.next_active_at();
-        let attached = {
+        let (attached, screen_id, ws_id) = {
             let mut state = self.state.lock().unwrap();
+            let (screen_id, ws_id) = match state.screen_of(target) {
+                Some((wi, si)) => {
+                    let ws = state.workspaces.get(wi);
+                    let screen = ws.and_then(|w| w.screens.get(si));
+                    match (ws, screen) {
+                        (Some(w), Some(s)) => (s.id, w.id),
+                        _ => (0, 0),
+                    }
+                }
+                None => (0, 0),
+            };
             match state.panes.get_mut(&target) {
                 Some(pane) => {
                     pane.tabs.push(surface.id);
@@ -1322,12 +1371,12 @@ reattaching to remote session {session_id} on {host} \
                     if let Some(record) = worktree {
                         pane.worktrees.push(record.clone());
                     }
-                    true
+                    (true, screen_id, ws_id)
                 }
                 None => {
                     // Pane disappeared between validation and attach.
                     state.surfaces.remove(&surface.id);
-                    false
+                    (false, 0, 0)
                 }
             }
         };
@@ -1337,7 +1386,7 @@ reattaching to remote session {session_id} on {host} \
         }
         self.emit(MuxEvent::TreeChanged);
         self.reap_if_dead(&surface);
-        Ok(surface)
+        Ok((surface, target, screen_id, ws_id))
     }
 
     /// `new-tab --branch <name>` (issue #77 AC4): create the worktree
@@ -1423,6 +1472,7 @@ reattaching to remote session {session_id} on {host} \
                         name: None,
                         root: Node::Leaf(pane_id),
                         active_pane: pane_id,
+                        zoomed: None,
                     }],
                     active_screen: 0,
                     color: None,
@@ -1584,6 +1634,7 @@ reattaching to remote session {session_id} on {host} \
                 for screen in ws.screens.iter_mut() {
                     if screen.root.split_leaf(target, dir, pane_id) {
                         screen.active_pane = pane_id;
+                        screen.zoomed = None;
                         done = true;
                         break 'outer;
                     }
@@ -2591,6 +2642,59 @@ reattaching to remote session {session_id} on {host} \
         found
     }
 
+    /// Toggle fullscreen zoom for a pane (default: the active pane).
+    ///
+    /// When zoomed, the pane occupies the entire screen area while the
+    /// underlying split tree and floating-point ratios are preserved intact.
+    /// Toggling again restores the previous split layout.
+    ///
+    /// Returns `Ok(true)` if zoomed, `Ok(false)` if unzoomed or a no-op
+    /// (e.g. single-pane screens with no splits). Returns an error if the
+    /// specified pane does not exist.
+    pub fn toggle_zoom(&self, pane: Option<PaneId>) -> anyhow::Result<bool> {
+        let is_zoomed = {
+            let mut state = self.state.lock().unwrap();
+            let target = match pane {
+                Some(id) => {
+                    if !state.panes.contains_key(&id) {
+                        anyhow::bail!("unknown pane {id}");
+                    }
+                    id
+                }
+                None => match state.active_pane() {
+                    Some(id) => id,
+                    None => return Ok(false),
+                },
+            };
+            let (wi, si) = state
+                .screen_of(target)
+                .ok_or_else(|| anyhow::anyhow!("pane {target} not found on any screen"))?;
+            let screen = &mut state.workspaces[wi].screens[si];
+
+            // Invariant: If screen has only 1 pane (no splits), return false / no-op.
+            if matches!(screen.root, Node::Leaf(_)) {
+                screen.zoomed = None;
+                return Ok(false);
+            }
+
+            // Toggles screen.zoomed: if zoomed, sets None (unzoom); if unzoomed, sets Some(target).
+            if screen.zoomed.is_some() {
+                screen.zoomed = None;
+                false
+            } else {
+                state.active_workspace = wi;
+                state.workspaces[wi].active_screen = si;
+                let screen = &mut state.workspaces[wi].screens[si];
+                screen.zoomed = Some(target);
+                screen.active_pane = target;
+                true
+            }
+        };
+
+        self.emit(MuxEvent::TreeChanged);
+        Ok(is_zoomed)
+    }
+
     /// Set the deepest split ratio in `dir` on the path to `pane`.
     pub fn set_ratio(&self, pane: PaneId, dir: SplitDir, ratio: f32) -> bool {
         let ratio = ratio.clamp(0.05, 0.95);
@@ -2838,6 +2942,12 @@ fn remove_surface(state: &mut State, target: SurfaceId) -> Option<Arc<Surface>> 
             };
             let screen = &mut state.workspaces[wi].screens[si];
             screen.root = root;
+            if screen.zoomed == Some(pane_id)
+                || matches!(screen.root, Node::Leaf(_))
+                || screen.zoomed.map_or(false, |z| !screen.root.contains(z))
+            {
+                screen.zoomed = None;
+            }
             if let Some(next) = next_active {
                 screen.active_pane = next;
             }
@@ -2885,6 +2995,12 @@ fn collapse_empty_pane(state: &mut State, pane_id: PaneId) {
             };
             let screen = &mut state.workspaces[wi].screens[si];
             screen.root = root;
+            if screen.zoomed == Some(pane_id)
+                || matches!(screen.root, Node::Leaf(_))
+                || screen.zoomed.map_or(false, |z| !screen.root.contains(z))
+            {
+                screen.zoomed = None;
+            }
             if let Some(next) = next_active {
                 screen.active_pane = next;
             }
@@ -3174,6 +3290,7 @@ mod tests {
                         b: Box::new(Node::Leaf(p2)),
                     },
                     active_pane: p3,
+                    zoomed: None,
                 }],
                 active_screen: 0,
                 color: None,
@@ -4438,5 +4555,25 @@ mod tests {
         assert!(mux.notifications_for(7).is_empty());
         assert_eq!(mux.client_read_mark("d", 7), None);
         assert_eq!(mux.notifications_for(8).len(), 1);
+    }
+
+    #[test]
+    fn new_workspace_and_tab_topology_return_valid_ids() {
+        let mux = test_mux();
+        let (surf1, pane1, screen1, ws1) = mux
+            .new_workspace_topology_with_overrides(Some("top-test".into()), None, None)
+            .expect("workspace topology should allocate");
+        assert!(surf1.id > 0);
+        assert!(pane1 > 0);
+        assert!(screen1 > 0);
+        assert!(ws1 > 0);
+
+        let (surf2, pane2, screen2, ws2) = mux
+            .new_tab_topology_with_overrides(Some(pane1), None, None, None, None)
+            .expect("tab topology should allocate");
+        assert!(surf2.id > 0);
+        assert_eq!(pane2, pane1);
+        assert_eq!(screen2, screen1);
+        assert_eq!(ws2, ws1);
     }
 }

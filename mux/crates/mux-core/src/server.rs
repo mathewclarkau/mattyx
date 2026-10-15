@@ -416,6 +416,31 @@ enum Command {
     ReadScreen {
         surface: SurfaceId,
     },
+    /// Blocks until a regular expression matches the plain-text screen of a PTY surface.
+    WaitFor {
+        surface: SurfaceId,
+        pattern: String,
+        timeout_ms: u64,
+    },
+    /// Direct process spawning into a tab or new workspace.
+    Run {
+        #[serde(default)]
+        argv: Option<Vec<String>>,
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        pane: Option<PaneId>,
+        #[serde(default)]
+        new_workspace: Option<bool>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        cols: Option<u16>,
+        #[serde(default)]
+        rows: Option<u16>,
+    },
     /// One-shot VT replay of the surface's current state (base64).
     VtState {
         surface: SurfaceId,
@@ -672,6 +697,10 @@ enum Command {
     FocusPane {
         pane: PaneId,
     },
+    ZoomPane {
+        #[serde(default)]
+        pane: Option<PaneId>,
+    },
     /// Select a tab within a pane (default: the active pane).
     SelectTab {
         #[serde(default)]
@@ -924,6 +953,8 @@ struct Response {
     /// `input_ack_timeout`). Old clients ignore the extra field.
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    zoomed: Option<Value>,
 }
 
 /// Line-oriented shared writer: responses and event streams interleave
@@ -1132,7 +1163,15 @@ fn handle_connection(mux: Arc<Mux>, stream: Box<dyn transport::Stream>) {
                 let id = req.id.clone();
                 match handle_command(&mux, req.cmd, &writer) {
                     Ok(data) => {
-                        Response { id, ok: true, data: Some(data), error: None, code: None }
+                        let zoomed = data.get("zoomed").cloned();
+                        Response {
+                            id,
+                            ok: true,
+                            data: Some(data),
+                            error: None,
+                            code: None,
+                            zoomed,
+                        }
                     }
                     // Issue #88: a structured ServerError also carries its
                     // code on the wire (see Response::code).
@@ -1142,6 +1181,7 @@ fn handle_connection(mux: Arc<Mux>, stream: Box<dyn transport::Stream>) {
                         ok: false,
                         data: None,
                         error: Some(e.to_string()),
+                        zoomed: None,
                     },
                 }
             }
@@ -1151,6 +1191,7 @@ fn handle_connection(mux: Arc<Mux>, stream: Box<dyn transport::Stream>) {
                 data: None,
                 error: Some(format!("bad request: {e}")),
                 code: None,
+                zoomed: None,
             },
         };
         let Ok(value) = serde_json::to_value(&response) else { break };
@@ -1258,6 +1299,7 @@ fn screen_json(
         "name": screen.name,
         "active": active,
         "active_pane": screen.active_pane,
+        "zoomed": screen.zoomed,
         "layout": node_json(&screen.root),
         "panes": pane_ids.iter().map(|id| pane_json(state, *id, short_ids)).collect::<Vec<_>>(),
     })
@@ -2016,6 +2058,90 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
             let text = surface.try_with_terminal(|t| t.plain_text())??;
             Ok(json!({ "text": text }))
         }
+        Command::WaitFor { surface, pattern, timeout_ms } => {
+            let surface = get_surface(mux, surface)?;
+            require_pty(&surface)?;
+            let re = regex::Regex::new(&pattern).map_err(|e| anyhow::anyhow!("bad regex: {e}"))?;
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_millis(timeout_ms);
+            loop {
+                let text = surface.try_with_terminal(|t| t.plain_text())??;
+                if re.is_match(&text) {
+                    return Ok(json!({
+                        "matched": true,
+                        "text": text,
+                        "elapsed_ms": start.elapsed().as_millis() as u64,
+                    }));
+                }
+                let elapsed = start.elapsed();
+                if elapsed >= timeout {
+                    anyhow::bail!("timeout waiting for pattern");
+                }
+                let remaining = timeout - elapsed;
+                let sleep_dur = remaining.min(std::time::Duration::from_millis(25));
+                std::thread::sleep(sleep_dur);
+            }
+        }
+        Command::Run {
+            argv,
+            command,
+            cwd,
+            pane,
+            new_workspace,
+            name,
+            cols,
+            rows,
+        } => {
+            let is_new_ws = new_workspace.unwrap_or(false);
+            if pane.is_some() && is_new_ws {
+                anyhow::bail!("pane and new_workspace are mutually exclusive");
+            }
+            let child_argv = match (argv, command) {
+                (Some(argv), None) => {
+                    if argv.is_empty() {
+                        anyhow::bail!("argv or command is required");
+                    }
+                    argv
+                }
+                (None, Some(cmd)) => {
+                    vec![crate::platform::default_shell(), "-lc".to_string(), cmd]
+                }
+                (Some(_), Some(_)) => anyhow::bail!("argv and command are mutually exclusive"),
+                (None, None) => anyhow::bail!("argv or command is required"),
+            };
+            let overrides = crate::SpawnOverrides {
+                command: Some(child_argv),
+                extra_env: Vec::new(),
+                cwd: cwd.clone(),
+            };
+            let size = match (cols, rows) {
+                (Some(c), Some(r)) => Some((c, r)),
+                (None, None) => None,
+                _ => anyhow::bail!("cols and rows must be supplied together"),
+            };
+            let (surface, pane_id, screen_id, workspace_id) = if is_new_ws {
+                let (surf, p_id, s_id, w_id) =
+                    mux.new_workspace_topology_with_overrides(name.clone(), size, Some(&overrides))?;
+                if let Some(ref n) = name {
+                    let _ = mux.rename_surface(surf.id, n.clone());
+                }
+                (surf, p_id, s_id, w_id)
+            } else {
+                let (surf, p_id, s_id, w_id) =
+                    mux.new_tab_topology_with_overrides(pane, cwd, size, Some(&overrides), None)?;
+                if let Some(ref n) = name {
+                    let _ = mux.rename_surface(surf.id, n.clone());
+                }
+                (surf, p_id, s_id, w_id)
+            };
+
+            Ok(json!({
+                "surface": surface.id,
+                "pane": pane_id,
+                "screen": screen_id,
+                "workspace": workspace_id,
+            }))
+        }
         Command::VtState { surface } => {
             let surface = get_surface(mux, surface)?;
             require_pty(&surface)?;
@@ -2323,6 +2449,15 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
                 anyhow::bail!("unknown pane {pane}");
             }
             Ok(json!({}))
+        }
+        Command::ZoomPane { pane } => {
+            let _ = mux.toggle_zoom(pane)?;
+            let zoomed = mux.with_state(|s| {
+                let target = pane.or_else(|| s.active_pane())?;
+                let (wi, si) = s.screen_of(target)?;
+                s.workspaces.get(wi)?.screens.get(si)?.zoomed
+            });
+            Ok(json!({ "zoomed": zoomed }))
         }
         Command::SelectTab { pane, index, delta } => {
             mux.select_tab(pane, index, delta);
@@ -3245,5 +3380,17 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(pid_path(&sock));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_command_deserialization_test() {
+        let json = r#"{"cmd":"run","argv":["echo","hi"],"new_workspace":true}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req.cmd {
+            Command::Run { new_workspace, .. } => {
+                assert_eq!(new_workspace, Some(true));
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }
