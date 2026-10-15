@@ -128,3 +128,132 @@ pub fn key_input_from(event: &KeyEvent) -> Option<KeyInput> {
     }
     Some(input)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    #[test]
+    fn test_mods_from_empty() {
+        let mods = mods_from(KeyModifiers::NONE);
+        assert_eq!(mods, Mods::default());
+        assert!(!mods.contains(Mods::SHIFT));
+        assert!(!mods.contains(Mods::CTRL));
+        assert!(!mods.contains(Mods::ALT));
+        assert!(!mods.contains(Mods::SUPER));
+    }
+
+    #[test]
+    fn test_mods_from_individual_modifiers() {
+        assert_eq!(mods_from(KeyModifiers::SHIFT), Mods::SHIFT);
+        assert_eq!(mods_from(KeyModifiers::CONTROL), Mods::CTRL);
+        assert_eq!(mods_from(KeyModifiers::ALT), Mods::ALT);
+        assert_eq!(mods_from(KeyModifiers::SUPER), Mods::SUPER);
+    }
+
+    #[test]
+    fn test_mods_from_combined_modifiers() {
+        let shift_ctrl = mods_from(KeyModifiers::SHIFT | KeyModifiers::CONTROL);
+        assert_eq!(shift_ctrl, Mods::SHIFT | Mods::CTRL);
+        assert!(shift_ctrl.contains(Mods::SHIFT));
+        assert!(shift_ctrl.contains(Mods::CTRL));
+        assert!(!shift_ctrl.contains(Mods::ALT));
+
+        let ctrl_alt = mods_from(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        assert_eq!(ctrl_alt, Mods::CTRL | Mods::ALT);
+
+        let all_mods = mods_from(
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+        );
+        assert_eq!(all_mods, Mods::SHIFT | Mods::CTRL | Mods::ALT | Mods::SUPER);
+    }
+
+    #[test]
+    fn test_mods_from_unmapped_modifiers() {
+        // Hyper or Meta should not map to Shift, Ctrl, Alt, or Super in ghostty Mods
+        let hyper_mods = mods_from(KeyModifiers::HYPER);
+        assert_eq!(hyper_mods, Mods::default());
+
+        let meta_mods = mods_from(KeyModifiers::META);
+        assert_eq!(meta_mods, Mods::default());
+    }
+
+    #[test]
+    fn test_key_input_from_release_returns_none() {
+        let event = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let mut release_event = event;
+        release_event.kind = KeyEventKind::Release;
+        assert!(key_input_from(&release_event).is_none());
+    }
+
+    #[test]
+    fn test_key_input_from_char_press_and_repeat() {
+        let event = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let input = key_input_from(&event).unwrap();
+        assert_eq!(input.key, sys::GHOSTTY_KEY_A);
+        assert_eq!(input.utf8, "a");
+        assert_eq!(input.unshifted_codepoint, 'a' as u32);
+        assert_eq!(input.action, Some(KeyAction::Press));
+
+        let mut repeat_event = event;
+        repeat_event.kind = KeyEventKind::Repeat;
+        let repeat_input = key_input_from(&repeat_event).unwrap();
+        assert_eq!(repeat_input.action, Some(KeyAction::Repeat));
+    }
+
+    #[test]
+    fn test_key_input_from_char_with_shift() {
+        let event = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
+        let input = key_input_from(&event).unwrap();
+        assert_eq!(input.key, sys::GHOSTTY_KEY_A);
+        assert_eq!(input.utf8, "A");
+        assert_eq!(input.unshifted_codepoint, 'a' as u32);
+        assert_eq!(input.mods, Mods::SHIFT);
+        assert_eq!(input.consumed_mods, Mods::SHIFT);
+    }
+
+    #[test]
+    fn test_key_input_from_char_with_ctrl() {
+        let event = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let input = key_input_from(&event).unwrap();
+        assert_eq!(input.key, sys::GHOSTTY_KEY_C);
+        // Under Ctrl, utf8 is kept empty because the key encoder derives Ctrl byte sequence
+        assert_eq!(input.utf8, "");
+        assert_eq!(input.mods, Mods::CTRL);
+    }
+
+    #[test]
+    fn test_key_input_from_special_keys() {
+        let enter = key_input_from(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert_eq!(enter.key, sys::GHOSTTY_KEY_ENTER);
+
+        let tab = key_input_from(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        assert_eq!(tab.key, sys::GHOSTTY_KEY_TAB);
+
+        let backtab = key_input_from(&KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).unwrap();
+        assert_eq!(backtab.key, sys::GHOSTTY_KEY_TAB);
+        assert_eq!(backtab.mods, Mods::SHIFT);
+
+        let bs = key_input_from(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)).unwrap();
+        assert_eq!(bs.key, sys::GHOSTTY_KEY_BACKSPACE);
+
+        let esc = key_input_from(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(esc.key, sys::GHOSTTY_KEY_ESCAPE);
+    }
+
+    #[test]
+    fn test_key_input_from_function_keys() {
+        let f1 = key_input_from(&KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        assert_eq!(f1.key, sys::GHOSTTY_KEY_F1);
+
+        let f12 = key_input_from(&KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE)).unwrap();
+        assert_eq!(f12.key, sys::GHOSTTY_KEY_F1 + 11);
+    }
+
+    #[test]
+    fn test_key_input_from_unsupported_key_returns_none() {
+        let event = KeyEvent::new(KeyCode::Media(crossterm::event::MediaKeyCode::Play), KeyModifiers::NONE);
+        assert!(key_input_from(&event).is_none());
+    }
+}
