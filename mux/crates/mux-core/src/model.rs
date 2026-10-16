@@ -149,6 +149,7 @@ pub struct Screen {
     pub name: Option<String>,
     pub root: Node,
     pub active_pane: PaneId,
+    pub zoomed: Option<PaneId>,
 }
 
 #[derive(Debug)]
@@ -194,5 +195,38 @@ impl State {
             .get(self.active_workspace)?
             .active_screen_ref()
             .map(|screen| screen.active_pane)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_icon_name_new_and_as_str() {
+        let icon = IconName::new("🚀".to_string());
+        assert_eq!(icon.as_str(), "🚀");
+
+        let ascii_icon = IconName::new("terminal".to_string());
+        assert_eq!(ascii_icon.as_str(), "terminal");
+    }
+
+    #[test]
+    fn test_icon_name_traits() {
+        let icon1 = IconName::new("star".to_string());
+        let icon2 = IconName::new("star".to_string());
+        let icon3 = IconName::new("heart".to_string());
+
+        // PartialEq & Eq
+        assert_eq!(icon1, icon2);
+        assert_ne!(icon1, icon3);
+
+        // Clone
+        let cloned_icon = icon1.clone();
+        assert_eq!(cloned_icon, icon1);
+
+        // Debug formatting
+        assert_eq!(format!("{:?}", icon1), "IconName(\"star\")");
     }
 }

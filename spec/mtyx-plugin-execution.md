@@ -123,15 +123,15 @@ When `mtyx pifactory-fleet deploy` is invoked:
 4. mtyx spawns the WASM module with `wasmtime` using the manifest's
    `entry` path resolved against the plugin install directory.
 5. mtyx passes the auth token to the WASM module via a host import
-   (`cmux_token(token: String) -> ()`).
+   (`mtyx_token(token: String) -> ()`).
 6. WASM module calls back into mtyx via a single host import
-   `cmux_call(request_json: String) -> String`, which mtyx validates against
+   `mtyx_call(request_json: String) -> String`, which mtyx validates against
    the token + verb allowlist before forwarding to the real control socket.
 
 This means:
 
 - Plugin cannot bypass the auth token (the only way to talk to mtyx is through
-  the `cmux_call` host import, which validates every request).
+  the `mtyx_call` host import, which validates every request).
 - Plugin cannot call verbs not in its allowlist (the token only authorises the
   specific verb being executed).
 - Plugin cannot read secrets from mtyx's environment (it gets only the
@@ -145,17 +145,17 @@ The plugin WASM module gets exactly three host functions. Anything else is a
 load-time failure (wasmtime validates the import list).
 
 ```rust
-// host import: cmux_token — returns the auth token for this call
-fn cmux_token() -> String;
+// host import: mtyx_token — returns the auth token for this call
+fn mtyx_token() -> String;
 
-// host import: cmux_call — send a JSON request, get a JSON response
+// host import: mtyx_call — send a JSON request, get a JSON response
 // request shape: { "id": u32, "verb": "list-workspaces", "args": {...} }
 // response shape: { "id": u32, "ok": bool, "data"?: ..., "error"?: string }
 // mtyx rejects verbs not in the manifest's allowlist or socket capability
-fn cmux_call(request_json: String) -> String;
+fn mtyx_call(request_json: String) -> String;
 
-// host import: cmux_log — plugin writes to mtyx's stderr (for diagnostics)
-fn cmux_log(level: u32, message: String);  // 0=info 1=warn 2=error
+// host import: mtyx_log — plugin writes to mtyx's stderr (for diagnostics)
+fn mtyx_log(level: u32, message: String);  // 0=info 1=warn 2=error
 ```
 
 Plus standard WASI preview1 imports for filesystem + clock access (the
@@ -179,7 +179,7 @@ $ mtyx pifactory-fleet deploy <args>
 │  3. mint per-call auth token (scoped: name+verb)   │
 │  4. resolve <plugin>/bin/fleet.wasm               │
 │  5. load module via wasmtime::Module::from_file    │
-│  6. instantiate with imports: cmux_token/_call/_log │
+│  6. instantiate with imports: mtyx_token/_call/_log │
 │  7. invoke plugin entrypoint with <args> as JSON   │
 │  8. fuel + timeout enforced throughout             │
 └──────────────────────────────────────────────────┘
@@ -189,8 +189,8 @@ $ mtyx pifactory-fleet deploy <args>
 ┌──────────────────────────────────────────────────┐
 │ pifactory-fleet.wasm                             │
 │   fn main(args_json_ptr, args_json_len) -> u32    │
-│     let token = cmux_token();                    │
-│     let resp = cmux_call(json!({                  │
+│     let token = mtyx_token();                    │
+│     let resp = mtyx_call(json!({                  │
 │       "id": 1, "verb": "list-workspaces"          │
 │     }));                                        │
 │     // ... decide what to dispatch ...           │
@@ -211,7 +211,7 @@ This PR is ~600-900 LOC across ~6 files. Estimated shape:
 | `mux/Cargo.toml` | Add `wasmtime = { version = "14", default-features = false, features = ["cranelift"] }` |
 | `mux/crates/mux-tui/Cargo.toml` | Wire wasmtime |
 | `mux/crates/mux-tui/src/plugin.rs` | Extend manifest parser to recognise `[plugin.capabilities]`; add `cmd_call` subcommand that handles the dispatch flow above |
-| `mux/crates/mux-tui/src/plugin_host.rs` (new) | The wasmtime host import implementations (`cmux_token`, `cmux_call`, `cmux_log`) + the per-call auth token mint + validation |
+| `mux/crates/mux-tui/src/plugin_host.rs` (new) | The wasmtime host import implementations (`mtyx_token`, `mtyx_call`, `mtyx_log`) + the per-call auth token mint + validation |
 | `mux/crates/mux-tui/src/main.rs` | Route `mtyx <plugin> <verb>` to `plugin::cmd_call` instead of rejecting; document the new shape in USAGE |
 | `mux/spec/cli.md` | Add the `mtyx <plugin> <verb>` entry to the verb table |
 | `mux/spec/commands.md` | Add the dispatch protocol (token mint, validation rules) |
@@ -279,7 +279,7 @@ The plugin wraps `scripts/cmux-panel-lib.sh` (already loaded via PR #51). The
 WASM module is a thin adapter that:
 
 1. Reads the JSON args (`workpiece_path`, `team_spec`)
-2. Calls `cmux_call` to dispatch scouts/planners/builders/reviewers via
+2. Calls `mtyx_call` to dispatch scouts/planners/builders/reviewers via
    existing mtyx verbs (`new-workspace`, `send`, `read-screen`)
 3. Returns a JSON summary of dispatched teams
 
@@ -288,7 +288,7 @@ in `scripts/team-dispatch.py` (Python on the host). The WASM module is purely
 a "translate JSON args → mtyx verb calls" adapter.
 
 Source repo for the worked example (separate from mattyx): the
-pifactory repo's `plugins/cmux-pifactory-fleet/`. Built separately against
+pifactory repo's `plugins/mtyx-pifactory-fleet/`. Built separately against
 `wasm32-unknown-unknown`, output `bin/fleet.wasm` copied into the plugin
 install dir on `mtyx plugin install`.
 
@@ -318,7 +318,7 @@ install dir on `mtyx plugin install`.
    override is mandatory in any meaningful plugin. Tighter default would
    just add boilerplate.
 3. **`max_runtime_ms` default**: **5000ms (5s)**. Plugins that need
-   longer-running operations must split them across multiple `cmux_call`
+   longer-running operations must split them across multiple `mtyx_call`
    invocations.
 4. **Token scope lifetime**: **per-call**. Mint a fresh 32-byte hex token at
    invocation, discard on return. Per-session tokens are a foot-gun if
@@ -361,7 +361,7 @@ What's done:
 
 * wasmtime 27 + wasmtime-wasi 27 (preview1) wired in.
 * `[plugin.capabilities]` parsed, validated, defaulted.
-* 3 host imports (`cmux_token`, `cmux_call`, `cmux_log`) implemented.
+* 3 host imports (`mtyx_token`, `mtyx_call`, `mtyx_log`) implemented.
 * Per-call auth tokens + verb allowlist + socket-capability enforcement
   + stale-id detection.
 * Fuel + epoch-interruption-based wall-clock caps.
@@ -372,7 +372,7 @@ What's done:
 What's NOT in this PR (deliberate follow-ups):
 
 * Worked example: `pifactory-fleet` plugin. Lives in the pifactory repo
-  under `plugins/cmux-pifactory-fleet/`. Ships with its own integration
+  under `plugins/mtyx-pifactory-fleet/`. Ships with its own integration
   tests.
 * End-to-end integration test that builds a tiny `wasm32-unknown-unknown`
   fixture and exercises the full `cmd_call` path. Skipped here because

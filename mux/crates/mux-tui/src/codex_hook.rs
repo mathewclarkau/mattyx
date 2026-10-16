@@ -143,6 +143,16 @@ fn run_install(uninstall: bool, global: bool) -> i32 {
                 }
                 config_content.push_str("\n[features]\ncodex_hooks = true\n");
             }
+            if let Ok(meta) = fs::symlink_metadata(&config_path) {
+                if meta.file_type().is_symlink() {
+                    eprintln!(
+                        "error: refusing to overwrite symlink at {}.
+                     Remove it manually if you want to update config.",
+                        config_path.display()
+                    );
+                    return 1;
+                }
+            }
             if let Err(e) = fs::write(&config_path, &config_content) {
                 eprintln!("error: could not update {}: {e}", config_path.display());
                 return 1;
@@ -247,6 +257,16 @@ fn run_install_skill(uninstall: bool, global: bool) -> i32 {
     } else {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() {
+                eprintln!(
+                    "error: refusing to overwrite symlink at {}.
+                     Remove it manually if you want to install the skill.",
+                    path.display()
+                );
+                return 1;
+            }
         }
         if let Err(e) = fs::write(&path, crate::skill_content::ORCHESTRATION_SKILL) {
             eprintln!("error writing {}: {e}", path.display());
@@ -370,6 +390,56 @@ mod tests {
         assert!(config.hooks.get("Stop").is_none(), "old absolute-path entry must be removed");
         let user = config.hooks.get("UserEvent").expect("user hooks survive");
         assert_eq!(user[0].command, "echo keep me");
+
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn install_hooks_refuses_symlink_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = temp_home("symlink-config");
+        let codex_dir = home.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+
+        let real_config = home.join("real_config.toml");
+        fs::write(&real_config, "# do not overwrite").unwrap();
+
+        let symlink_config = codex_dir.join("config.toml");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_config, &symlink_config).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&real_config, &symlink_config).unwrap();
+
+        std::env::set_var("HOME", &home);
+
+        assert_eq!(run_install(false, true), 1);
+        assert_eq!(fs::read_to_string(&real_config).unwrap(), "# do not overwrite");
+
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn install_skill_refuses_symlink() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = temp_home("symlink-skill");
+        let skill_dir = home.join(".codex").join("skills").join("mtyx-orchestration");
+        fs::create_dir_all(&skill_dir).unwrap();
+
+        let real_skill = home.join("real_skill.md");
+        fs::write(&real_skill, "# do not overwrite").unwrap();
+
+        let symlink_skill = skill_dir.join("SKILL.md");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_skill, &symlink_skill).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&real_skill, &symlink_skill).unwrap();
+
+        std::env::set_var("HOME", &home);
+
+        assert_eq!(run_install_skill(false, true), 1);
+        assert_eq!(fs::read_to_string(&real_skill).unwrap(), "# do not overwrite");
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(&home);

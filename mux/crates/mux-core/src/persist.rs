@@ -10,7 +10,7 @@
 //! would be a reasonable follow-up; this keeps the first version to what
 //! the existing spawn APIs already support cleanly.
 //!
-//! Remote (`cmuxd-remote`) tabs are a partial exception: a workspace's
+//! Remote (`mtyxd-remote`) tabs are a partial exception: a workspace's
 //! very first pane's first tab reattaches to the *same remote session*
 //! (via `Mux::new_remote_workspace`, not the local-shell path at all) —
 //! see `Mux::restore_workspace`. A remote tab anywhere else in the tree
@@ -67,7 +67,7 @@ enum LayoutSnapshot {
     },
 }
 
-/// Enough of a `RemoteSpec` to reattach the same `cmuxd-remote` session on
+/// Enough of a `RemoteSpec` to reattach the same `mtyxd-remote` session on
 /// restore. `local_binary_path` is persisted too even though it's really
 /// a cache artifact from `ssh_bootstrap` (a frontend concern, which
 /// `persist.rs`/`Mux::restore_session` otherwise know nothing about) -

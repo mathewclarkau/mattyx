@@ -51,6 +51,12 @@ struct HookPayload {
     session_id: Option<String>,
     cwd: Option<String>,
     hook_event_name: Option<String>,
+    #[serde(default)]
+    notification_type: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
 }
 
 fn run_hook() -> i32 {
@@ -69,7 +75,7 @@ fn run_hook() -> i32 {
         record_session(session_id, payload.cwd.as_deref(), event);
     }
 
-    if let (Some(state), Some(surface)) = (event.and_then(agent_state_for_event), surface_id()) {
+    if let (Some(state), Some(surface)) = (agent_state_for_event(&payload), surface_id()) {
         let mut params = json!({ "surface": surface, "state": state, "source": "hook" });
         if let Some(session_id) = &payload.session_id {
             params["session"] = json!(session_id);
@@ -81,10 +87,37 @@ fn run_hook() -> i32 {
     0
 }
 
-fn agent_state_for_event(event: &str) -> Option<&'static str> {
+fn agent_state_for_event(payload: &HookPayload) -> Option<&'static str> {
+    let event = payload.hook_event_name.as_deref()?;
     Some(match event {
         "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => "working",
-        "Notification" => "blocked",
+        "Notification" => {
+            let ntype = payload.notification_type.as_deref().unwrap_or("").to_lowercase();
+            let msg = payload.message.as_deref().unwrap_or("").to_lowercase();
+            let title = payload.title.as_deref().unwrap_or("").to_lowercase();
+            let combined = format!("{ntype} {msg} {title}");
+            if combined.contains("permission")
+                || combined.contains("elicitation")
+                || combined.contains("approval")
+                || combined.contains("approve")
+                || combined.contains("confirm")
+            {
+                "blocked"
+            } else if combined.contains("idle")
+                || combined.contains("ready")
+                || combined.contains("complete")
+                || combined.contains("finished")
+                || combined.contains("done")
+                || combined.contains("waiting")
+            {
+                "idle"
+            } else {
+                // PR #127 review: default-deny. An unrecognized
+                // Notification must not silently un-gate sends; only the
+                // explicit idle keywords above may release the #93 gate.
+                "blocked"
+            }
+        }
         "Stop" | "SubagentStop" => "idle",
         "SessionEnd" => "done",
         _ => return None,
@@ -396,7 +429,7 @@ fn run_install_hooks(uninstall: bool) -> i32 {
     // an equivalent substring match (`contains("mtyx report-agent")`) for
     // the same reason.
     const HOOK_MARKER: &str = "claude hook";
-    let is_our_hook = |cmd: &str| cmd.ends_with(HOOK_MARKER);
+    let is_our_hook = |cmd: &str| cmd.ends_with(HOOK_MARKER) || cmd.contains("cmux claude");
 
     for event in HOOK_EVENTS {
         if uninstall {
@@ -535,15 +568,32 @@ mod tests {
 
     #[test]
     fn agent_state_maps_known_events_and_ignores_unknown() {
-        assert_eq!(agent_state_for_event("SessionStart"), Some("working"));
-        assert_eq!(agent_state_for_event("UserPromptSubmit"), Some("working"));
-        assert_eq!(agent_state_for_event("PreToolUse"), Some("working"));
-        assert_eq!(agent_state_for_event("PostToolUse"), Some("working"));
-        assert_eq!(agent_state_for_event("Notification"), Some("blocked"));
-        assert_eq!(agent_state_for_event("Stop"), Some("idle"));
-        assert_eq!(agent_state_for_event("SubagentStop"), Some("idle"));
-        assert_eq!(agent_state_for_event("SessionEnd"), Some("done"));
-        assert_eq!(agent_state_for_event("SomethingFuture"), None);
+        let make_payload = |event: &str, ntype: Option<&str>, msg: Option<&str>| HookPayload {
+            hook_event_name: Some(event.to_string()),
+            notification_type: ntype.map(str::to_string),
+            message: msg.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(agent_state_for_event(&make_payload("SessionStart", None, None)), Some("working"));
+        assert_eq!(agent_state_for_event(&make_payload("UserPromptSubmit", None, None)), Some("working"));
+        assert_eq!(agent_state_for_event(&make_payload("PreToolUse", None, None)), Some("working"));
+        assert_eq!(agent_state_for_event(&make_payload("PostToolUse", None, None)), Some("working"));
+        assert_eq!(agent_state_for_event(&make_payload("Notification", Some("permission_prompt"), None)), Some("blocked"));
+        assert_eq!(agent_state_for_event(&make_payload("Notification", Some("idle_prompt"), None)), Some("idle"));
+        // PR #127 review: default-deny — an unrecognized Notification type
+        // must map to "blocked", never silently release the #93 gate.
+        assert_eq!(
+            agent_state_for_event(&make_payload("Notification", Some("something_unrecognized"), None)),
+            Some("blocked")
+        );
+        assert_eq!(
+            agent_state_for_event(&make_payload("Notification", None, Some("unrecognized message text"))),
+            Some("blocked")
+        );
+        assert_eq!(agent_state_for_event(&make_payload("Stop", None, None)), Some("idle"));
+        assert_eq!(agent_state_for_event(&make_payload("SubagentStop", None, None)), Some("idle"));
+        assert_eq!(agent_state_for_event(&make_payload("SessionEnd", None, None)), Some("done"));
+        assert_eq!(agent_state_for_event(&make_payload("SomethingFuture", None, None)), None);
     }
 
     fn temp_state_dir(name: &str) -> PathBuf {
@@ -653,6 +703,61 @@ mod tests {
             !command.contains("/old/deleted/path/"),
             "the surviving command must be the current binary's path, not the stale one: {command}"
         );
+
+        std::env::remove_var("HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_claude_agent_state_for_event() {
+        let p_blocked = HookPayload {
+            hook_event_name: Some("Notification".into()),
+            notification_type: Some("PermissionPrompt".into()),
+            message: Some("Claude needs permission".into()),
+            ..Default::default()
+        };
+        assert_eq!(agent_state_for_event(&p_blocked), Some("blocked"));
+
+        let p_idle = HookPayload {
+            hook_event_name: Some("Notification".into()),
+            notification_type: Some("IdlePrompt".into()),
+            message: Some("Claude is waiting for input".into()),
+            ..Default::default()
+        };
+        assert_eq!(agent_state_for_event(&p_idle), Some("idle"));
+
+        let p_done = HookPayload {
+            hook_event_name: Some("Notification".into()),
+            notification_type: Some("TaskCompleted".into()),
+            message: Some("Finished processing".into()),
+            ..Default::default()
+        };
+        assert_eq!(agent_state_for_event(&p_done), Some("idle"));
+    }
+
+    #[test]
+    fn install_hooks_replaces_cmux_claude_hook() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = temp_state_dir("install-cmux-cleanup");
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/home/matt/Code/cmux-linux/mux/target/release/cmux claude hook"}]}]}}"#,
+        )
+        .unwrap();
+        std::env::set_var("HOME", &dir);
+
+        assert_eq!(run_install_hooks(false), 0);
+
+        let settings: Value = serde_json::from_str(
+            &std::fs::read_to_string(claude_dir.join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        let stop_entries = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop_entries.len(), 1);
+        let command = stop_entries[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(!command.contains("cmux-linux"), "cmux hook must be replaced: {command}");
 
         std::env::remove_var("HOME");
         let _ = std::fs::remove_dir_all(&dir);

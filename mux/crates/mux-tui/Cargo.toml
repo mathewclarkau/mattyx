@@ -10,12 +10,6 @@ description = "mattyx: tmux-like terminal multiplexer TUI backed by libghostty-v
 name = "mtyx"
 path = "src/main.rs"
 
-# Transition alias: the canonical binary is `mtyx`; `cmux` points at the
-# same entry point so existing workflows keep working untouched.
-[[bin]]
-name = "cmux"
-path = "src/main.rs"
-
 [dependencies]
 ghostty-vt.workspace = true
 mux-core.workspace = true

@@ -391,3 +391,44 @@ fn send_wait_requires_observed_activity() {
     mux.close_workspace(0);
     mux_core::server::cleanup(&sock);
 }
+
+#[test]
+fn write_bytes_bypasses_blocked_gate() {
+    let session = unique_session("write-bytes-bypass");
+    let mux = Mux::new(session, SurfaceOptions::default());
+    let surface = mux.new_workspace(None, None).unwrap();
+    let sock = mux_core::server::serve(mux.clone(), None).unwrap();
+    let sid = surface.id;
+
+    // Report agent state as blocked.
+    let rep = rpc(
+        &sock,
+        json!({"id": 1, "cmd": "report-agent", "surface": sid, "state": "blocked", "source": "hook"}),
+    );
+    assert_eq!(rep["ok"], json!(true));
+
+    // Standard send without force must fail with agent_blocked.
+    let blocked_send = rpc(
+        &sock,
+        json!({"id": 2, "cmd": "send", "surface": sid, "text": "hello\n"}),
+    );
+    assert_eq!(blocked_send["ok"], json!(false));
+    assert_eq!(blocked_send["code"], json!("agent_blocked"));
+
+    // write-bytes bypasses the gate. Base64 "eQo=" is "y\n".
+    let written = rpc(
+        &sock,
+        json!({"id": 3, "cmd": "write-bytes", "surface": sid, "bytes": "eQo="}),
+    );
+    assert_eq!(written["ok"], json!(true), "write-bytes must bypass blocked gate: {written}");
+
+    // write-bytes without surface targets the active surface and succeeds.
+    let written_active = rpc(
+        &sock,
+        json!({"id": 4, "cmd": "write-bytes", "bytes": "eQo="}),
+    );
+    assert_eq!(written_active["ok"], json!(true), "write-bytes on active surface must succeed: {written_active}");
+
+    mux.close_workspace(0);
+    mux_core::server::cleanup(&sock);
+}

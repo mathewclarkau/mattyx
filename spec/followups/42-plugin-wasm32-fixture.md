@@ -21,8 +21,8 @@ covered only by the existing test suite (no real plugin WASM).
    ```
 2. Create a tiny test fixture in `mux/crates/mux-tui/tests/fixtures/`:
    - A `Cargo.toml` with a `cdylib` target
-   - A `src/lib.rs` that exports a `_cmux_plugin_main` function
-   - The function does one `cmux_call("list-workspaces", ...)` and
+   - A `src/lib.rs` that exports a `_mtyx_plugin_main` function
+   - The function does one `mtyx_call("list-workspaces", ...)` and
      returns
 3. Add a `build.rs` (or `tests/cli.rs` build script) that compiles
    the fixture to `target/wasm32-unknown-unknown/debug/fixture.wasm`
@@ -39,7 +39,7 @@ covered only by the existing test suite (no real plugin WASM).
 ## Estimated effort
 
 ~1-2 hours. The fixture is trivial (10-20 lines of Rust calling one
-`cmux_call`); the build.rs wiring is the only fiddly bit.
+`mtyx_call`); the build.rs wiring is the only fiddly bit.
 
 ## Why it's deferred
 

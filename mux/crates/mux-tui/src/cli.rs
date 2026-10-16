@@ -3,6 +3,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use base64::Engine;
 use mux_core::platform::transport;
 use serde_json::{json, Value};
 
@@ -40,13 +41,13 @@ pub(crate) struct GlobalArgs {
 /// forms (`--group 1`, `--group 0`) still work. `confirm`/`no-confirm`
 /// (issue #88) join the same convention.
 const BARE_BOOL_FLAGS: &[&str] =
-    &["group", "confirm", "no-confirm", "force", "wait", "require-transition", "all"];
+    &["group", "confirm", "no-confirm", "force", "wait", "require-transition", "all", "new-workspace"];
 
 /// Verbs that accept one bare positional argument alongside their flags
 /// (issue #84: `mtyx screenshot --surface <id> <file>`), mapped onto the
 /// named flag of the same meaning (`<file>` == `--output <file>`). Passing
 /// both forms is a usage error.
-const POSITIONAL_FLAG_VERBS: &[(&str, &str)] = &[("screenshot", "output")];
+const POSITIONAL_FLAG_VERBS: &[(&str, &str)] = &[("screenshot", "output"), ("answer", "key")];
 
 #[derive(Default)]
 struct FlagMap {
@@ -117,10 +118,38 @@ const VERBS: &[VerbSpec] = &[
         stream: false,
     },
     VerbSpec {
+        name: "answer",
+        allowed: &["surface", "key"],
+        build: build_answer,
+        print: print_empty,
+        stream: false,
+    },
+    VerbSpec {
+        name: "write-bytes",
+        allowed: &["surface", "bytes"],
+        build: build_write_bytes,
+        print: print_empty,
+        stream: false,
+    },
+    VerbSpec {
         name: "read-screen",
         allowed: &["surface"],
         build: build_surface,
         print: print_read_screen,
+        stream: false,
+    },
+    VerbSpec {
+        name: "wait-for",
+        allowed: &["surface", "pattern", "timeout-ms"],
+        build: build_wait_for,
+        print: print_empty,
+        stream: false,
+    },
+    VerbSpec {
+        name: "run",
+        allowed: &["command", "pane", "new-workspace", "cwd", "name", "cols", "rows"],
+        build: build_run,
+        print: print_surface,
         stream: false,
     },
     VerbSpec {
@@ -194,6 +223,13 @@ const VERBS: &[VerbSpec] = &[
         allowed: &["pane"],
         build: build_pane,
         print: print_empty,
+        stream: false,
+    },
+    VerbSpec {
+        name: "zoom-pane",
+        allowed: &["pane"],
+        build: build_zoom_pane,
+        print: print_zoom_pane,
         stream: false,
     },
     VerbSpec {
@@ -684,6 +720,11 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             // token after it is ever parsed as a flag. Distinct from
             // the `--` that must follow `--exec`: that one is consumed
             // by the `--exec` arm below.
+            "--" if verb.map(|v| v.name) == Some("run") => {
+                let argv: Vec<String> = args[i + 1..].to_vec();
+                flags.exec = Some(argv);
+                i = args.len();
+            }
             "--" if verb.is_some() => {
                 positional_only = true;
                 i += 1;
@@ -926,6 +967,13 @@ fn run_command(args: CliArgs) -> i32 {
             .optional("timeout")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(mux_core::server::DEFAULT_WAIT_READY_MS);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(wait_ms.saturating_add(5_000))));
+    } else if args.verb.name == "wait-for" {
+        let wait_ms = args
+            .flags
+            .optional("timeout-ms")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
         let _ = stream.set_read_timeout(Some(Duration::from_millis(wait_ms.saturating_add(5_000))));
     } else if args.verb.name == "send"
         && (request.get("confirm").and_then(Value::as_bool) == Some(true)
@@ -1175,10 +1223,19 @@ fn build_pane(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(json!({ "pane": flags.required_u64("pane")? }))
 }
 
+fn build_zoom_pane(flags: &FlagMap) -> Result<Value, UsageError> {
+    let pane = match flags.optional("pane") {
+        Some(s) => Some(parse_u64("pane", &s)?),
+        None => None,
+    };
+    Ok(json!({ "pane": pane }))
+}
+
 fn build_screen(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(json!({ "screen": flags.required_u64("screen")? }))
 }
 
+#[allow(dead_code)]
 fn build_workspace(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(json!({ "workspace": flags.required_u64("workspace")? }))
 }
@@ -1282,6 +1339,42 @@ fn build_send(flags: &FlagMap) -> Result<Value, UsageError> {
             .map_err(|err| UsageError(format!("failed to read stdin: {err}")))?;
         value["text"] = json!(text);
     }
+    Ok(value)
+}
+
+fn build_write_bytes(flags: &FlagMap) -> Result<Value, UsageError> {
+    let mut value = json!({ "bytes": flags.required("bytes")? });
+    flags.insert_optional_u64(&mut value, "surface")?;
+    Ok(value)
+}
+
+fn build_answer(flags: &FlagMap) -> Result<Value, UsageError> {
+    let mut value = json!({});
+    flags.insert_optional_u64(&mut value, "surface")?;
+    let key = flags.required("key")?;
+    let bytes: &[u8] = match key.to_lowercase().as_str() {
+        "down" | "arrow-down" | "arrow_down" => b"\x1b[B",
+        "up" | "arrow-up" | "arrow_up" => b"\x1b[A",
+        "enter" | "return" => b"\r",
+        "esc" | "escape" => b"\x1b",
+        "ctrl-c" | "ctrl+c" | "c-c" => b"\x03",
+        "1" => b"1",
+        "2" => b"2",
+        "3" => b"3",
+        "4" => b"4",
+        "5" => b"5",
+        "6" => b"6",
+        "7" => b"7",
+        "8" => b"8",
+        "9" => b"9",
+        _ => {
+            return Err(UsageError(format!(
+                "unrecognized answer key {key:?}; expected one of: down, up, enter, esc, ctrl-c, 1-9"
+            )))
+        }
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    value["bytes"] = json!(encoded);
     Ok(value)
 }
 
@@ -1731,6 +1824,44 @@ fn build_agent_send(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(value)
 }
 
+fn build_wait_for(flags: &FlagMap) -> Result<Value, UsageError> {
+    Ok(json!({
+        "surface": flags.required_u64("surface")?,
+        "pattern": flags.required("pattern")?,
+        "timeout_ms": flags.required_u64("timeout-ms")?,
+    }))
+}
+
+fn build_run(flags: &FlagMap) -> Result<Value, UsageError> {
+    let has_argv = flags.exec.as_ref().map(|a| !a.is_empty()).unwrap_or(false);
+    let has_cmd = flags.optional("command").is_some();
+    if has_argv && has_cmd {
+        return Err(UsageError("argv and command are mutually exclusive".to_string()));
+    }
+    if !has_argv && !has_cmd {
+        return Err(UsageError("argv or command is required".to_string()));
+    }
+    let has_pane = flags.optional("pane").is_some();
+    let is_new_ws = flags.optional_bool("new-workspace").unwrap_or(false);
+    if has_pane && is_new_ws {
+        return Err(UsageError("--pane and --new-workspace are mutually exclusive".to_string()));
+    }
+
+    let mut value = json!({});
+    if let Some(argv) = &flags.exec {
+        value["argv"] = json!(argv);
+    }
+    flags.insert_optional_string(&mut value, "command");
+    flags.insert_optional_string(&mut value, "cwd");
+    flags.insert_optional_u64(&mut value, "pane")?;
+    if is_new_ws {
+        value["new_workspace"] = json!(true);
+    }
+    flags.insert_optional_string(&mut value, "name");
+    flags.insert_optional_size(&mut value)?;
+    Ok(value)
+}
+
 fn build_wait_ready(flags: &FlagMap) -> Result<Value, UsageError> {
     // Issue #85: required surface id; `--timeout` is optional (the
     // server defaults it) and in milliseconds, mirroring
@@ -2031,7 +2162,7 @@ fn signal_session_pid(pid: u32, _kill: bool) {
 /// `run_kill_session` behaviour.
 pub(crate) fn kill_session_at(socket_path: &std::path::Path, pid: Option<u32>) -> bool {
     if let Some(pid) = pid {
-        if mux_core::server::is_cmux_process(pid) {
+        if mux_core::server::is_mtyx_process(pid) {
             signal_session_pid(pid, false);
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             while std::time::Instant::now() < deadline {
@@ -2924,6 +3055,15 @@ fn print_surface(data: &Value, out: &mut dyn Write) -> io::Result<()> {
     writeln!(out, "{}", data.get("surface").and_then(Value::as_u64).unwrap_or(0))
 }
 
+fn print_zoom_pane(data: &Value, out: &mut dyn Write) -> io::Result<()> {
+    match data.get("zoomed") {
+        Some(val) if !val.is_null() => {
+            writeln!(out, "zoomed pane {}", val.as_u64().unwrap_or(0))
+        }
+        _ => writeln!(out, "unzoomed"),
+    }
+}
+
 fn print_tree(data: &Value, out: &mut dyn Write) -> io::Result<()> {
     let Some(workspaces) = data.get("workspaces").and_then(Value::as_array) else {
         return Ok(());
@@ -3251,7 +3391,7 @@ mod tests {
                 // parse, so both spellings dispatch identically.
                 continue;
             }
-            let mut long = vec!["--json".to_string(), canonical.to_string()];
+            let long = vec!["--json".to_string(), canonical.to_string()];
             match (parse(&args), parse(&long)) {
                 (Ok(Parsed::Command(short)), Ok(Parsed::Command(full))) => {
                     assert!(
@@ -3471,5 +3611,42 @@ mod tests {
         assert_eq!((sub.verb.build)(&sub.flags).unwrap(), json!({}));
         let sub = parse_ok(&["subscribe", "--client", "c2"]);
         assert_eq!((sub.verb.build)(&sub.flags).unwrap()["client"], json!("c2"));
+    }
+
+    #[test]
+    fn answer_and_write_bytes_build_requests() {
+        let ans_down = parse_ok(&["answer", "down"]);
+        let built = (ans_down.verb.build)(&ans_down.flags).unwrap();
+        assert_eq!(
+            built["bytes"],
+            json!(base64::engine::general_purpose::STANDARD.encode(b"\x1b[B"))
+        );
+        assert!(built.get("surface").is_none());
+
+        let ans_surface = parse_ok(&["answer", "--surface", "5", "enter"]);
+        let built = (ans_surface.verb.build)(&ans_surface.flags).unwrap();
+        assert_eq!(built["surface"], json!(5));
+        assert_eq!(
+            built["bytes"],
+            json!(base64::engine::general_purpose::STANDARD.encode(b"\r"))
+        );
+
+        let ans_ctrl_c = parse_ok(&["answer", "ctrl-c"]);
+        let built = (ans_ctrl_c.verb.build)(&ans_ctrl_c.flags).unwrap();
+        assert_eq!(
+            built["bytes"],
+            json!(base64::engine::general_purpose::STANDARD.encode(b"\x03"))
+        );
+
+        let ans_digit = parse_ok(&["answer", "2"]);
+        let built = (ans_digit.verb.build)(&ans_digit.flags).unwrap();
+        assert_eq!(
+            built["bytes"],
+            json!(base64::engine::general_purpose::STANDARD.encode(b"2"))
+        );
+
+        let wb = parse_ok(&["write-bytes", "--bytes", "aGVsbG8="]);
+        let built = (wb.verb.build)(&wb.flags).unwrap();
+        assert_eq!(built["bytes"], json!("aGVsbG8="));
     }
 }

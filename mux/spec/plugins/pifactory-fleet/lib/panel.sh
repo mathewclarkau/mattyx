@@ -28,7 +28,7 @@
 #
 # Output: a single mtyx verb name, or "<verb>+<verb>" to denote a
 # multi-step sequence (note: the current loader permits only one
-# cmux_call per invocation, so multi-step sequences are deferred to
+# mtyx_call per invocation, so multi-step sequences are deferred to
 # a future loader fix that increments expected_request_id per call).
 pifactory_panel_verb_map() {
     case "$1" in

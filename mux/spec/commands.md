@@ -307,6 +307,40 @@ Example:
 {"id":3,"ok":true,"data":{}}
 ```
 
+### write-bytes
+
+| Field  | Value         |
+| ------ | ------------- |
+| name   | `write-bytes` |
+| alias  | `answer`      |
+| status | implemented   |
+| since  | protocol 7    |
+
+Writes raw bytes directly to a PTY surface, bypassing the issue #93 `agent_blocked` gate. This is used by interactive attach clients and the operator answer hatch so keyboard input is never locked out when an agent card or terminal is blocked. If `surface` is omitted, input is written to the session's active surface.
+
+Params:
+
+| Name      | JSON type | Required/default | Constraints                                            |
+| --------- | --------- | ---------------- | ------------------------------------------------------ |
+| `surface` | `Id`      | default null     | When omitted, targets the session's active surface     |
+| `bytes`   | `Base64`  | required         | Standard base64-encoded raw bytes to write to the PTY |
+
+Result:
+
+```text
+object{}
+```
+
+CLI mapping:
+
+| Item         | Value                                                         |
+| ------------ | ------------------------------------------------------------- |
+| Verb         | `write-bytes` / `answer`                                      |
+| Flags        | `write-bytes: --bytes <base64> [--surface <id>]`              |
+|              | `answer: <key> [--surface <id>]` (key: down, up, enter, esc, ctrl-c, 1-9) |
+| Plain stdout | no output                                                     |
+| JSON stdout  | exact result object                                           |
+
 ### read-screen
 
 | Field  | Value         |
@@ -2670,7 +2704,7 @@ The three-word alias (`mtyx pane worktree create|list|remove ...`) is rewritten 
 | status | implemented            |
 | since  | protocol 6             |
 
-Creates a workspace whose single tab is a remote shell reached through `cmuxd-remote` over SSH (see `docs/protocol.md`'s "Remote Workspaces" section and `mux-core/src/remote_pty.rs`) instead of a local pty. The caller is responsible for having already built/uploaded a `cmuxd-remote` binary for the target's OS/arch and passing its local path; the bundled `mtyx ssh <host>` CLI does this and is the intended entry point, not this command directly.
+Creates a workspace whose single tab is a remote shell reached through `mtyxd-remote` over SSH (see `docs/protocol.md`'s "Remote Workspaces" section and `mux-core/src/remote_pty.rs`) instead of a local pty. The caller is responsible for having already built/uploaded a `mtyxd-remote` binary for the target's OS/arch and passing its local path; the bundled `mtyx ssh <host>` CLI does this and is the intended entry point, not this command directly.
 
 Params:
 
@@ -2679,7 +2713,7 @@ Params:
 | `host`              | `string`  | required         | SSH destination, passed to `ssh`/`scp` as-is (may be a full `user@host` or an entry in `~/.ssh/config`) |
 | `slot`              | `string`  | required         | Groups sessions under one persistent remote daemon per host                                             |
 | `session_id`        | `string`  | required         | Fresh id starts a new remote shell; an existing id (e.g. from a persisted snapshot) reattaches to it    |
-| `local_binary_path` | `string`  | required         | Local filesystem path to a `cmuxd-remote` binary built for the remote's OS/arch                         |
+| `local_binary_path` | `string`  | required         | Local filesystem path to a `mtyxd-remote` binary built for the remote's OS/arch                         |
 | `name`              | `string?` | default null     | Workspace display name                                                                                  |
 | `cols`              | `uint16?` | default null     | Initial surface width; `rows` must also be set to take effect                                           |
 | `rows`              | `uint16?` | default null     | Initial surface height; `cols` must also be set to take effect                                          |
@@ -2710,7 +2744,7 @@ CLI mapping:
 Example:
 
 ```json
-{"id":60,"cmd":"new-remote-workspace","host":"myhost","slot":"mtyx","session_id":"mtyx-...","local_binary_path":"/home/me/.cache/mattyx/cmuxd-remote-linux-amd64","name":"work"}
+{"id":60,"cmd":"new-remote-workspace","host":"myhost","slot":"mtyx","session_id":"mtyx-...","local_binary_path":"/home/me/.cache/mattyx/mtyxd-remote-linux-amd64","name":"work"}
 {"id":60,"ok":true,"data":{"surface":7}}
 ```
 

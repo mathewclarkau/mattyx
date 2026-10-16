@@ -171,12 +171,12 @@ USAGE:
   mtyx <verb> [OPTIONS]    Run one control-socket command
   mtyx workspace-color <name> <color>  Set a named workspace colour
   mtyx claude <subcommand> Claude Code hook integration (see below)
-  mtyx antigravity install-hooks  Antigravity CLI hook integration (see below)
-  mtyx codex install-hooks        Codex CLI hook integration (see below)
-  mtyx pi install-hooks           Pi agent extension integration (see below)
+  mtyx antigravity <install-hooks|install-skill>  Antigravity CLI hook integration (see below)
+  mtyx codex <install-hooks|install-skill>        Codex CLI hook integration (see below)
+  mtyx pi <install-hooks|install-skill>           Pi agent extension integration (see below)
   mtyx aider install-hooks        Aider wrapper integration (see below)
-  mtyx grok install-hooks         Grok CLI hook integration (see below)
-  mtyx opencode install-hooks     opencode plugin integration (see below)
+  mtyx grok <install-hooks|install-skill>         Grok CLI hook integration (see below)
+  mtyx opencode <install-hooks|install-skill>     opencode plugin integration (see below)
   mtyx agents <list|install>     Manage all agent hook integrations (see below)
   mtyx plugin <subcommand> Manage mtyx-plugin.toml manifests (see below)
   mtyx ssh <host> [OPTS]   Open a remote workspace over SSH (see below)
@@ -241,9 +241,9 @@ MOUSE
   screen entries to switch screens (+ for a new screen).
 
 CLI VERBS
-  identify, list-workspaces, send, read-screen, screenshot, vt-state,
+  identify, list-workspaces, send, read-screen, wait-for, run, screenshot, vt-state,
   new-tab, new-browser-tab, new-workspace, new-screen, split, set-ratio,
-  set-default-colors, close-surface, close-pane, close-screen,
+  set-default-colors, close-surface, close-pane, zoom-pane, close-screen,
   close-workspace, rename-pane, rename-surface, rename-screen,
   rename-workspace, set-workspace-color, set-status, workspace-color,
   trigger-flash, resize-surface,
@@ -441,9 +441,17 @@ GROK CLI INTEGRATION
       Installs the orchestration skill to .agents/skills/mtyx-orchestration/SKILL.md
       (or ~/.grok/skills/mtyx-orchestration/SKILL.md if --global).
 
+OPENCODE INTEGRATION
+  mtyx opencode install-hooks [--uninstall] [--global]
+      Installs a TypeScript plugin into .opencode/plugin/mtyx.ts (or
+      ~/.config/opencode/plugin/mtyx.ts if --global) to report state changes.
+  mtyx opencode install-skill [--uninstall] [--global]
+      Installs the orchestration skill to .opencode/skills/mtyx-orchestration/SKILL.md
+      (or ~/.config/opencode/skills/mtyx-orchestration/SKILL.md if --global).
+
 AGENT HOOK INTEGRATION
   mtyx agents list [--global]
-      Lists installed status, version, timestamp, and path for all six agents.
+      Lists installed status, version, timestamp, and path for all seven agents.
   mtyx agents install --all [--uninstall] [--global]
       Installs or removes every registered agent hook, continuing after failures.
   mtyx agents install --only <agent> [--uninstall] [--global]
@@ -465,7 +473,7 @@ PLUGIN LOADER (manifest + registry only; no execution yet)
 REMOTE (SSH) WORKSPACES
   mtyx ssh <host> [--name <workspace-name>] [--session <mux-session>]
       Opens a workspace whose tab is a shell on <host> instead of local.
-      Builds and caches a cmuxd-remote binary for the remote's OS/arch
+      Builds and caches a mtyxd-remote binary for the remote's OS/arch
       the first time (needs Go on PATH), uploads it, and starts it in
       persistent mode: closing the tab detaches without killing the
       remote shell, and this session's own daemon restarting reattaches
@@ -516,7 +524,7 @@ struct Args {
 /// mtyx version, resolved at build time from the release tag and baked
 /// into the binary by `mux-core`'s build script. Surfaced by
 /// `mtyx --version` / `mtyx -V` (issue #59), by the control socket's
-/// `identify` reply, and stamped into the `cmuxd-remote` daemon we
+/// `identify` reply, and stamped into the `mtyxd-remote` daemon we
 /// cross-compile for `mtyx ssh`. Reading `CARGO_PKG_VERSION` here is
 /// what made `-V` report a stale `0.1.0` (issue #71).
 const VERSION: &str = mux_core::VERSION;
@@ -641,7 +649,7 @@ fn main() {
         {
             if plugin::lookup_plugin(first).is_ok() {
                 // Resolve the session's control-socket path the same
-                // way cli::list does. The plugin's cmux_call host
+                // way cli::list does. The plugin's mtyx_call host
                 // imports write back to this socket.
                 let raw_socket: Option<PathBuf> =
                     std::env::var_os("MTYX_MUX_SOCKET").map(PathBuf::from).or_else(|| {

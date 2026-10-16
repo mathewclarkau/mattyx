@@ -438,6 +438,8 @@ pub enum Action {
     OpenFuzzyFinder,
     OpenSessionManager,
     ShowHelp,
+    ToggleZoom,
+    Answer,
 }
 
 impl Action {
@@ -478,6 +480,8 @@ impl Action {
             Action::OpenFuzzyFinder => "open-fuzzy-finder",
             Action::OpenSessionManager => "open-session-manager",
             Action::ShowHelp => "show-help",
+            Action::ToggleZoom => "toggle-zoom",
+            Action::Answer => "answer",
         }
     }
 
@@ -519,6 +523,8 @@ impl Action {
             Action::OpenFuzzyFinder => "Open fuzzy finder",
             Action::OpenSessionManager => "Open session manager",
             Action::ShowHelp => "Show help",
+            Action::ToggleZoom => "Toggle zoom",
+            Action::Answer => "Answer prompt",
         }
     }
 
@@ -560,6 +566,8 @@ impl Action {
             Action::OpenFuzzyFinder => "Open the fuzzy finder",
             Action::OpenSessionManager => "Open the session manager overlay",
             Action::ShowHelp => "Show this key binding help",
+            Action::ToggleZoom => "Zoom or unzoom the focused pane",
+            Action::Answer => "Inject answer bytes into the focused pane (Down, Up, Enter, 1-9, Ctrl-c)",
         }
     }
 
@@ -583,7 +591,9 @@ impl Action {
             | Action::FocusUp
             | Action::FocusDown
             | Action::ResizeGrow
-            | Action::ResizeShrink => HelpCategory::Pane,
+            | Action::ResizeShrink
+            | Action::ToggleZoom
+            | Action::Answer => HelpCategory::Pane,
             Action::NewTab
             | Action::NewBrowserTab
             | Action::NextTab
@@ -694,6 +704,8 @@ impl Default for Keys {
                 bind(KeyCode::Char('G'), Action::OpenFuzzyFinder),
                 bind(KeyCode::Char('S'), Action::OpenSessionManager),
                 bind(KeyCode::Char('?'), Action::ShowHelp),
+                bind(KeyCode::Char('z'), Action::ToggleZoom),
+                bind(KeyCode::Char('a'), Action::Answer),
             ],
         }
     }
@@ -745,6 +757,7 @@ impl Keys {
                 a.config_key() == name
                     || (**a == Action::RenameTab && name == "rename-pane")
                     || (**a == Action::NewBrowserTab && name == "new_browser_tab")
+                    || (**a == Action::ToggleZoom && name == "zoom-pane")
             }) {
                 Some(action) => {
                     self.bindings.retain(|(_, a)| a != action);
@@ -885,6 +898,8 @@ fn all_actions() -> &'static [Action] {
         Action::OpenFuzzyFinder,
         Action::OpenSessionManager,
         Action::ShowHelp,
+        Action::ToggleZoom,
+        Action::Answer,
     ]
 }
 
@@ -2184,6 +2199,26 @@ sidebar_rail = 77
             Some(Action::OpenSessionManager),
             "default S binding must survive the to_raw_map → apply round trip"
         );
+    }
+
+    #[test]
+    fn default_z_toggles_zoom() {
+        let keys = Keys::default();
+        assert_eq!(
+            keys.action_for(&KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
+            Some(Action::ToggleZoom)
+        );
+        assert!(all_actions().contains(&Action::ToggleZoom));
+    }
+
+    #[test]
+    fn default_a_answers_prompt() {
+        let keys = Keys::default();
+        assert_eq!(
+            keys.action_for(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some(Action::Answer)
+        );
+        assert!(all_actions().contains(&Action::Answer));
     }
 
     #[test]

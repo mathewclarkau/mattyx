@@ -77,7 +77,7 @@ fn run_install(uninstall: bool, global: bool) -> i32 {
 const EXTENSION_TEMPLATE: &str = r#"import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFile } from "child_process";
 
-export default function cmuxExtension(pi: ExtensionAPI) {
+export default function mtyxExtension(pi: ExtensionAPI) {
   const report = (state: string) => {
     const surface = process.env.MTYX_MUX_SURFACE;
     if (surface) {
@@ -235,6 +235,8 @@ mod tests {
             !code.contains("\"mtyx\","),
             "a bare-mtyx execFile target must not survive:\n{code}"
         );
+        assert!(code.contains("export default function mtyxExtension"), "{code}");
+        assert!(!code.contains("cmuxExtension"), "{code}");
         assert!(code.contains("\"report-agent\""), "{code}");
 
         // Uninstall still removes the file (issue #97 AC3: the pi

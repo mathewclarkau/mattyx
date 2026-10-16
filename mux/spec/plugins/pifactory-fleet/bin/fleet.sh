@@ -46,7 +46,7 @@ pifactory_fleet_status() {
 # dispatch happens via `pifactory_fleet_dispatch`; `deploy` only
 # allocates the workspace slot.
 #
-# Single cmux_call per invocation (see the plugin's README on the
+# Single mtyx_call per invocation (see the plugin's README on the
 # loader's single-call-per-invocation constraint).
 pifactory_fleet_deploy() {
     local role="${1:-fleet-scout}"

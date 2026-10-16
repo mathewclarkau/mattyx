@@ -236,7 +236,7 @@ func runWebSocketPTYServer(ctx context.Context, cfg wsPTYServerConfig, stderr io
 		_ = server.Shutdown(shutdownCtx)
 	}()
 
-	_, _ = fmt.Fprintf(stderr, "cmuxd-remote ws listening on %s\n", listener.Addr().String())
+	_, _ = fmt.Fprintf(stderr, "mtyxd-remote ws listening on %s\n", listener.Addr().String())
 	err = server.Serve(listener)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -745,7 +745,7 @@ func (h *wsPTYHub) startSessionLocked(sessionKey wsPTYSessionKey, sessionID stri
 	} else if len(trimmedCommand) > 120*1024 {
 		// Startup script exceeds Linux's MAX_ARG_STRLEN (~128KB). Write to a
 		// temp file and exec /bin/sh <file> to avoid E2BIG from execve.
-		f, err := os.CreateTemp("", "cmuxd-startup-*.sh")
+		f, err := os.CreateTemp("", "mtyxd-startup-*.sh")
 		if err != nil {
 			return nil, fmt.Errorf("could not create startup script temp file: %w", err)
 		}

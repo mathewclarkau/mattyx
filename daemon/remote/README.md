@@ -1,14 +1,14 @@
-# cmuxd-remote (Go)
+# mtyxd-remote (Go)
 
 Go remote daemon for `mtyx ssh` bootstrap, capability negotiation, and remote proxy RPC. It is not in the terminal keystroke hot path.
 
 ## Commands
 
-1. `cmuxd-remote version`
-2. `cmuxd-remote serve --stdio`
-3. `cmuxd-remote serve --stdio --persistent --slot <slot>`
-4. `cmuxd-remote serve --ws --auth-lease-file <path> [--rpc-auth-lease-file <path>] [--listen 127.0.0.1:7777]`
-5. `cmuxd-remote cli <command> [args...]` — relay mtyx commands to the local app over the reverse SSH forward
+1. `mtyxd-remote version`
+2. `mtyxd-remote serve --stdio`
+3. `mtyxd-remote serve --stdio --persistent --slot <slot>`
+4. `mtyxd-remote serve --ws --auth-lease-file <path> [--rpc-auth-lease-file <path>] [--listen 127.0.0.1:7777]`
+5. `mtyxd-remote cli <command> [args...]` — relay mtyx commands to the local app over the reverse SSH forward
 
 `serve --ws` is explicit opt-in for cloud VM images only. The normal `mtyx ssh`
 code path uses `serve --stdio --persistent --slot <slot>` over an SSH exec
@@ -16,7 +16,7 @@ channel. That stdio process is only a proxy to an authenticated per-slot daemon
 with credentials and logs under `~/.mattyx/daemon/<version>/<slot>/`, so remote PTY sessions
 can survive local surface close, local reconnect, and app relaunch. The persistent
 server never opens a public listener; it accepts only a per-user Unix socket under
-`/tmp/cmuxd-remote-<uid>/` and the slot token.
+`/tmp/mtyxd-remote-<uid>/` and the slot token.
 
 When invoked as `mtyx` (via wrapper/symlink installed during bootstrap), the binary auto-dispatches to the `cli` subcommand. This is busybox-style argv[0] detection.
 
@@ -56,7 +56,7 @@ slot name is generated locally, validated as `[A-Za-z0-9._-]{1,128}`, and sent
 to the remote daemon bootstrap as `--slot`.
 
 Remote slot files:
-1. `/tmp/cmuxd-remote-<uid>/cmuxd-<slot-hash>.sock` authenticated Unix socket for stdio proxies.
+1. `/tmp/mtyxd-remote-<uid>/mtyxd-<slot-hash>.sock` authenticated Unix socket for stdio proxies.
 2. `~/.mattyx/daemon/<version>/<slot>/auth.token` random 32-byte hex token, mode `0600`.
 3. `~/.mattyx/daemon/<version>/<slot>/daemon.lock` single-owner lock.
 4. `~/.mattyx/daemon/<version>/<slot>/daemon.log` startup and crash diagnostics.
@@ -112,7 +112,7 @@ Security invariants:
 
 ## Distribution
 
-Release and nightly builds publish prebuilt `cmuxd-remote` binaries on GitHub Releases for:
+Release and nightly builds publish prebuilt `mtyxd-remote` binaries on GitHub Releases for:
 1. `darwin/arm64`
 2. `darwin/amd64`
 3. `linux/arm64`
@@ -135,7 +135,7 @@ The command prints the exact release asset URL, expected SHA-256, local cache st
 
 The `cli` subcommand (or `mtyx` wrapper/symlink) connects to the local mtyx app through an SSH reverse forward and relays commands using the v2 JSON-RPC protocol.
 
-Cloud VM images install `/usr/local/bin/mtyx` as a symlink to `cmuxd-remote`,
+Cloud VM images install `/usr/local/bin/mtyx` as a symlink to `mtyxd-remote`,
 so `mtyx --help` works before a user-specific SSH bootstrap has written
 `~/.mattyx/bin/mtyx`.
 
@@ -153,7 +153,7 @@ Authenticated relay details:
 
 Integration additions for the relay path:
 
-1. Bootstrap installs `~/.mattyx/bin/mtyx` wrapper and keeps a default daemon target (`~/.mattyx/bin/cmuxd-remote-current`).
+1. Bootstrap installs `~/.mattyx/bin/mtyx` wrapper and keeps a default daemon target (`~/.mattyx/bin/mtyxd-remote-current`).
 2. A background `ssh -N -R` process reverse-forwards a TCP port to the authenticated local relay server. The relay address is written to `~/.mattyx/socket_addr` on the remote.
 3. Relay startup writes `~/.mattyx/relay/<port>.daemon_path` so the wrapper can route each shell to the correct daemon binary when multiple local mtyx instances or versions coexist.
 4. Relay startup writes `~/.mattyx/relay/<port>.auth` with the relay ID and token needed for HMAC authentication.

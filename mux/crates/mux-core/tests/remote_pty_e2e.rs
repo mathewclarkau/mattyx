@@ -3,12 +3,12 @@
 //! Exercises `mux-core`'s remote-pty support (`remote_pty.rs`) against a
 //! real SSH target. Needs infrastructure this crate's default `cargo test`
 //! can't assume (a reachable sshd, key-based auth already set up, and a
-//! `cmuxd-remote` binary built for that host), so every test here is a
+//! `mtyxd-remote` binary built for that host), so every test here is a
 //! silent no-op unless both env vars are set:
 //!
 //! ```text
 //! MTYX_MUX_TEST_SSH_HOST=localhost \
-//! MTYX_MUX_TEST_REMOTE_BIN=/path/to/cmuxd-remote \
+//! MTYX_MUX_TEST_REMOTE_BIN=/path/to/mtyxd-remote \
 //! cargo test -p mux-core --test remote_pty_e2e
 //! ```
 

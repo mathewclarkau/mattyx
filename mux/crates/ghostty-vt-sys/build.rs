@@ -25,6 +25,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MTYX_GHOSTTY_SRC");
     println!("cargo:rerun-if-env-changed=ZIG");
     println!("cargo:rerun-if-env-changed=MTYX_GHOSTTY_VT_ZIG_CPU");
+    println!("cargo:rerun-if-env-changed=MTYX_GHOSTTY_VT_ZIG_TARGET");
     println!("cargo:rerun-if-changed={}", ghostty_dir.join("include").display());
     println!("cargo:rerun-if-changed={}", ghostty_dir.join("build.zig").display());
     println!("cargo:rerun-if-changed={}", ghostty_dir.join("src").display());
@@ -44,7 +45,9 @@ fn main() {
         "-Demit-xcframework=false".to_string(),
         "-Doptimize=ReleaseFast".to_string(),
     ];
-    if target != host {
+    if let Ok(zig_target) = env::var("MTYX_GHOSTTY_VT_ZIG_TARGET") {
+        zig_args.push(format!("-Dtarget={zig_target}"));
+    } else if target != host {
         if let Some(zig_target) = zig_target_for_rust_target(&target) {
             zig_args.push(format!("-Dtarget={zig_target}"));
         }
@@ -166,6 +169,8 @@ fn main() {
 
 fn zig_target_for_rust_target(target: &str) -> Option<&'static str> {
     match target {
+        "x86_64-unknown-linux-gnu" => Some("x86_64-linux-gnu"),
+        "aarch64-unknown-linux-gnu" => Some("aarch64-linux-gnu"),
         "x86_64-pc-windows-gnu" => Some("x86_64-windows-gnu"),
         "x86_64-pc-windows-msvc" => Some("x86_64-windows-msvc"),
         "aarch64-pc-windows-msvc" => Some("aarch64-windows-msvc"),

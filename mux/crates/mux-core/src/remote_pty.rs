@@ -1,4 +1,4 @@
-//! A PTY backed by `cmuxd-remote` (vendored at `daemon/remote/`) running on
+//! A PTY backed by `mtyxd-remote` (vendored at `daemon/remote/`) running on
 //! a remote host over SSH, instead of a local child process.
 //!
 //! The trick: `portable_pty::{MasterPty, SlavePty, Child, ChildKiller}` have
@@ -8,10 +8,10 @@
 //! and its reader thread, `write_bytes`, `resize`, and the OSC-notification
 //! watcher all work completely unchanged for a remote surface — they just
 //! see a `Box<dyn MasterPty>`/`Box<dyn SlavePty>` and don't know or care
-//! that bytes are actually flowing over `cmuxd-remote`'s NDJSON RPC
+//! that bytes are actually flowing over `mtyxd-remote`'s NDJSON RPC
 //! protocol through an SSH-exec'd child process instead of a kernel pty.
 //!
-//! Protocol (from `daemon/remote/cmd/cmuxd-remote/{main,ws_pty}.go`):
+//! Protocol (from `daemon/remote/cmd/mtyxd-remote/{main,ws_pty}.go`):
 //! newline-delimited JSON, `{"id":...,"method":...,"params":{...}}` /
 //! `{"id":...,"ok":bool,"result"|"error":...}`, plus pushed
 //! `{"event":...}` lines with no `id`. Only the `pty.*` methods matter
@@ -24,9 +24,9 @@
 //! is that closing it locally doesn't kill the remote session), and
 //! `pty.close` (actually kills it — not currently exposed by any verb; a
 //! stale remote session needs manual cleanup, e.g. deleting
-//! `~/.cache/mattyx/cmuxd-remote` and `~/.mattyx/daemon/` on the remote).
+//! `~/.cache/mattyx/mtyxd-remote` and `~/.mattyx/daemon/` on the remote).
 //!
-//! `cmuxd-remote serve --stdio --persistent --slot <slot>` is what makes
+//! `mtyxd-remote serve --stdio --persistent --slot <slot>` is what makes
 //! the remote shell outlive both an SSH disconnect and this local process
 //! restarting: it spawns (or reconnects to) a detached background daemon
 //! under `~/.mattyx/daemon/dev/<slot>/` on the remote and becomes a thin
@@ -55,7 +55,7 @@ pub struct RemoteSpec {
     /// SSH destination, e.g. `"host"` or `"user@host"` — passed to `ssh`
     /// verbatim, so `~/.ssh/config` aliases and options work.
     pub host: String,
-    /// `cmuxd-remote`'s persistent-daemon slot name. Sessions under
+    /// `mtyxd-remote`'s persistent-daemon slot name. Sessions under
     /// different slots are independent; reuse one slot per host to let
     /// its daemon multiplex several `session_id`s.
     pub slot: String,
@@ -63,9 +63,9 @@ pub struct RemoteSpec {
     /// reconnect-after-restart must persist this and pass it back
     /// unchanged (see `persist.rs`'s `TabSnapshot`).
     pub session_id: String,
-    /// Local path to a `cmuxd-remote` binary built for the *remote*
+    /// Local path to a `mtyxd-remote` binary built for the *remote*
     /// host's OS/arch. Uploaded (once, hash-checked) to
-    /// `~/.cache/mattyx/cmuxd-remote` on the remote if missing or
+    /// `~/.cache/mattyx/mtyxd-remote` on the remote if missing or
     /// stale. Building this is deliberately not this module's job — it
     /// needs a Go toolchain and knowledge of where the vendored source
     /// lives, both of which belong to the frontend, not this library.
@@ -86,7 +86,7 @@ fn random_token() -> String {
     format!("{:x}-{:x}-{:x}", std::process::id(), nanos, n)
 }
 
-/// Opens a `PtyPair` backed by a remote `cmuxd-remote` session. Uploads
+/// Opens a `PtyPair` backed by a remote `mtyxd-remote` session. Uploads
 /// the daemon binary first if the remote copy is missing or doesn't match
 /// `spec.local_binary_path`'s hash.
 pub fn open_remote_pty(spec: &RemoteSpec, size: PtySize) -> anyhow::Result<PtyPair> {
@@ -112,9 +112,9 @@ pub fn open_remote_pty(spec: &RemoteSpec, size: PtySize) -> anyhow::Result<PtyPa
 /// unquoted, and every use of this path in an exec'd command string goes
 /// through [`shell_quote`] for safety against paths/slots with spaces or
 /// quotes, which would otherwise silently defeat tilde expansion.
-const REMOTE_BIN_PATH: &str = ".cache/mattyx/cmuxd-remote";
+const REMOTE_BIN_PATH: &str = ".cache/mattyx/mtyxd-remote";
 
-/// Uploads `local_binary_path` to `$HOME/.cache/mattyx/cmuxd-remote` on
+/// Uploads `local_binary_path` to `$HOME/.cache/mattyx/mtyxd-remote` on
 /// `host` unless a copy with the same SHA-256 is already there. Returns
 /// the remote path (relative to `$HOME`).
 fn ensure_uploaded(host: &str, local_binary_path: &std::path::Path) -> anyhow::Result<String> {
@@ -134,11 +134,11 @@ fn ensure_uploaded(host: &str, local_binary_path: &std::path::Path) -> anyhow::R
         )?;
         run_checked(
             Command::new("scp").arg(local_binary_path).arg(format!("{host}:{REMOTE_BIN_PATH}")),
-            "upload cmuxd-remote",
+            "upload mtyxd-remote",
         )?;
         run_checked(
             Command::new("ssh").arg(host).arg(format!("chmod +x {}", shell_quote(REMOTE_BIN_PATH))),
-            "chmod remote cmuxd-remote",
+            "chmod remote mtyxd-remote",
         )?;
     }
     Ok(REMOTE_BIN_PATH.to_string())
@@ -415,7 +415,7 @@ impl SlavePty for RemoteSlavePty {
     }
 }
 
-/// `cmuxd-remote`'s `pty.attach.command` replaces the whole shell
+/// `mtyxd-remote`'s `pty.attach.command` replaces the whole shell
 /// invocation (`/bin/sh -c <command>`) and, unlike a local
 /// `CommandBuilder`, has no separate cwd concept — so a requested cwd is
 /// folded into the command as a leading `cd`.

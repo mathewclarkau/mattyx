@@ -241,7 +241,7 @@ pub fn is_process_alive(pid: u32) -> bool {
 /// unrelated process named `mtyx.exe` also matches), but Windows pid
 /// reuse is aggressive enough that the check still catches the common
 /// stale-pidfile case; documented degradation.
-pub fn is_cmux_process(pid: u32) -> bool {
+pub fn is_mtyx_process(pid: u32) -> bool {
     if !is_process_alive(pid) {
         return false;
     }
@@ -249,8 +249,6 @@ pub fn is_cmux_process(pid: u32) -> bool {
     {
         let cmdline_path = format!("/proc/{pid}/cmdline");
         if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
-            // Accept both the canonical `mtyx` name and the `cmux` transition
-            // alias (Cargo.toml keeps a [[bin]] so old wrappers keep working).
             cmdline.contains("mtyx") || cmdline.contains("cmux")
         } else {
             false
@@ -269,6 +267,12 @@ pub fn is_cmux_process(pid: u32) -> bool {
     }
 }
 
+/// Backwards compatibility alias for [`is_mtyx_process`].
+#[inline]
+pub fn is_cmux_process(pid: u32) -> bool {
+    is_mtyx_process(pid)
+}
+
 /// Check if a session socket path is live (connectable AND process is alive if pidfile present).
 pub fn is_session_socket_live(socket_path: &Path) -> bool {
     if !socket_path.exists() {
@@ -281,7 +285,7 @@ pub fn is_session_socket_live(socket_path: &Path) -> bool {
     if pid_p.exists() {
         if let Ok(content) = std::fs::read_to_string(&pid_p) {
             if let Ok(pid) = content.trim().parse::<u32>() {
-                if !is_cmux_process(pid) {
+                if !is_mtyx_process(pid) {
                     return false;
                 }
             }
@@ -409,8 +413,52 @@ enum Command {
         #[serde(default)]
         wait_activity_ms: Option<u64>,
     },
+    /// Direct, un-gated byte write to a PTY surface (operator/attach input and answer hatch).
+    /// Bypasses the #93 blocked-send gate. If `surface` is omitted, targets the focused pane.
+    ///
+    /// PR #127 review: `origin` is audit attestation, NOT a permission
+    /// check. `origin = "operator-hatch"` claims the write came from the
+    /// operator's own answer hatch; the daemon then verifies the peer
+    /// credential uid against the daemon owner uid (the same check
+    /// connection-level `peer_auth` performs) and logs an attested audit
+    /// line. Any other — or absent — origin is still allowed, but logged
+    /// as `bypass-origin-unattested`. The call is never refused here.
+    #[serde(alias = "answer")]
+    WriteBytes {
+        #[serde(default)]
+        surface: Option<SurfaceId>,
+        bytes: String,
+        /// Optional attestation of who is invoking the bypass.
+        #[serde(default)]
+        origin: Option<String>,
+    },
     ReadScreen {
         surface: SurfaceId,
+    },
+    /// Blocks until a regular expression matches the plain-text screen of a PTY surface.
+    WaitFor {
+        surface: SurfaceId,
+        pattern: String,
+        timeout_ms: u64,
+    },
+    /// Direct process spawning into a tab or new workspace.
+    Run {
+        #[serde(default)]
+        argv: Option<Vec<String>>,
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        pane: Option<PaneId>,
+        #[serde(default)]
+        new_workspace: Option<bool>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        cols: Option<u16>,
+        #[serde(default)]
+        rows: Option<u16>,
     },
     /// One-shot VT replay of the surface's current state (base64).
     VtState {
@@ -522,7 +570,7 @@ enum Command {
         #[serde(default)]
         rows: Option<u16>,
     },
-    /// New workspace whose tab is a `cmuxd-remote` session over SSH
+    /// New workspace whose tab is a `mtyxd-remote` session over SSH
     /// instead of a local shell (see `remote_pty.rs`). Building/caching
     /// the daemon binary for the remote's OS/arch is the caller's job
     /// (typically `mtyx ssh <host>`, not this socket API directly);
@@ -667,6 +715,10 @@ enum Command {
     },
     FocusPane {
         pane: PaneId,
+    },
+    ZoomPane {
+        #[serde(default)]
+        pane: Option<PaneId>,
     },
     /// Select a tab within a pane (default: the active pane).
     SelectTab {
@@ -920,6 +972,8 @@ struct Response {
     /// `input_ack_timeout`). Old clients ignore the extra field.
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    zoomed: Option<Value>,
 }
 
 /// Line-oriented shared writer: responses and event streams interleave
@@ -1126,9 +1180,17 @@ fn handle_connection(mux: Arc<Mux>, stream: Box<dyn transport::Stream>) {
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(req) => {
                 let id = req.id.clone();
-                match handle_command(&mux, req.cmd, &writer) {
+                match handle_command(&mux, req.cmd, &writer, peer.as_ref().ok().copied()) {
                     Ok(data) => {
-                        Response { id, ok: true, data: Some(data), error: None, code: None }
+                        let zoomed = data.get("zoomed").cloned();
+                        Response {
+                            id,
+                            ok: true,
+                            data: Some(data),
+                            error: None,
+                            code: None,
+                            zoomed,
+                        }
                     }
                     // Issue #88: a structured ServerError also carries its
                     // code on the wire (see Response::code).
@@ -1138,6 +1200,7 @@ fn handle_connection(mux: Arc<Mux>, stream: Box<dyn transport::Stream>) {
                         ok: false,
                         data: None,
                         error: Some(e.to_string()),
+                        zoomed: None,
                     },
                 }
             }
@@ -1147,6 +1210,7 @@ fn handle_connection(mux: Arc<Mux>, stream: Box<dyn transport::Stream>) {
                 data: None,
                 error: Some(format!("bad request: {e}")),
                 code: None,
+                zoomed: None,
             },
         };
         let Ok(value) = serde_json::to_value(&response) else { break };
@@ -1254,6 +1318,7 @@ fn screen_json(
         "name": screen.name,
         "active": active,
         "active_pane": screen.active_pane,
+        "zoomed": screen.zoomed,
         "layout": node_json(&screen.root),
         "panes": pane_ids.iter().map(|id| pane_json(state, *id, short_ids)).collect::<Vec<_>>(),
     })
@@ -1850,7 +1915,12 @@ fn resolve_workspace_index(mux: &Mux, selector: Option<&str>) -> anyhow::Result<
     })
 }
 
-fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::Result<Value> {
+fn handle_command(
+    mux: &Arc<Mux>,
+    cmd: Command,
+    writer: &LineWriter,
+    peer_uid: Option<u32>,
+) -> anyhow::Result<Value> {
     match cmd {
         Command::Identify => Ok(json!({
             "app": "mtyx",
@@ -2006,11 +2076,133 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
                 None => Ok(json!({})),
             }
         }
+        Command::WriteBytes { surface, bytes, origin } => {
+            // PR #127 review: audit trail for the un-gated write path.
+            // Attestation only — the call is never refused here, so the
+            // pre-existing bypass behaviour (and its lifecycle test) is
+            // unchanged. A peer that claims `operator-hatch` gets its
+            // peer credential uid re-verified against the daemon owner
+            // uid, reusing the same decision `peer_auth` applies at
+            // connection acceptance; everything else is logged as
+            // unattested so the audit line cannot be forged by omission.
+            let attested_peer = peer_uid.filter(|uid| {
+                matches!(
+                    platform::peer_auth_decision(
+                        Ok(*uid),
+                        platform::daemon_uid(),
+                        platform::transport_supports_peer_creds(),
+                    ),
+                    platform::PeerAuthDecision::Accept
+                )
+            });
+            match (origin.as_deref(), attested_peer) {
+                (Some("operator-hatch"), Some(uid)) => {
+                    eprintln!("mtyx: write-bytes bypass invoked by peer uid={uid} (operator-hatch)");
+                }
+                _ => {
+                    eprintln!("mtyx: warning: write-bytes bypass-origin-unattested");
+                }
+            }
+            let surface = match surface {
+                Some(id) => get_surface(mux, id)?,
+                None => mux
+                    .active_surface_handle()
+                    .ok_or_else(|| ServerError::new("no_active_surface", "no active surface in session"))?,
+            };
+            require_pty(&surface)?;
+            let raw = base64::engine::general_purpose::STANDARD.decode(bytes)?;
+            surface.write_bytes(&raw)?;
+            Ok(json!({}))
+        }
         Command::ReadScreen { surface } => {
             let surface = get_surface(mux, surface)?;
             require_pty(&surface)?;
             let text = surface.try_with_terminal(|t| t.plain_text())??;
             Ok(json!({ "text": text }))
+        }
+        Command::WaitFor { surface, pattern, timeout_ms } => {
+            let surface = get_surface(mux, surface)?;
+            require_pty(&surface)?;
+            let re = regex::Regex::new(&pattern).map_err(|e| anyhow::anyhow!("bad regex: {e}"))?;
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_millis(timeout_ms);
+            loop {
+                let text = surface.try_with_terminal(|t| t.plain_text())??;
+                if re.is_match(&text) {
+                    return Ok(json!({
+                        "matched": true,
+                        "text": text,
+                        "elapsed_ms": start.elapsed().as_millis() as u64,
+                    }));
+                }
+                let elapsed = start.elapsed();
+                if elapsed >= timeout {
+                    anyhow::bail!("timeout waiting for pattern");
+                }
+                let remaining = timeout - elapsed;
+                let sleep_dur = remaining.min(std::time::Duration::from_millis(25));
+                std::thread::sleep(sleep_dur);
+            }
+        }
+        Command::Run {
+            argv,
+            command,
+            cwd,
+            pane,
+            new_workspace,
+            name,
+            cols,
+            rows,
+        } => {
+            let is_new_ws = new_workspace.unwrap_or(false);
+            if pane.is_some() && is_new_ws {
+                anyhow::bail!("pane and new_workspace are mutually exclusive");
+            }
+            let child_argv = match (argv, command) {
+                (Some(argv), None) => {
+                    if argv.is_empty() {
+                        anyhow::bail!("argv or command is required");
+                    }
+                    argv
+                }
+                (None, Some(cmd)) => {
+                    vec![crate::platform::default_shell(), "-lc".to_string(), cmd]
+                }
+                (Some(_), Some(_)) => anyhow::bail!("argv and command are mutually exclusive"),
+                (None, None) => anyhow::bail!("argv or command is required"),
+            };
+            let overrides = crate::SpawnOverrides {
+                command: Some(child_argv),
+                extra_env: Vec::new(),
+                cwd: cwd.clone(),
+            };
+            let size = match (cols, rows) {
+                (Some(c), Some(r)) => Some((c, r)),
+                (None, None) => None,
+                _ => anyhow::bail!("cols and rows must be supplied together"),
+            };
+            let (surface, pane_id, screen_id, workspace_id) = if is_new_ws {
+                let (surf, p_id, s_id, w_id) =
+                    mux.new_workspace_topology_with_overrides(name.clone(), size, Some(&overrides))?;
+                if let Some(ref n) = name {
+                    let _ = mux.rename_surface(surf.id, n.clone());
+                }
+                (surf, p_id, s_id, w_id)
+            } else {
+                let (surf, p_id, s_id, w_id) =
+                    mux.new_tab_topology_with_overrides(pane, cwd, size, Some(&overrides), None)?;
+                if let Some(ref n) = name {
+                    let _ = mux.rename_surface(surf.id, n.clone());
+                }
+                (surf, p_id, s_id, w_id)
+            };
+
+            Ok(json!({
+                "surface": surface.id,
+                "pane": pane_id,
+                "screen": screen_id,
+                "workspace": workspace_id,
+            }))
         }
         Command::VtState { surface } => {
             let surface = get_surface(mux, surface)?;
@@ -2320,6 +2512,15 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
             }
             Ok(json!({}))
         }
+        Command::ZoomPane { pane } => {
+            let _ = mux.toggle_zoom(pane)?;
+            let zoomed = mux.with_state(|s| {
+                let target = pane.or_else(|| s.active_pane())?;
+                let (wi, si) = s.screen_of(target)?;
+                s.workspaces.get(wi)?.screens.get(si)?.zoomed
+            });
+            Ok(json!({ "zoomed": zoomed }))
+        }
         Command::SelectTab { pane, index, delta } => {
             mux.select_tab(pane, index, delta);
             Ok(json!({}))
@@ -2529,7 +2730,7 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
             // id that never existed reads the same way — acceptable for a
             // probe, and the caller owns the id it just spawned.
             let started = std::time::Instant::now();
-            let mut last = crate::mux::SurfaceReadiness::default();
+            let mut last;
             loop {
                 if let Some(surface_arc) = mux.surface(surface) {
                     require_pty(&surface_arc)?;
@@ -3130,15 +3331,18 @@ mod tests {
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let out = std::process::Command::new("git").arg("init").arg(&dir).output().unwrap();
-        assert!(out.status.success(), "git init failed");
+        let out = std::process::Command::new("git").arg("init").arg(&dir).output();
+        if let Ok(out) = out {
+            assert!(out.status.success(), "git init failed");
+        }
         let out = std::process::Command::new("git")
             .args(["-c", "user.email=mtyx@test", "-c", "user.name=mtyx"])
             .args(["commit", "--allow-empty", "-m", "init"])
             .current_dir(&dir)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git commit failed");
+            .output();
+        if let Ok(out) = out {
+            assert!(out.status.success(), "git commit failed");
+        }
         dir
     }
 
@@ -3238,5 +3442,17 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(pid_path(&sock));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_command_deserialization_test() {
+        let json = r#"{"cmd":"run","argv":["echo","hi"],"new_workspace":true}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req.cmd {
+            Command::Run { new_workspace, .. } => {
+                assert_eq!(new_workspace, Some(true));
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

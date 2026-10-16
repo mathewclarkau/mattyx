@@ -87,7 +87,8 @@ fn draw_status_bar(app: &mut App, frame: &mut Frame) {
     put(frame, &mut x, " screens ", base.fg(Color::Indexed(244)));
     for (i, screen) in ws.screens.iter().enumerate() {
         let active = i == ws.active_screen;
-        let label = format!(" {} ", truncate(&screen.display_name(i), 20));
+        let zoom_badge = if screen.zoomed.is_some() { "[Z] " } else { "" };
+        let label = format!(" {zoom_badge}{} ", truncate(&screen.display_name(i), 20));
         let (start, width) = put(frame, &mut x, &label, if active { active_style } else { base });
         if width > 0 {
             hits.push((
@@ -102,25 +103,38 @@ fn draw_status_bar(app: &mut App, frame: &mut Frame) {
     }
     app.hits.extend(hits);
 
-    // Session label / status message, right-aligned (the prefix indicator
+    // Session label / status message, right-aligned (the prefix/answer indicator
     // replaces it).
     let label = app
         .status_message
         .as_ref()
         .map(|msg| format!(" {} ", truncate(msg, area.width.saturating_sub(x) as usize)))
-        .unwrap_or_else(|| format!("[{}] ", app.session_label));
+        .unwrap_or_else(|| {
+            let ws_name = &ws.name;
+            let surface_part = if let Some(sid) = app.active_surface() {
+                format!(" · surface:{sid}")
+            } else {
+                String::new()
+            };
+            format!("[{} · ws:{ws_name}{surface_part}] ", app.session_label)
+        });
     let label_w = label.chars().count() as u16;
-    if !app.prefix_armed && x + label_w < area.width {
+    if !app.prefix_armed && !app.answer_armed && x + label_w < area.width {
+        let style = if let Some(msg) = app.status_message.as_deref() {
+            if msg.contains("keys reached the pane") {
+                base.fg(Color::Indexed(244))
+            } else {
+                base.fg(Color::Red).add_modifier(Modifier::BOLD)
+            }
+        } else {
+            base.fg(Color::Indexed(244))
+        };
         frame.buffer_mut().set_stringn(
             area.width - label_w,
             status_y,
             &label,
             label_w as usize,
-            if app.status_message.is_some() {
-                base.fg(Color::Red).add_modifier(Modifier::BOLD)
-            } else {
-                base.fg(Color::Indexed(244))
-            },
+            style,
         );
     }
 
@@ -133,6 +147,16 @@ fn draw_status_bar(app: &mut App, frame: &mut Frame) {
             indicator,
             indicator.len(),
             Style::default().bg(Color::Yellow).fg(Color::Black),
+        );
+    } else if app.answer_armed {
+        let indicator = " answer: [↑/↓/Enter/Esc/1-9/C-c] ";
+        let x = area.width.saturating_sub(indicator.len() as u16);
+        frame.buffer_mut().set_stringn(
+            x,
+            status_y,
+            indicator,
+            indicator.len(),
+            Style::default().bg(Color::Cyan).fg(Color::Black),
         );
     }
 }

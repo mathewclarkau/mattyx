@@ -164,6 +164,22 @@ pub fn layout_screen(root: &Node, area: Rect) -> LayoutResult {
     result
 }
 
+/// Compute pane rects for a screen, accounting for fullscreen zoom.
+/// When `zoomed` is `Some(id)` and the pane is present in `root`, the zoomed
+/// pane tiles the entire area and other panes are not laid out.
+/// Otherwise, evaluates `root` via [`layout_screen`], preserving all split
+/// tree geometry and floating-point ratios.
+pub fn layout_screen_with_zoom(root: &Node, area: Rect, zoomed: Option<PaneId>) -> LayoutResult {
+    if let Some(pane_id) = zoomed {
+        if root.contains(pane_id) {
+            return LayoutResult {
+                panes: vec![(pane_id, area)],
+            };
+        }
+    }
+    layout_screen(root, area)
+}
+
 fn walk(node: &Node, area: Rect, out: &mut LayoutResult) {
     match node {
         Node::Leaf(id) => out.panes.push((*id, area)),
@@ -497,5 +513,29 @@ mod tests {
     fn directional_focus_ignores_zero_size_panes() {
         let panes = vec![(1, r(0, 0, 10, 10)), (2, r(10, 0, 0, 10)), (3, r(12, 0, 10, 10))];
         assert_eq!(dir(&panes, 1, 1, 0), Some(3));
+    }
+
+    #[test]
+    fn layout_screen_with_zoom_fullscreen_and_unzoom() {
+        let root = Node::Split {
+            dir: SplitDir::Right,
+            ratio: 0.5,
+            a: Box::new(Node::Leaf(1)),
+            b: Box::new(Node::Leaf(2)),
+        };
+        let area = Rect { x: 0, y: 0, width: 80, height: 24 };
+
+        // Unzoomed
+        let unzoomed = layout_screen_with_zoom(&root, area, None);
+        assert_eq!(unzoomed.panes.len(), 2);
+
+        // Zoomed into pane 2
+        let zoomed = layout_screen_with_zoom(&root, area, Some(2));
+        assert_eq!(zoomed.panes.len(), 1);
+        assert_eq!(zoomed.panes[0], (2, area));
+
+        // Zoomed into invalid pane falls back to normal layout
+        let invalid = layout_screen_with_zoom(&root, area, Some(999));
+        assert_eq!(invalid.panes.len(), 2);
     }
 }
