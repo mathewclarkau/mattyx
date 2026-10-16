@@ -202,6 +202,7 @@ fn is_mutating_verb(verb: &str) -> bool {
             | "new-screen"
             | "new-tab"
             | "run"
+            | "write-bytes"
             | "split"
             | "send"
             | "browser-reload"
@@ -612,6 +613,10 @@ mod tests {
         assert!(is_mutating_verb("set-default-colors"));
         assert!(is_mutating_verb("rename-workspace"));
         assert!(is_mutating_verb("split"));
+        // PR #127 review: write-bytes injects raw bytes into a PTY, so a
+        // `socket = "read"` plugin must not slip it past the capability
+        // model (and the #93 gate) by holding a read-only socket.
+        assert!(is_mutating_verb("write-bytes"));
         assert!(!is_mutating_verb("list-workspaces"));
         assert!(!is_mutating_verb("read-screen"));
         assert!(!is_mutating_verb("identify"));

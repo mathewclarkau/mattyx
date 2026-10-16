@@ -415,11 +415,22 @@ enum Command {
     },
     /// Direct, un-gated byte write to a PTY surface (operator/attach input and answer hatch).
     /// Bypasses the #93 blocked-send gate. If `surface` is omitted, targets the focused pane.
+    ///
+    /// PR #127 review: `origin` is audit attestation, NOT a permission
+    /// check. `origin = "operator-hatch"` claims the write came from the
+    /// operator's own answer hatch; the daemon then verifies the peer
+    /// credential uid against the daemon owner uid (the same check
+    /// connection-level `peer_auth` performs) and logs an attested audit
+    /// line. Any other — or absent — origin is still allowed, but logged
+    /// as `bypass-origin-unattested`. The call is never refused here.
     #[serde(alias = "answer")]
     WriteBytes {
         #[serde(default)]
         surface: Option<SurfaceId>,
         bytes: String,
+        /// Optional attestation of who is invoking the bypass.
+        #[serde(default)]
+        origin: Option<String>,
     },
     ReadScreen {
         surface: SurfaceId,
@@ -1169,7 +1180,7 @@ fn handle_connection(mux: Arc<Mux>, stream: Box<dyn transport::Stream>) {
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(req) => {
                 let id = req.id.clone();
-                match handle_command(&mux, req.cmd, &writer) {
+                match handle_command(&mux, req.cmd, &writer, peer.as_ref().ok().copied()) {
                     Ok(data) => {
                         let zoomed = data.get("zoomed").cloned();
                         Response {
@@ -1904,7 +1915,12 @@ fn resolve_workspace_index(mux: &Mux, selector: Option<&str>) -> anyhow::Result<
     })
 }
 
-fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::Result<Value> {
+fn handle_command(
+    mux: &Arc<Mux>,
+    cmd: Command,
+    writer: &LineWriter,
+    peer_uid: Option<u32>,
+) -> anyhow::Result<Value> {
     match cmd {
         Command::Identify => Ok(json!({
             "app": "mtyx",
@@ -2060,7 +2076,33 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
                 None => Ok(json!({})),
             }
         }
-        Command::WriteBytes { surface, bytes } => {
+        Command::WriteBytes { surface, bytes, origin } => {
+            // PR #127 review: audit trail for the un-gated write path.
+            // Attestation only — the call is never refused here, so the
+            // pre-existing bypass behaviour (and its lifecycle test) is
+            // unchanged. A peer that claims `operator-hatch` gets its
+            // peer credential uid re-verified against the daemon owner
+            // uid, reusing the same decision `peer_auth` applies at
+            // connection acceptance; everything else is logged as
+            // unattested so the audit line cannot be forged by omission.
+            let attested_peer = peer_uid.filter(|uid| {
+                matches!(
+                    platform::peer_auth_decision(
+                        Ok(*uid),
+                        platform::daemon_uid(),
+                        platform::transport_supports_peer_creds(),
+                    ),
+                    platform::PeerAuthDecision::Accept
+                )
+            });
+            match (origin.as_deref(), attested_peer) {
+                (Some("operator-hatch"), Some(uid)) => {
+                    eprintln!("mtyx: write-bytes bypass invoked by peer uid={uid} (operator-hatch)");
+                }
+                _ => {
+                    eprintln!("mtyx: warning: write-bytes bypass-origin-unattested");
+                }
+            }
             let surface = match surface {
                 Some(id) => get_surface(mux, id)?,
                 None => mux

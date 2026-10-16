@@ -1317,6 +1317,17 @@ mod tests {
         assert_eq!(classify_osc_notification("Grok", "idle_prompt"), crate::AgentState::Idle);
         assert_eq!(classify_osc_notification("Claude", "Task completed"), crate::AgentState::Idle);
         assert_eq!(classify_osc_notification("Agent", "Waiting for user input"), crate::AgentState::Idle);
+        // PR #127 review: approval phrasing wins even when it also matches
+        // the idle keywords (e.g. "waiting for user input") — an approval
+        // prompt must never classify as Idle and release the #93 gate.
+        assert_eq!(
+            classify_osc_notification("Permission needed — waiting for user input", ""),
+            crate::AgentState::Blocked
+        );
+        assert_eq!(
+            classify_osc_notification("", "Do you approve this command? (waiting for input)"),
+            crate::AgentState::Blocked
+        );
     }
 }
 
@@ -1326,6 +1337,19 @@ mod tests {
 /// must not force `Blocked`.
 pub fn classify_osc_notification(title: &str, body: &str) -> crate::AgentState {
     let lower = format!("{} {}", title.to_lowercase(), body.to_lowercase());
+    // PR #127 review: approval phrasing is checked BEFORE the idle match.
+    // Idle keywords include "waiting for user"/"waiting for input"/
+    // "waiting for command", so an approval prompt phrased "permission
+    // needed — waiting for user input" would otherwise classify as Idle
+    // and release the #93 blocked-send gate. Approval always wins.
+    if lower.contains("permission")
+        || lower.contains("approval")
+        || lower.contains("approve")
+        || lower.contains("confirm")
+        || lower.contains("authoriz")
+    {
+        return crate::AgentState::Blocked;
+    }
     if lower.contains("idle")
         || lower.contains("ready")
         || lower.contains("complete")

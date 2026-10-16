@@ -112,7 +112,10 @@ fn agent_state_for_event(payload: &HookPayload) -> Option<&'static str> {
             {
                 "idle"
             } else {
-                "idle"
+                // PR #127 review: default-deny. An unrecognized
+                // Notification must not silently un-gate sends; only the
+                // explicit idle keywords above may release the #93 gate.
+                "blocked"
             }
         }
         "Stop" | "SubagentStop" => "idle",
@@ -577,6 +580,16 @@ mod tests {
         assert_eq!(agent_state_for_event(&make_payload("PostToolUse", None, None)), Some("working"));
         assert_eq!(agent_state_for_event(&make_payload("Notification", Some("permission_prompt"), None)), Some("blocked"));
         assert_eq!(agent_state_for_event(&make_payload("Notification", Some("idle_prompt"), None)), Some("idle"));
+        // PR #127 review: default-deny — an unrecognized Notification type
+        // must map to "blocked", never silently release the #93 gate.
+        assert_eq!(
+            agent_state_for_event(&make_payload("Notification", Some("something_unrecognized"), None)),
+            Some("blocked")
+        );
+        assert_eq!(
+            agent_state_for_event(&make_payload("Notification", None, Some("unrecognized message text"))),
+            Some("blocked")
+        );
         assert_eq!(agent_state_for_event(&make_payload("Stop", None, None)), Some("idle"));
         assert_eq!(agent_state_for_event(&make_payload("SubagentStop", None, None)), Some("idle"));
         assert_eq!(agent_state_for_event(&make_payload("SessionEnd", None, None)), Some("done"));
