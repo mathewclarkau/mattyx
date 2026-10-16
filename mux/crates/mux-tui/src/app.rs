@@ -410,6 +410,14 @@ enum Drag {
     ResizeSplit { horizontal: Option<(PaneId, PaneEdge)>, vertical: Option<(PaneId, PaneEdge)> },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ConsumptionWatch {
+    pub surface: SurfaceId,
+    pub deadline: Instant,
+    pub output_seen: bool,
+    pub hint_emitted: bool,
+}
+
 pub struct App {
     pub session: Session,
     pub config: Config,
@@ -421,6 +429,8 @@ pub struct App {
     stdout_lock: Arc<Mutex<()>>,
     pub pane_areas: Vec<PaneArea>,
     pub prefix_armed: bool,
+    pub answer_armed: bool,
+    pub consumption_watch: Option<ConsumptionWatch>,
     pub session_label: String,
     pub sidebar_visible: bool,
     /// Width of the sidebar in the current frame (0 when hidden).
@@ -729,6 +739,8 @@ pub fn run(
         stdout_lock: stdout_lock.clone(),
         pane_areas: Vec::new(),
         prefix_armed: false,
+        answer_armed: false,
+        consumption_watch: None,
         session_label,
         sidebar_visible: true,
         sidebar_width: 0,
@@ -809,6 +821,7 @@ impl App {
                 || self.toast.is_some()
                 || self.has_active_flash()
                 || self.session_manager.is_some()
+                || self.consumption_watch.is_some_and(|w| !w.hint_emitted && !w.output_seen)
             {
                 Duration::from_millis(30)
             } else {
@@ -828,6 +841,9 @@ impl App {
                         action = action.merge(RenderAction::Draw);
                     }
                     if self.expire_flashes() {
+                        action = action.merge(RenderAction::Draw);
+                    }
+                    if self.check_consumption_watch() {
                         action = action.merge(RenderAction::Draw);
                     }
                     None
@@ -850,6 +866,9 @@ impl App {
                 action = action.merge(RenderAction::Draw);
             }
             if self.expire_flashes() {
+                action = action.merge(RenderAction::Draw);
+            }
+            if self.check_consumption_watch() {
                 action = action.merge(RenderAction::Draw);
             }
             match action {
@@ -1033,6 +1052,16 @@ impl App {
                 Ok(RenderAction::Draw)
             }
             AppEvent::Mux(MuxEvent::SurfaceOutput(id)) => {
+                if let Some(watch) = self.consumption_watch.as_mut() {
+                    if watch.surface == id {
+                        watch.output_seen = true;
+                        if self.status_message.as_deref()
+                            == Some("keys reached the pane; the child did not change the screen")
+                        {
+                            self.status_message = None;
+                        }
+                    }
+                }
                 if self.frame_only_browser_update(id) {
                     Ok(RenderAction::Graphics)
                 } else {
@@ -1115,7 +1144,7 @@ impl App {
         self.tree.active_screen().map(|screen| screen.active_pane)
     }
 
-    fn active_surface(&self) -> Option<SurfaceId> {
+    pub fn active_surface(&self) -> Option<SurfaceId> {
         self.tree.active_surface()
     }
 
@@ -1257,6 +1286,32 @@ impl App {
         }
         if self.omnibar.is_some() {
             return self.handle_omnibar_key(key);
+        }
+        if self.answer_armed {
+            self.answer_armed = false;
+            let bytes: Option<&'static [u8]> = match key.code {
+                KeyCode::Down => Some(b"\x1b[B"),
+                KeyCode::Up => Some(b"\x1b[A"),
+                KeyCode::Enter => Some(b"\r"),
+                KeyCode::Esc => Some(b"\x1b"),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(b"\x03"),
+                KeyCode::Char('1') => Some(b"1"),
+                KeyCode::Char('2') => Some(b"2"),
+                KeyCode::Char('3') => Some(b"3"),
+                KeyCode::Char('4') => Some(b"4"),
+                KeyCode::Char('5') => Some(b"5"),
+                KeyCode::Char('6') => Some(b"6"),
+                KeyCode::Char('7') => Some(b"7"),
+                KeyCode::Char('8') => Some(b"8"),
+                KeyCode::Char('9') => Some(b"9"),
+                _ => None,
+            };
+            if let Some(b) = bytes {
+                self.write_answer_bytes(b);
+            } else {
+                self.forward_key(&key);
+            }
+            return Ok(RenderAction::Draw);
         }
         if let Some(action) = self.config.keys.modeless_action_for(&key) {
             return self.run_action(action);
@@ -1422,6 +1477,19 @@ impl App {
             self.forward_key(&key);
             return Ok(RenderAction::Draw);
         }
+        // Direct answer shortcuts: prefix + Enter (\r), prefix + Esc (\x1b), prefix + Ctrl-c (\x03)
+        if key.code == KeyCode::Enter {
+            self.write_answer_bytes(b"\r");
+            return Ok(RenderAction::Draw);
+        }
+        if key.code == KeyCode::Esc {
+            self.write_answer_bytes(b"\x1b");
+            return Ok(RenderAction::Draw);
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.write_answer_bytes(b"\x03");
+            return Ok(RenderAction::Draw);
+        }
         // 1-9 select a tab by number (fixed: they mirror the tab labels).
         if let KeyCode::Char(c @ '1'..='9') = key.code {
             let pane = self.active_pane();
@@ -1489,7 +1557,7 @@ impl App {
             Action::PrevScreen => self.session.select_screen(None, Some(-1)),
             Action::NextScreen => self.session.select_screen(None, Some(1)),
             Action::NewScreen => self.new_screen()?,
-            Action::NextWorkspace => self.session.select_workspace(None, Some(1)),
+            Action::NextWorkspace => self.select_workspace(None, Some(1)),
             Action::NewWorkspace => self.new_workspace()?,
             Action::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
             Action::FocusLeft => self.move_focus(-1, 0),
@@ -1538,6 +1606,10 @@ impl App {
             }
             Action::OpenSessionManager => {
                 self.open_session_manager();
+                return Ok(RenderAction::Draw);
+            }
+            Action::Answer => {
+                self.answer_armed = true;
                 return Ok(RenderAction::Draw);
             }
         }
@@ -1651,7 +1723,7 @@ impl App {
                 self.session_manager_rename(socket, new_name);
             }
             SessionManagerAction::FocusWorkspaceInPlace { index } => {
-                self.session.select_workspace(Some(index), None);
+                self.select_workspace(Some(index), None);
                 // The focus change shows up via the next mux event redraw;
                 // keep the overlay open so the user can pick again.
             }
@@ -1897,16 +1969,21 @@ impl App {
     /// Resolve a finder target to a focus action against the session.
     /// Focusing a surface also activates its workspace, screen, pane,
     /// and tab so the user lands on the agent they picked.
-    fn focus_finder_target(&self, target: crate::finder::FinderTarget) {
+    fn focus_finder_target(&mut self, target: crate::finder::FinderTarget) {
         use crate::finder::FinderTarget;
         match target {
             FinderTarget::Workspace(id) => {
                 if let Some(index) = self.tree.workspaces.iter().position(|ws| ws.id == id) {
-                    self.session.select_workspace(Some(index), None);
+                    self.select_workspace(Some(index), None);
                 }
             }
             FinderTarget::Pane(id) => {
                 self.session.focus_pane(id);
+                if let Some(surface) = self.active_surface_handle() {
+                    surface.with_terminal(|term| {
+                        term.scroll_to_bottom();
+                    });
+                }
             }
             FinderTarget::Surface(id) => {
                 for ws in &self.tree.workspaces {
@@ -1917,6 +1994,11 @@ impl App {
                             {
                                 self.session.focus_pane(pane.id);
                                 self.session.select_tab(Some(pane.id), Some(tab_index), None);
+                                if let Some(surface) = self.active_surface_handle() {
+                                    surface.with_terminal(|term| {
+                                        term.scroll_to_bottom();
+                                    });
+                                }
                                 return;
                             }
                         }
@@ -2188,6 +2270,56 @@ impl App {
         }
     }
 
+    pub fn select_workspace(&mut self, index: Option<usize>, delta: Option<isize>) {
+        self.prefix_armed = false;
+        self.answer_armed = false;
+        self.session.select_workspace(index, delta);
+        self.tree = self.session.tree();
+        if let Some(ws) = self.tree.active_workspace() {
+            if let Some(screen) = ws.active_screen_ref() {
+                self.session.focus_pane(screen.active_pane);
+            }
+        }
+        if let Some(surface) = self.active_surface_handle() {
+            surface.with_terminal(|term| {
+                term.scroll_to_bottom();
+            });
+        }
+    }
+
+    pub fn arm_consumption_watch(&mut self, surface: SurfaceId) {
+        self.consumption_watch = Some(ConsumptionWatch {
+            surface,
+            deadline: Instant::now() + Duration::from_millis(1000),
+            output_seen: false,
+            hint_emitted: false,
+        });
+    }
+
+    pub fn check_consumption_watch(&mut self) -> bool {
+        let Some(watch) = self.consumption_watch.as_mut() else { return false };
+        if !watch.hint_emitted && !watch.output_seen && Instant::now() >= watch.deadline {
+            watch.hint_emitted = true;
+            self.status_message =
+                Some("keys reached the pane; the child did not change the screen".to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn write_answer_bytes(&mut self, bytes: &[u8]) {
+        let Some(surface) = self.active_surface_handle() else { return };
+        let surface_id = self.active_surface();
+        surface.with_terminal(|term| {
+            term.scroll_to_bottom();
+        });
+        surface.write_bytes(bytes);
+        if let Some(id) = surface_id {
+            self.arm_consumption_watch(id);
+        }
+    }
+
     fn forward_key(&mut self, key: &KeyEvent) {
         if self
             .active_surface_handle()
@@ -2228,6 +2360,9 @@ impl App {
         };
         if encoded.is_ok() && !self.encode_buf.is_empty() {
             surface.write_bytes(&self.encode_buf);
+            if let Some(id) = self.active_surface() {
+                self.arm_consumption_watch(id);
+            }
         }
     }
 
@@ -2841,7 +2976,7 @@ impl App {
         if let Some(Drag::WorkspaceArm { workspace, .. }) = self.drag {
             self.drag = None;
             if let Some(index) = self.workspace_index(workspace) {
-                self.session.select_workspace(Some(index), None);
+                self.select_workspace(Some(index), None);
             }
             return Ok(RenderAction::Draw);
         }
@@ -3429,5 +3564,28 @@ mod tests {
     fn flash_active_expired_at_or_after_duration() {
         assert!(!flash_active(Duration::from_millis(500)));
         assert!(!flash_active(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn consumption_watch_fires_hint_after_deadline_when_no_output() {
+        use std::time::Instant;
+        use super::ConsumptionWatch;
+
+        let mut watch = ConsumptionWatch {
+            surface: 1,
+            deadline: Instant::now() - Duration::from_millis(10),
+            output_seen: false,
+            hint_emitted: false,
+        };
+        assert!(!watch.hint_emitted && !watch.output_seen && Instant::now() >= watch.deadline);
+        watch.hint_emitted = true;
+
+        let watch_seen = ConsumptionWatch {
+            surface: 1,
+            deadline: Instant::now() - Duration::from_millis(10),
+            output_seen: true,
+            hint_emitted: false,
+        };
+        assert!(!(!watch_seen.hint_emitted && !watch_seen.output_seen && Instant::now() >= watch_seen.deadline));
     }
 }

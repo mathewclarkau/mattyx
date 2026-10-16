@@ -2835,6 +2835,21 @@ reattaching to remote session {session_id} on {host} \
         }
         self.emit(MuxEvent::TreeChanged);
     }
+
+    /// Return the active surface id of the active pane of the active workspace, if any.
+    pub fn active_surface(&self) -> Option<SurfaceId> {
+        let state = self.state.lock().unwrap();
+        let ws = state.workspaces.get(state.active_workspace)?;
+        let screen = ws.active_screen_ref()?;
+        let pane = state.panes.get(&screen.active_pane)?;
+        pane.active_surface()
+    }
+
+    /// Return the active surface handle of the active pane of the active workspace, if any.
+    pub fn active_surface_handle(&self) -> Option<Arc<Surface>> {
+        let id = self.active_surface()?;
+        self.surface(id)
+    }
 }
 
 /// Spawn overrides for a layout tab's recorded argv/env/cwd. Browser and

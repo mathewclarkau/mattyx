@@ -67,10 +67,16 @@ fn grok_native_hooks() -> Value {
             "SessionStart": group("working"),
             "PreToolUse": group("working"),
             "PostToolUse": group("idle"),
-            "Notification": [{
-                "matcher": "idle_prompt|permission_prompt",
-                "hooks": [command("blocked")]
-            }],
+            "Notification": [
+                {
+                    "matcher": "permission_prompt",
+                    "hooks": [command("blocked")]
+                },
+                {
+                    "matcher": "idle_prompt",
+                    "hooks": [command("idle")]
+                }
+            ],
             "Stop": group("done"),
             "SubagentStart": group("working"),
             "SubagentStop": group("idle")
@@ -267,7 +273,12 @@ mod tests {
         assert!(command.contains("--source hook"), "{command}");
         assert!(!command.contains("--source grok"), "{command}");
         assert!(command.contains("test -n \"$MTYX_MUX_SURFACE\""), "{command}");
-        assert_eq!(hooks["hooks"]["Notification"][0]["matcher"], "idle_prompt|permission_prompt");
+        assert_eq!(hooks["hooks"]["Notification"][0]["matcher"], "permission_prompt");
+        assert_eq!(hooks["hooks"]["Notification"][1]["matcher"], "idle_prompt");
+        let notif_blocked = hooks["hooks"]["Notification"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(notif_blocked.contains("--state blocked"), "{notif_blocked}");
+        let notif_idle = hooks["hooks"]["Notification"][1]["hooks"][0]["command"].as_str().unwrap();
+        assert!(notif_idle.contains("--state idle"), "{notif_idle}");
     }
 
     /// Issue #97 AC1: every emitted command invokes the running binary by

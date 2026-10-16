@@ -663,9 +663,10 @@ impl Surface {
                     if let Some(watcher) = osc_watcher.as_mut() {
                         for (title, body) in watcher.feed(&buf[..n]) {
                             if let Some(mux) = mux.upgrade() {
+                                let detected_state = classify_osc_notification(&title, &body);
                                 mux.report_surface_agent(
                                     &surface,
-                                    crate::AgentState::Blocked,
+                                    detected_state,
                                     crate::AgentStateSource::Detected,
                                     None,
                                     None,
@@ -1307,5 +1308,36 @@ mod tests {
         assert_eq!(gate.current, 3);
         let t3 = gate.take_ticket();
         assert_eq!(t3, 3);
+    }
+
+    #[test]
+    fn test_classify_osc_notification() {
+        assert_eq!(classify_osc_notification("Build failed", "Errors encountered"), crate::AgentState::Blocked);
+        assert_eq!(classify_osc_notification("Grok", "Permission prompt"), crate::AgentState::Blocked);
+        assert_eq!(classify_osc_notification("Grok", "idle_prompt"), crate::AgentState::Idle);
+        assert_eq!(classify_osc_notification("Claude", "Task completed"), crate::AgentState::Idle);
+        assert_eq!(classify_osc_notification("Agent", "Waiting for user input"), crate::AgentState::Idle);
+    }
+}
+
+/// Classify an OSC desktop notification (issue #126).
+///
+/// An idle prompt or a task-complete notice is not an approval dialog and
+/// must not force `Blocked`.
+pub fn classify_osc_notification(title: &str, body: &str) -> crate::AgentState {
+    let lower = format!("{} {}", title.to_lowercase(), body.to_lowercase());
+    if lower.contains("idle")
+        || lower.contains("ready")
+        || lower.contains("complete")
+        || lower.contains("finished")
+        || lower.contains("done")
+        || lower.contains("succeeded")
+        || lower.contains("waiting for user")
+        || lower.contains("waiting for input")
+        || lower.contains("waiting for command")
+    {
+        crate::AgentState::Idle
+    } else {
+        crate::AgentState::Blocked
     }
 }

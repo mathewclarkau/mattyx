@@ -3,6 +3,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use base64::Engine;
 use mux_core::platform::transport;
 use serde_json::{json, Value};
 
@@ -46,7 +47,7 @@ const BARE_BOOL_FLAGS: &[&str] =
 /// (issue #84: `mtyx screenshot --surface <id> <file>`), mapped onto the
 /// named flag of the same meaning (`<file>` == `--output <file>`). Passing
 /// both forms is a usage error.
-const POSITIONAL_FLAG_VERBS: &[(&str, &str)] = &[("screenshot", "output")];
+const POSITIONAL_FLAG_VERBS: &[(&str, &str)] = &[("screenshot", "output"), ("answer", "key")];
 
 #[derive(Default)]
 struct FlagMap {
@@ -113,6 +114,20 @@ const VERBS: &[VerbSpec] = &[
             "wait-timeout-ms",
         ],
         build: build_send,
+        print: print_empty,
+        stream: false,
+    },
+    VerbSpec {
+        name: "answer",
+        allowed: &["surface", "key"],
+        build: build_answer,
+        print: print_empty,
+        stream: false,
+    },
+    VerbSpec {
+        name: "write-bytes",
+        allowed: &["surface", "bytes"],
+        build: build_write_bytes,
         print: print_empty,
         stream: false,
     },
@@ -1324,6 +1339,42 @@ fn build_send(flags: &FlagMap) -> Result<Value, UsageError> {
             .map_err(|err| UsageError(format!("failed to read stdin: {err}")))?;
         value["text"] = json!(text);
     }
+    Ok(value)
+}
+
+fn build_write_bytes(flags: &FlagMap) -> Result<Value, UsageError> {
+    let mut value = json!({ "bytes": flags.required("bytes")? });
+    flags.insert_optional_u64(&mut value, "surface")?;
+    Ok(value)
+}
+
+fn build_answer(flags: &FlagMap) -> Result<Value, UsageError> {
+    let mut value = json!({});
+    flags.insert_optional_u64(&mut value, "surface")?;
+    let key = flags.required("key")?;
+    let bytes: &[u8] = match key.to_lowercase().as_str() {
+        "down" | "arrow-down" | "arrow_down" => b"\x1b[B",
+        "up" | "arrow-up" | "arrow_up" => b"\x1b[A",
+        "enter" | "return" => b"\r",
+        "esc" | "escape" => b"\x1b",
+        "ctrl-c" | "ctrl+c" | "c-c" => b"\x03",
+        "1" => b"1",
+        "2" => b"2",
+        "3" => b"3",
+        "4" => b"4",
+        "5" => b"5",
+        "6" => b"6",
+        "7" => b"7",
+        "8" => b"8",
+        "9" => b"9",
+        _ => {
+            return Err(UsageError(format!(
+                "unrecognized answer key {key:?}; expected one of: down, up, enter, esc, ctrl-c, 1-9"
+            )))
+        }
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    value["bytes"] = json!(encoded);
     Ok(value)
 }
 
@@ -3560,5 +3611,42 @@ mod tests {
         assert_eq!((sub.verb.build)(&sub.flags).unwrap(), json!({}));
         let sub = parse_ok(&["subscribe", "--client", "c2"]);
         assert_eq!((sub.verb.build)(&sub.flags).unwrap()["client"], json!("c2"));
+    }
+
+    #[test]
+    fn answer_and_write_bytes_build_requests() {
+        let ans_down = parse_ok(&["answer", "down"]);
+        let built = (ans_down.verb.build)(&ans_down.flags).unwrap();
+        assert_eq!(
+            built["bytes"],
+            json!(base64::engine::general_purpose::STANDARD.encode(b"\x1b[B"))
+        );
+        assert!(built.get("surface").is_none());
+
+        let ans_surface = parse_ok(&["answer", "--surface", "5", "enter"]);
+        let built = (ans_surface.verb.build)(&ans_surface.flags).unwrap();
+        assert_eq!(built["surface"], json!(5));
+        assert_eq!(
+            built["bytes"],
+            json!(base64::engine::general_purpose::STANDARD.encode(b"\r"))
+        );
+
+        let ans_ctrl_c = parse_ok(&["answer", "ctrl-c"]);
+        let built = (ans_ctrl_c.verb.build)(&ans_ctrl_c.flags).unwrap();
+        assert_eq!(
+            built["bytes"],
+            json!(base64::engine::general_purpose::STANDARD.encode(b"\x03"))
+        );
+
+        let ans_digit = parse_ok(&["answer", "2"]);
+        let built = (ans_digit.verb.build)(&ans_digit.flags).unwrap();
+        assert_eq!(
+            built["bytes"],
+            json!(base64::engine::general_purpose::STANDARD.encode(b"2"))
+        );
+
+        let wb = parse_ok(&["write-bytes", "--bytes", "aGVsbG8="]);
+        let built = (wb.verb.build)(&wb.flags).unwrap();
+        assert_eq!(built["bytes"], json!("aGVsbG8="));
     }
 }

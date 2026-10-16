@@ -307,6 +307,40 @@ Example:
 {"id":3,"ok":true,"data":{}}
 ```
 
+### write-bytes
+
+| Field  | Value         |
+| ------ | ------------- |
+| name   | `write-bytes` |
+| alias  | `answer`      |
+| status | implemented   |
+| since  | protocol 7    |
+
+Writes raw bytes directly to a PTY surface, bypassing the issue #93 `agent_blocked` gate. This is used by interactive attach clients and the operator answer hatch so keyboard input is never locked out when an agent card or terminal is blocked. If `surface` is omitted, input is written to the session's active surface.
+
+Params:
+
+| Name      | JSON type | Required/default | Constraints                                            |
+| --------- | --------- | ---------------- | ------------------------------------------------------ |
+| `surface` | `Id`      | default null     | When omitted, targets the session's active surface     |
+| `bytes`   | `Base64`  | required         | Standard base64-encoded raw bytes to write to the PTY |
+
+Result:
+
+```text
+object{}
+```
+
+CLI mapping:
+
+| Item         | Value                                                         |
+| ------------ | ------------------------------------------------------------- |
+| Verb         | `write-bytes` / `answer`                                      |
+| Flags        | `write-bytes: --bytes <base64> [--surface <id>]`              |
+|              | `answer: <key> [--surface <id>]` (key: down, up, enter, esc, ctrl-c, 1-9) |
+| Plain stdout | no output                                                     |
+| JSON stdout  | exact result object                                           |
+
 ### read-screen
 
 | Field  | Value         |

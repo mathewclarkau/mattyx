@@ -439,6 +439,7 @@ pub enum Action {
     OpenSessionManager,
     ShowHelp,
     ToggleZoom,
+    Answer,
 }
 
 impl Action {
@@ -480,6 +481,7 @@ impl Action {
             Action::OpenSessionManager => "open-session-manager",
             Action::ShowHelp => "show-help",
             Action::ToggleZoom => "toggle-zoom",
+            Action::Answer => "answer",
         }
     }
 
@@ -522,6 +524,7 @@ impl Action {
             Action::OpenSessionManager => "Open session manager",
             Action::ShowHelp => "Show help",
             Action::ToggleZoom => "Toggle zoom",
+            Action::Answer => "Answer prompt",
         }
     }
 
@@ -564,6 +567,7 @@ impl Action {
             Action::OpenSessionManager => "Open the session manager overlay",
             Action::ShowHelp => "Show this key binding help",
             Action::ToggleZoom => "Zoom or unzoom the focused pane",
+            Action::Answer => "Inject answer bytes into the focused pane (Down, Up, Enter, 1-9, Ctrl-c)",
         }
     }
 
@@ -588,7 +592,8 @@ impl Action {
             | Action::FocusDown
             | Action::ResizeGrow
             | Action::ResizeShrink
-            | Action::ToggleZoom => HelpCategory::Pane,
+            | Action::ToggleZoom
+            | Action::Answer => HelpCategory::Pane,
             Action::NewTab
             | Action::NewBrowserTab
             | Action::NextTab
@@ -700,6 +705,7 @@ impl Default for Keys {
                 bind(KeyCode::Char('S'), Action::OpenSessionManager),
                 bind(KeyCode::Char('?'), Action::ShowHelp),
                 bind(KeyCode::Char('z'), Action::ToggleZoom),
+                bind(KeyCode::Char('a'), Action::Answer),
             ],
         }
     }
@@ -893,6 +899,7 @@ fn all_actions() -> &'static [Action] {
         Action::OpenSessionManager,
         Action::ShowHelp,
         Action::ToggleZoom,
+        Action::Answer,
     ]
 }
 
@@ -2202,6 +2209,16 @@ sidebar_rail = 77
             Some(Action::ToggleZoom)
         );
         assert!(all_actions().contains(&Action::ToggleZoom));
+    }
+
+    #[test]
+    fn default_a_answers_prompt() {
+        let keys = Keys::default();
+        assert_eq!(
+            keys.action_for(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some(Action::Answer)
+        );
+        assert!(all_actions().contains(&Action::Answer));
     }
 
     #[test]

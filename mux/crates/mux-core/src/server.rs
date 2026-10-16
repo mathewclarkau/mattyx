@@ -413,6 +413,14 @@ enum Command {
         #[serde(default)]
         wait_activity_ms: Option<u64>,
     },
+    /// Direct, un-gated byte write to a PTY surface (operator/attach input and answer hatch).
+    /// Bypasses the #93 blocked-send gate. If `surface` is omitted, targets the focused pane.
+    #[serde(alias = "answer")]
+    WriteBytes {
+        #[serde(default)]
+        surface: Option<SurfaceId>,
+        bytes: String,
+    },
     ReadScreen {
         surface: SurfaceId,
     },
@@ -2051,6 +2059,18 @@ fn handle_command(mux: &Arc<Mux>, cmd: Command, writer: &LineWriter) -> anyhow::
                 None if confirm.unwrap_or(false) => Ok(json!({ "confirmed": true })),
                 None => Ok(json!({})),
             }
+        }
+        Command::WriteBytes { surface, bytes } => {
+            let surface = match surface {
+                Some(id) => get_surface(mux, id)?,
+                None => mux
+                    .active_surface_handle()
+                    .ok_or_else(|| ServerError::new("no_active_surface", "no active surface in session"))?,
+            };
+            require_pty(&surface)?;
+            let raw = base64::engine::general_purpose::STANDARD.decode(bytes)?;
+            surface.write_bytes(&raw)?;
+            Ok(json!({}))
         }
         Command::ReadScreen { surface } => {
             let surface = get_surface(mux, surface)?;
