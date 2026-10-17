@@ -13,6 +13,7 @@ licensing. This file is the living **drift ledger** (issue #29).
 | v0.1.0 | (initial vendor) | `adc48877a` | Anchor for `mux/` + `daemon/remote/` |
 | v0.4.0 | (n/a — port-only) | `7652d3b1c` (observed, not integrated) | First large port divergence: session CLI, agent hooks, Linux lifecycle |
 | *next after #29 batch 1* | `d19f59aa2` (PATH fix only) | `7652d3b1c` | See [Integration log](#integration-log) |
+| v0.22.0 | (n/a — port-only) | `7652d3b1c` (unchanged) | Port-only release: #126/#127 blocked-pane keyboard-lockup fix + macOS clipboard (#110). No upstream integration — upstream divergence now ~10k commits past the anchor |
 
 Update this table on every release that either integrates upstream commits or
 deliberately ships further port-only work while upstream advances.
