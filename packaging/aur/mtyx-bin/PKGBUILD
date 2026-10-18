@@ -13,7 +13,7 @@ depends=('glibc' 'gcc-libs')
 optdepends=('libnotify: desktop notifications (notify-send)'
             'pipewire: audio playback for contrib alerts (paplay/pw-play)')
 source_x86_64=("https://github.com/mathewclarkau/mattyx/releases/download/v${pkgver}/mtyx-linux-x86_64")
-sha256sums_x86_64=('0019dfc4b32d63c1392aa264aed2253c1e0c2fb09216f8e2cc269bbfb8bb49b5')
+sha256sums_x86_64=('f7ac986208b56d9930be3ccb65a8c000eea72cdf145e2fbc6364f3d7d11ae40a')
 # aarch64: enable when the release workflow publishes the arm64 asset reliably
 # source_aarch64=("https://github.com/mathewclarkau/mattyx/releases/download/v${pkgver}/mtyx-linux-aarch64")
 # sha256sums_aarch64=('SKIP')
