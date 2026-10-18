@@ -112,21 +112,42 @@ done
 
 echo "==> building mux-tui (release)"
 cd "$ROOT/mux"
-# Pin cargo to the Rust 1.97 toolchain via rustup's "+toolchain" syntax.
-# The dtolnay/rust-toolchain action installs Rust 1.97 under
-# ~/.cargo but the CI image's PATH may still surface an older
-# system cargo first (1.74 on ubuntu-22.04, 1.82 on ubuntu-24.04).
-# Older cargo < 1.78 cannot read Cargo.lock v4, which we generate
-# by default. The "+1.97" prefix routes through rustup regardless of
-# PATH ordering. See AGENTS.md "Pinned toolchain" for the rust pin.
+# Pin cargo to the Rust 1.97 toolchain via rustup's "+toolchain" syntax
+# when rustup is available. The dtolnay/rust-toolchain action installs Rust
+# 1.97 under ~/.cargo but the CI image's PATH may still surface an older
+# system cargo first (1.74 on ubuntu-22.04, 1.82 on ubuntu-24.04). Older
+# cargo < 1.78 cannot read Cargo.lock v4, which we generate by default. The
+# "+1.97" prefix routes through rustup regardless of PATH ordering. See
+# AGENTS.md "Pinned toolchain" for the rust pin.
+#
+# On a box without rustup (system cargo only) "+1.97" is "no such command",
+# so fall back to the plain cargo invocation. An old system cargo is only a
+# warning, not a hard failure — the lockfile parser is the real constraint.
 if command -v cargo >/dev/null 2>&1; then
     CARGO_BIN="$(command -v cargo)"
 else
     echo "error: cargo not found on PATH (dtolnay/rust-toolchain should install it)" >&2
     exit 1
 fi
-echo "    using: $("$CARGO_BIN" --version)"
-ZIG="$ZIG_BIN" "$CARGO_BIN" "+1.97" build --release -p mux-tui
+CARGO_VERSION="$("$CARGO_BIN" --version)"
+echo "    using: $CARGO_VERSION"
+# "cargo 1.99.0 (...)" -> minor "99"
+CARGO_MINOR="${CARGO_VERSION#*.}"
+CARGO_MINOR="${CARGO_MINOR%%.*}"
+case "$CARGO_MINOR" in
+    ''|*[!0-9]*) ;;
+    *)
+        if [ "$CARGO_MINOR" -lt 78 ]; then
+            echo "warning: $CARGO_VERSION is older than 1.78; Cargo.lock may not parse" >&2
+        fi
+        ;;
+esac
+if rustup --version >/dev/null 2>&1; then
+    ZIG="$ZIG_BIN" "$CARGO_BIN" "+1.97" build --release -p mux-tui
+else
+    echo "    rustup not found; building with $CARGO_BIN directly (no +1.97 pin)"
+    ZIG="$ZIG_BIN" "$CARGO_BIN" build --release -p mux-tui
+fi
 
 if [ "$ZIG_OS" = "windows" ]; then
   echo "==> built: $ROOT/mux/target/release/mtyx.exe"
