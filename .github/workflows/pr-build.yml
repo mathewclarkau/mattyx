@@ -135,12 +135,19 @@ jobs:
         working-directory: mux
         run: cargo +1.97 check -p mux-tui
 
+      # Tests that read std::env::temp_dir() are sensitive to a leaked or
+      # unwritable $TMPDIR; pin it to /tmp so the suite is deterministic on
+      # the runner (see mux/docs/getting-started.md > Sessions and sockets).
       - name: Cargo test (mux-tui)
         working-directory: mux
+        env:
+          TMPDIR: /tmp
         run: cargo +1.97 test -p mux-tui
 
       - name: Cargo test (mux-core)
         working-directory: mux
+        env:
+          TMPDIR: /tmp
         run: cargo +1.97 test -p mux-core
 
       - name: Setup Go
