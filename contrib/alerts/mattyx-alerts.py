@@ -30,6 +30,10 @@ Key behaviours:
   restarts are survived.
 - Audio leg: first working player of paplay / pw-play / ffplay -nodsp
   -autoexit / aplay, probed once and cached.
+- Desktop leg: notify-send. With a known surface it attaches a "Focus pane"
+  action; clicking it runs `mtyx focus-pane --surface <id>`. Desktops or
+  notify-send builds without action support silently fall back to the plain
+  two-argument notification.
 
 Environment:
 
@@ -281,25 +285,77 @@ class LabelResolver:
 
 
 class Notifier:
-    """notify-send leg. Failures are logged and swallowed."""
+    """notify-send leg. Failures are logged and swallowed.
 
-    def __init__(self, run=subprocess.run):
+    When a surface id is supplied, send() adds a "Focus pane" action and, if
+    the user clicks it, runs `mtyx focus-pane --surface <id>`. notify-send's
+    -A implies --wait, so the action form blocks until the notification is
+    dismissed or clicked (bounded by a timeout). If the installed
+    notify-send or the desktop server does not support actions, we log once
+    and degrade silently to the plain two-argument notification.
+    """
+
+    #: Action key notify-send prints when the Focus button is clicked.
+    FOCUS_ACTION = "mtyx-focus"
+
+    def __init__(self, run=subprocess.run, which=shutil.which, mtyx_bin=None):
         self._run = run
-        self._available = shutil.which("notify-send") is not None
+        self._available = which("notify-send") is not None
+        self._bin = mtyx_bin or resolve_mtyx_bin()
+        self._actions_ok = True
         self._warned = False
 
-    def send(self, title: str, body: str) -> None:
+    def send(self, title: str, body: str, surface: Optional[int] = None) -> None:
         if not self._available:
             if not self._warned:
                 log("notify-send not found; desktop notification leg disabled")
                 self._warned = True
             return
+        if surface is not None and self._actions_ok:
+            if self._send_with_action(title, body, surface):
+                return
+            # Actions unsupported: _send_with_action cleared _actions_ok, so
+            # this plain form is the last notify-send call for this ding.
+        self._send_plain(title, body)
+
+    def _send_plain(self, title: str, body: str) -> None:
         try:
             self._run(["notify-send", title, body],
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                       timeout=10)
         except Exception as exc:  # noqa: BLE001
             log(f"notify-send failed ({exc!r})")
+
+    def _send_with_action(self, title: str, body: str, surface: int) -> bool:
+        """Action form. Returns False only when the caller should retry the
+        plain form (actions unsupported); a displayed notification returns
+        True even if no action was clicked."""
+        argv = ["notify-send", "-A", f"{self.FOCUS_ACTION}=Focus pane", title, body]
+        try:
+            proc = self._run(argv, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=30, text=True)
+        except subprocess.TimeoutExpired:
+            # The notification was displayed; we just never saw a click.
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log(f"notify-send action form failed ({exc!r}); using plain form")
+            self._actions_ok = False
+            return False
+        if proc.returncode != 0:
+            # Old notify-send or a desktop server without action support.
+            self._actions_ok = False
+            return False
+        if (proc.stdout or "").strip() == self.FOCUS_ACTION:
+            self._focus(surface)
+        return True
+
+    def _focus(self, surface: int) -> None:
+        try:
+            self._run([self._bin, "focus-pane", "--surface", str(surface)],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                      timeout=10)
+        except Exception as exc:  # noqa: BLE001
+            log(f"focus-pane failed ({exc!r})")
 
 
 class SoundPlayer:
@@ -375,7 +431,7 @@ class AlertEmitter:
         label = self._resolver.label(ding.surface)
         body = format_transition(ding)
         if self._notify_enabled:
-            self._notifier.send(label, body)
+            self._notifier.send(label, body, surface=ding.surface)
         if self._sound_enabled:
             self._player.play()
         log(f"ding: surface={ding.surface} label={label!r}: {body}")
