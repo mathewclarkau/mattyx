@@ -856,13 +856,6 @@ enum Command {
         pane: PaneId,
         branch: String,
     },
-    /// Issue #75 AC3: read a pane's screen by agent name or surface id.
-    /// `source` is one of "visible" (default), "recent", or
-    /// "recent-unwrapped"; `recent`/`recent-unwrapped` are currently the
-    /// same active-screen content as "visible" (scrollback is not yet
-    /// surfaced by the VT formatter — see spec/commands.md), with
-    /// "recent-unwrapped" undoing soft line-wraps. `lines` tails the
-    /// last N lines (default 40).
     /// Issue #75 AC3: read a pane by agent name or surface id. `source`
     /// is one of "visible" (default: viewport rows only), "recent" (a
     /// bottom-anchored window including scrollback), or
