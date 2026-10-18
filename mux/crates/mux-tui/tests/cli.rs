@@ -863,6 +863,57 @@ fn agent_read_rejects_unknown_source() {
 }
 
 #[test]
+fn agent_read_gates_working_agent_and_force_bypasses() {
+    // D2.2: a pane reported `working` refuses `agent-read` with the
+    // structured `agent_not_idle` error (nonzero exit, message naming
+    // the code); `--force` bypasses the gate and returns the payload.
+    let server = HeadlessServer::start("agent-read-gate");
+    let workspace = cli(&server, &["new-workspace", "--name", "reader-gate"]);
+    assert_success(&workspace);
+    let surface = String::from_utf8(workspace.stdout).unwrap().trim().parse::<u64>().unwrap();
+    let surface_str = surface.to_string();
+
+    let report = cli(
+        &server,
+        &["report-agent", "--surface", &surface_str, "--state", "working", "--source", "hook"],
+    );
+    assert_success(&report);
+
+    // Ungated read: exit 1, stderr names the structured code.
+    let gated = cli(&server, &["agent-read", "--target", &surface_str]);
+    assert_eq!(
+        gated.status.code(),
+        Some(1),
+        "working-agent read must exit nonzero; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&gated.stdout),
+        String::from_utf8_lossy(&gated.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&gated.stderr).contains("agent_not_idle"),
+        "stderr was {:?}",
+        String::from_utf8_lossy(&gated.stderr)
+    );
+
+    // The --json envelope carries the same message (issue #98 shape).
+    let gated_json = cli(&server, &["--json", "agent-read", "--target", &surface_str]);
+    assert_eq!(gated_json.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&gated_json.stdout).unwrap();
+    assert_eq!(value["ok"], serde_json::json!(false), "envelope: {value}");
+    assert!(
+        value["error"]["message"].as_str().unwrap_or("").contains("agent_not_idle"),
+        "message must name the code: {value}"
+    );
+
+    // --force bypasses the gate and the payload still carries
+    // surface + text.
+    let forced = cli(&server, &["--json", "agent-read", "--target", &surface_str, "--force"]);
+    assert_success(&forced);
+    let forced_value: serde_json::Value = serde_json::from_slice(&forced.stdout).unwrap();
+    assert_eq!(forced_value["surface"].as_u64(), Some(surface), "payload: {forced_value}");
+    assert!(forced_value["text"].is_string(), "payload text: {forced_value}");
+}
+
+#[test]
 fn wait_agent_status_returns_immediately_when_state_matches() {
     // Issue #75 AC5 (Herdr semantics): if the agent already reports the
     // target state, the wait returns immediately with the matched state.

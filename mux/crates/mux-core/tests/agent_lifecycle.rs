@@ -1,12 +1,16 @@
 //! Issue #93: agent lifecycle contract — blocked-send gating and
 //! observed-transition waits.
 //!
-//! Two halves:
+//! Three parts:
 //!
 //! * `send` to a pane whose effective agent state is `Blocked` (an
 //!   explicit hook/socket report, or a screen-derived `Detected`
 //!   classification) is refused with the structured `agent_blocked`
 //!   error and writes NOTHING to the PTY. `force: true` bypasses it.
+//! * `agent-read` of a pane whose effective agent state is `Working`
+//!   (D2.2) is refused with the structured `agent_not_idle` error — a
+//!   mid-turn agent is a moving target. `force: true` bypasses it;
+//!   `Blocked` panes stay readable (stable content).
 //! * `wait-agent-status` with `require_transition` only succeeds on an
 //!   OBSERVED state change at/after the call, not on a cached state that
 //!   already matched.
@@ -155,6 +159,124 @@ fn send_with_force_bypasses_gate() {
         Duration::from_secs(5),
     );
     assert!(seen.is_some(), "forced send never reached the child");
+
+    mux.close_workspace(0);
+    mux_core::server::cleanup(&sock);
+}
+
+/// D2.2: `agent-read` on a pane whose effective agent state is
+/// `Working` is refused with the structured `agent_not_idle` error — a
+/// mid-turn agent renders a moving target, so the snapshot would be
+/// half-rendered. `Idle` (and `Blocked`: a pane parked at an approval
+/// dialog is stable) stay readable without force.
+#[test]
+fn agent_read_to_working_agent_returns_agent_not_idle() {
+    let mux = Mux::new(
+        unique_session("d22-read-gate"),
+        SurfaceOptions {
+            command: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "stty -echo; printf 'ready$ '; while IFS= read -r line; do echo \"GOT:$line\"; done"
+                    .to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    let surface = mux.new_workspace(None, None).unwrap();
+    let other = mux.new_workspace(None, None).unwrap();
+    let sock = mux_core::server::serve(mux.clone(), None).unwrap();
+    let sid = surface.id;
+
+    wait_for(|| screen_text(&surface).contains("ready$").then_some(()), Duration::from_secs(5))
+        .expect("pane prompt never appeared");
+
+    // Park the pane mid-turn via an explicit socket report.
+    let report = rpc(
+        &sock,
+        json!({"id": 1, "cmd": "report-agent", "surface": sid, "state": "working", "source": "socket",
+               "agent": "w22"}),
+    );
+    assert_eq!(report["ok"], json!(true), "report-agent failed: {report}");
+
+    // By agent name…
+    let read = rpc(&sock, json!({"id": 2, "cmd": "agent-read", "target": "w22"}));
+    assert_eq!(read["ok"], json!(false), "working-agent read must fail: {read}");
+    assert_eq!(
+        read["code"],
+        json!("agent_not_idle"),
+        "structured code must be agent_not_idle: {read}"
+    );
+    assert!(
+        read["error"].as_str().unwrap_or("").starts_with("agent_not_idle"),
+        "error string must carry the code prefix: {read}"
+    );
+
+    // …and by numeric surface id (target addressing is shared).
+    let read = rpc(&sock, json!({"id": 3, "cmd": "agent-read", "target": sid.to_string()}));
+    assert_eq!(read["ok"], json!(false), "id-addressed read must fail: {read}");
+    assert_eq!(read["code"], json!("agent_not_idle"), "code: {read}");
+
+    // Control: an idle pane reads fine WITHOUT force.
+    let idle = rpc(
+        &sock,
+        json!({"id": 4, "cmd": "report-agent", "surface": other.id, "state": "idle", "source": "socket"}),
+    );
+    assert_eq!(idle["ok"], json!(true), "idle report failed: {idle}");
+    let read = rpc(&sock, json!({"id": 5, "cmd": "agent-read", "target": other.id.to_string()}));
+    assert_eq!(read["ok"], json!(true), "idle pane must read without force: {read}");
+    assert_eq!(read["data"]["surface"], json!(other.id), "read payload: {read}");
+    assert!(read["data"]["text"].is_string(), "read payload text: {read}");
+
+    // Blocked is deliberately NOT gated (Working only): an approval
+    // dialog is stable, legitimately readable content.
+    let blocked = rpc(
+        &sock,
+        json!({"id": 6, "cmd": "report-agent", "surface": other.id, "state": "blocked", "source": "hook"}),
+    );
+    assert_eq!(blocked["ok"], json!(true), "blocked report failed: {blocked}");
+    let read = rpc(&sock, json!({"id": 7, "cmd": "agent-read", "target": other.id.to_string()}));
+    assert_eq!(read["ok"], json!(true), "blocked pane must read without force: {read}");
+
+    mux.close_workspace(0);
+    mux.close_workspace(1);
+    mux_core::server::cleanup(&sock);
+}
+
+/// D2.2: `force: true` bypasses the `agent_not_idle` gate and returns
+/// the same payload as an ungated read.
+#[test]
+fn agent_read_with_force_bypasses_gate() {
+    let mux = Mux::new(
+        unique_session("d22-read-force"),
+        SurfaceOptions {
+            command: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "stty -echo; printf 'ready$ '; while IFS= read -r line; do echo \"GOT:$line\"; done"
+                    .to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    let surface = mux.new_workspace(None, None).unwrap();
+    let sock = mux_core::server::serve(mux.clone(), None).unwrap();
+    let sid = surface.id;
+
+    wait_for(|| screen_text(&surface).contains("ready$").then_some(()), Duration::from_secs(5))
+        .expect("pane prompt never appeared");
+
+    let report = rpc(
+        &sock,
+        json!({"id": 1, "cmd": "report-agent", "surface": sid, "state": "working", "source": "hook"}),
+    );
+    assert_eq!(report["ok"], json!(true), "report-agent failed: {report}");
+
+    let read =
+        rpc(&sock, json!({"id": 2, "cmd": "agent-read", "target": sid.to_string(), "force": true}));
+    assert_eq!(read["ok"], json!(true), "forced read must succeed: {read}");
+    assert_eq!(read["data"]["surface"], json!(sid), "forced read payload: {read}");
+    assert!(read["data"]["text"].is_string(), "forced read must carry text: {read}");
 
     mux.close_workspace(0);
     mux_core::server::cleanup(&sock);
