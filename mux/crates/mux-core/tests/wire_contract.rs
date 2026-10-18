@@ -211,3 +211,84 @@ fn notify_ack_shape() {
     assert!(data["acked"].is_array(), "data.acked must be an array: {data}");
     assert!(data["unread"].is_number(), "data.unread must be a number: {data}");
 }
+
+/// D1: `agent-register` reply is the agent-report record (same shape as
+/// `report-agent`/`list-agents` entries). The registration runs at hook
+/// authority so a fast-starting agent's first hook report cannot reject
+/// it; the pinned part here is the KEY SET, not the values.
+#[test]
+fn agent_register_shape() {
+    let (_mux, sock, surface) = mux_with_workspace("wire-agent-register");
+    let resp =
+        rpc(&sock, json!({"id": 12, "cmd": "agent-register", "surface": surface, "agent": "demo"}));
+    assert_envelope(&resp, 12);
+
+    let data = &resp["data"];
+    assert!(data["surface"].is_number(), "surface must be a number: {data}");
+    assert!(data["state"].is_string(), "state must be a string: {data}");
+    assert!(data["source"].is_string(), "source must be a string: {data}");
+    assert!(data["agent"].is_string(), "agent must be a string: {data}");
+    assert!(data["updated_at_ms"].is_number(), "updated_at_ms must be a number: {data}");
+    assert!(data["state_seq"].is_number(), "state_seq must be a number: {data}");
+}
+
+/// D1: a duplicate name on another surface is rejected with the stable
+/// `agent_name_taken` code (`mtyx agent start` maps it to exit 1).
+#[test]
+fn agent_register_rejects_duplicate_names_with_stable_code() {
+    let (mux, sock, surface) = mux_with_workspace("wire-agent-dup");
+    let first =
+        rpc(&sock, json!({"id": 13, "cmd": "agent-register", "surface": surface, "agent": "dup"}));
+    assert_envelope(&first, 13);
+
+    let second_surface = mux.new_workspace(None, None).unwrap();
+    let resp = rpc(
+        &sock,
+        json!({"id": 14, "cmd": "agent-register", "surface": second_surface.id, "agent": "dup"}),
+    );
+    assert_eq!(resp["ok"], json!(false), "duplicate register must fail: {resp}");
+    assert_eq!(resp["code"], json!("agent_name_taken"), "stable error code: {resp}");
+}
+
+/// D1: `agent-prompt` reply, plus the `send` blocked gate contract —
+/// ungated write, `agent_blocked` refusal (with the stable `code`
+/// field) while blocked, and `force` bypassing it. The writes land in
+/// the stub `/bin/cat` PTY, so this is shape-only.
+#[test]
+fn agent_prompt_shape_and_blocked_gate() {
+    let (_mux, sock, surface) = mux_with_workspace("wire-agent-prompt");
+    let reg =
+        rpc(&sock, json!({"id": 15, "cmd": "agent-register", "surface": surface, "agent": "demo"}));
+    assert_envelope(&reg, 15);
+
+    // Ungated (fresh registration reports `unknown`): text + CR write.
+    let resp = rpc(&sock, json!({"id": 16, "cmd": "agent-prompt", "target": "demo", "text": "hi"}));
+    assert_envelope(&resp, 16);
+    assert!(resp["data"]["surface"].is_number(), "data.surface must be a number: {resp}");
+
+    // A hook report AFTER the registration keeps the name (hooks never
+    // carry `agent`; the ladder preserves it) — the factory race the
+    // hook-authority registration exists to close.
+    let blocked = rpc(
+        &sock,
+        json!({"id": 17, "cmd": "report-agent", "surface": surface, "state": "blocked", "source": "hook"}),
+    );
+    assert_envelope(&blocked, 17);
+    assert_eq!(
+        blocked["data"]["agent"],
+        json!("demo"),
+        "a hook report must not drop the registered name: {blocked}"
+    );
+
+    let refused =
+        rpc(&sock, json!({"id": 18, "cmd": "agent-prompt", "target": "demo", "text": "hi"}));
+    assert_eq!(refused["ok"], json!(false), "blocked prompt must fail: {refused}");
+    assert_eq!(refused["code"], json!("agent_blocked"), "stable error code: {refused}");
+
+    let forced = rpc(
+        &sock,
+        json!({"id": 19, "cmd": "agent-prompt", "target": "demo", "text": "hi", "force": true}),
+    );
+    assert_envelope(&forced, 19);
+    assert!(forced["data"]["surface"].is_number(), "data.surface must be a number: {forced}");
+}

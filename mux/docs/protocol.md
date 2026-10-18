@@ -69,7 +69,8 @@ scroll-surface           report-agent                  list-agents
 detect-agent             detect-agents                 agent-pattern-add
 agent-pattern-list       agent-pattern-remove          pane-worktree-create
 pane-worktree-list       pane-worktree-remove          agent-read
-agent-send               wait-agent-status             wait-ready
+agent-send               agent-prompt                  agent-register
+wait-agent-status        wait-ready
 rename-session           layout-export                 layout-export-all
 layout-apply
 ```
@@ -83,6 +84,13 @@ Notes on the mapping between CLI verbs and socket commands:
 - The CLI verbs `list-sessions`, `kill-session`, `kill-stale`, and `screenshot`
   are client-side operations (they inspect the runtime directory / render
   locally) — they issue no dedicated socket command of the same name.
+- `mtyx agent <start|prompt|wait|read|list>` is a CLI-only noun rewritten
+  onto flat verbs before dispatch (the `agent-pattern` pattern): `agent
+  start` composes `new-tab` + `agent-register` in one CLI flow, `agent
+  list` joins `list-agents` with `list-workspaces` (client-side), and
+  `agent prompt`/`wait`/`read` map to `agent-prompt`/`wait-agent-status`/
+  `agent-read`. The noun defaults `agent wait --status blocked --timeout
+  60000` when the flags are omitted.
 - `theme list`, `agents`, `plugin`, `ssh`, `machine`, `completions`, and the
   agent-integration subcommands (`claude`, `codex`, `pi`, `aider`, `grok`,
   `antigravity`, `opencode`) are CLI-only special cases, not socket commands.
@@ -155,6 +163,31 @@ The CLI maps `ready:false` to a nonzero exit.
 ```
 
 **Alternate-screen boundary:** when the target app uses the VT alternate screen (full-screen agent UIs), `recent`/`recent-unwrapped` return the same visible viewport as `visible` — ghostty creates the alternate screen with `max_scrollback = 0` (`ghostty/src/terminal/Terminal.zig`), its `PageList::scrollbar()` is viewport-only in that mode, and the ghostty C API only exposes the *active* screen. Paging alt-screen history would require a ghostty VT change (nonzero alternate-screen `max_scrollback` plus a C-API accessor for the non-active screen); mux deliberately stops at that boundary and does not fork ghostty semantics.
+
+### Named agents: `agent-register` and `agent-prompt`
+
+`agent-register` binds a unique agent NAME to a surface at HOOK authority — the registration primitive behind `mtyx agent start <name> ... -- <argv>` (which composes `new-tab --exec` + `agent-register` in one CLI flow). Names are the addressing key for the name-addressed verbs (`agent-read`, `agent-send`, `agent-prompt`, `wait-agent-status`).
+
+Why hook authority and not a plain socket-source `report-agent --agent <name>` after the spawn: the report authority ladder is Detected < Socket < Hook, and a fast-starting agent's first HOOK report can land before the registration. A socket report is then rejected (`source >= existing.source` fails), and the name is never stored. Registering at hook authority closes that window; later hook reports — which never carry `agent` — keep the established name (reports omitting `agent` preserve it), so the registration survives the pane's lifetime. An existing report's state/session/message are preserved (a hook that already fired is not clobbered); a fresh pane starts at `unknown`.
+
+```json
+{"id":70,"cmd":"agent-register","surface":3,"agent":"demo"}
+{"id":70,"ok":true,"data":{"surface":3,"state":"unknown","source":"hook","session":null,"agent":"demo","message":null,"updated_at_ms":1710000000000,"state_seq":1}}
+```
+
+Errors (both stable `code`s): a name already registered to ANOTHER surface fails with `agent_name_taken` (names must be unique per session — duplicates would make name targets ambiguous); an empty or all-digit name fails with `agent_name_invalid` (an all-digit name would be ambiguous with a surface id in `resolve_agent_target`). Re-registering the same name on the same surface is idempotent (no `state_seq` bump, so `--require-transition` waits cannot be satisfied by it).
+
+`agent-prompt` types text + a literal CR into the pane addressed by agent name or surface id — the `mtyx agent prompt` primitive. It carries the SAME blocked-send gate as `send`: when the target's effective state is `blocked`, the write is refused with the structured `agent_blocked` error and nothing is written, unless `"force": true` (CLI: `--force`). It is deliberately NOT `agent-send`, which is the un-gated, no-CR raw hatch. Text is written verbatim (the target is an agent REPL, not a shell line editor).
+
+```json
+{"id":71,"cmd":"agent-prompt","target":"demo","text":"run the tests"}
+{"id":71,"ok":true,"data":{"surface":3}}
+
+{"id":72,"cmd":"agent-prompt","target":"demo","text":"run the tests"}
+{"id":72,"ok":false,"error":"agent_blocked: surface 3 is blocked by an agent approval/dialog ...; pass --force to send anyway.","code":"agent_blocked"}
+```
+
+The reply shapes of both commands are pinned by golden tests in `mux-core/tests/wire_contract.rs` (`agent_register_shape`, `agent_prompt_shape_and_blocked_gate`).
 
 ## Events
 
