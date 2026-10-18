@@ -69,12 +69,63 @@ fn run_install(uninstall: bool, global: bool) -> i32 {
     }
 }
 
-/// The pi extension body installed by `install-hooks`. The
-/// `__MTYX_BIN__` placeholder is replaced at install time with the
-/// resolved [`hook_merge::hook_bin`] path as a JS string literal
-/// (issue #97). A placeholder + `.replace()` (rather than `format!`)
-/// keeps the TypeScript braces below unescaped.
-const EXTENSION_TEMPLATE: &str = r#"import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+/// pi extension event -> mtyx agent state.
+///
+/// pi 0.84.0 has **no** blocked / waiting-for-user event, so a settled run
+/// reports `idle`, never `blocked` (see the mapping table in
+/// [`EXTENSION_TEMPLATE`]). Rendering the `pi.on(...)` lines from this table
+/// keeps the Rust mapper and the installed TypeScript in sync.
+const EVENT_STATES: &[(&str, &str)] = &[
+    ("before_agent_start", "working"),
+    ("tool_call", "working"),
+    ("agent_settled", "idle"),
+    ("session_shutdown", "done"),
+];
+
+/// Map a pi extension event name to the mtyx state to report, or `None` for
+/// an event we do not track (mirrors `claude_hook::agent_state_for_event`).
+fn event_state(event: &str) -> Option<&'static str> {
+    EVENT_STATES.iter().find(|(name, _)| *name == event).map(|(_, state)| *state)
+}
+
+/// Render the `pi.on(...)` registrations from [`EVENT_STATES`].
+fn event_handlers() -> String {
+    EVENT_STATES
+        .iter()
+        .map(|(event, _)| {
+            let state = event_state(event).expect("EVENT_STATES entry has a state");
+            format!("  pi.on(\"{event}\", () => {{\n    report(\"{state}\");\n  }});")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// The pi extension body installed by `install-hooks`. The `__MTYX_BIN__`
+/// placeholder is replaced at install time with the resolved
+/// [`hook_merge::hook_bin`] path as a JS string literal (issue #97);
+/// `__MTYX_EVENT_HANDLERS__` is replaced with [`event_handlers`]. Placeholders
+/// + `.replace()` (rather than `format!`) keep the TypeScript braces below
+/// unescaped.
+const EXTENSION_TEMPLATE: &str = r#"// mtyx pi extension — reports agent state to the mtyx daemon.
+//
+// State mapping (pi 0.84.0 exposes no blocked / waiting-for-user event):
+//
+//   pi event            -> mtyx state   why
+//   ------------------     -----------   -----------------------------------
+//   before_agent_start  -> working       a user prompt starts a new run
+//   tool_call           -> working       the agent is actively running a tool
+//   agent_settled       -> idle          the run has fully settled and no
+//                                        retry / compaction / queued
+//                                        continuation will run (types.d.ts:
+//                                        545-547; ctx.isIdle() is true here).
+//                                        We do NOT report "blocked" from pi:
+//                                        there is no permission/input-wait
+//                                        event to map it to.
+//   session_shutdown    -> done          the session is going away
+//
+// The pi.on lines are generated from pi_hook.rs::event_state so this table
+// cannot drift from the Rust mapping.
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFile } from "child_process";
 
 export default function mtyxExtension(pi: ExtensionAPI) {
@@ -91,7 +142,7 @@ export default function mtyxExtension(pi: ExtensionAPI) {
       // needs no quoting either.
       execFile(
         __MTYX_BIN__,
-        ["report-agent", "--surface", surface, "--state", state, "--source", "pi"],
+        ["report-agent", "--surface", surface, "--state", state, "--source", "hook"],
         (err) => {
           // Silent error
         }
@@ -99,18 +150,14 @@ export default function mtyxExtension(pi: ExtensionAPI) {
     }
   };
 
-  pi.on("tool_call", () => {
-    report("working");
-  });
-
-  pi.on("session_shutdown", () => {
-    report("done");
-  });
+__MTYX_EVENT_HANDLERS__
 }
 "#;
 
 fn extension_code() -> String {
-    EXTENSION_TEMPLATE.replace("__MTYX_BIN__", &hook_merge::js_quote(&hook_merge::hook_bin()))
+    EXTENSION_TEMPLATE
+        .replace("__MTYX_BIN__", &hook_merge::js_quote(&hook_merge::hook_bin()))
+        .replace("__MTYX_EVENT_HANDLERS__", &event_handlers())
 }
 
 fn skill_path(global: bool) -> Option<std::path::PathBuf> {
@@ -210,6 +257,37 @@ mod tests {
         // (`D:\a\...`) never appear verbatim in the emitted file.
         let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap();
         serde_json::to_string(&exe).unwrap().trim_matches('"').to_string()
+    }
+
+    /// Mirrors claude_hook's `agent_state_maps_known_events_and_ignores_unknown`:
+    /// every tracked pi event maps to a state and an unknown event is ignored.
+    /// pi 0.84.0 has no waiting-for-user event, so nothing maps to `blocked`.
+    #[test]
+    fn event_state_maps_known_events_and_ignores_unknown() {
+        assert_eq!(event_state("before_agent_start"), Some("working"));
+        assert_eq!(event_state("tool_call"), Some("working"));
+        assert_eq!(event_state("agent_settled"), Some("idle"));
+        assert_eq!(event_state("session_shutdown"), Some("done"));
+        assert_eq!(event_state("something_future"), None);
+        assert_eq!(event_state(""), None);
+        // pi exposes no blocked/waiting-for-user event — never report blocked.
+        assert!(EVENT_STATES.iter().all(|(_, state)| *state != "blocked"));
+    }
+
+    /// The emitted extension must actually register `agent_settled` and report
+    /// `idle` — the whole point of D2 (pi panes previously never went idle).
+    #[test]
+    fn template_reports_idle_on_agent_settled() {
+        let code = extension_code();
+        assert!(code.contains("pi.on(\"agent_settled\""), "{code}");
+        assert!(code.contains("report(\"idle\")"), "{code}");
+        assert!(!code.contains("report(\"blocked\")"), "{code}");
+        assert!(!code.contains("__MTYX_EVENT_HANDLERS__"), "{code}");
+        // AgentStateSource::parse only accepts detected|socket|hook; the
+        // historical "--source pi" was rejected with "bad source" and turned
+        // the whole extension into a silent no-op. Pin the valid authority tier.
+        assert!(code.contains("\"--source\", \"hook\""), "{code}");
+        assert!(!code.contains("\"--source\", \"pi\""), "{code}");
     }
 
     /// Issue #97 AC1: the installed extension invokes the running binary
