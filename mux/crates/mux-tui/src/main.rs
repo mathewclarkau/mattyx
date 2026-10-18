@@ -18,6 +18,7 @@ mod claude_hook;
 mod cli;
 mod clipboard;
 mod codex_hook;
+mod completions;
 mod config;
 mod desktop_notify;
 mod finder;
@@ -618,6 +619,18 @@ fn main() {
     }
     if raw_args.first().map(|arg| arg.as_str()) == Some("opencode") {
         std::process::exit(opencode_hook::run(&raw_args[1..]));
+    }
+    if raw_args.first().map(|arg| arg.as_str()) == Some("completions") {
+        match raw_args.get(1).map(String::as_str) {
+            Some(shell @ ("bash" | "zsh" | "fish")) => {
+                print!("{}", completions::generate(shell));
+                std::process::exit(0);
+            }
+            _ => {
+                eprintln!("mtyx: usage: mtyx completions <bash|zsh|fish>");
+                std::process::exit(2);
+            }
+        }
     }
     if raw_args.first().map(|arg| arg.as_str()) == Some("theme") {
         match raw_args.get(1).map(String::as_str) {

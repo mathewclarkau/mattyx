@@ -58,15 +58,15 @@ struct FlagMap {
     exec: Option<Vec<String>>,
 }
 
-struct VerbSpec {
-    name: &'static str,
-    allowed: &'static [&'static str],
+pub(crate) struct VerbSpec {
+    pub(crate) name: &'static str,
+    pub(crate) allowed: &'static [&'static str],
     build: BuildFn,
     print: PrintFn,
     stream: bool,
 }
 
-const VERBS: &[VerbSpec] = &[
+pub(crate) const VERBS: &[VerbSpec] = &[
     VerbSpec {
         name: "identify",
         allowed: &[],
