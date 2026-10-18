@@ -856,24 +856,37 @@ enum Command {
         pane: PaneId,
         branch: String,
     },
-    /// Issue #75 AC3: read a pane's screen by agent name or surface id.
-    /// `source` is one of "visible" (default), "recent", or
-    /// "recent-unwrapped"; `recent`/`recent-unwrapped` are currently the
-    /// same active-screen content as "visible" (scrollback is not yet
-    /// surfaced by the VT formatter — see spec/commands.md), with
-    /// "recent-unwrapped" undoing soft line-wraps. `lines` tails the
-    /// last N lines (default 40).
     /// Issue #75 AC3: read a pane by agent name or surface id. `source`
     /// is one of "visible" (default: viewport rows only), "recent" (a
     /// bottom-anchored window including scrollback), or
     /// "recent-unwrapped" (the recent window with soft line-wraps
     /// re-joined). `lines` tails the last N lines (default 40).
+    ///
+    /// D2.2: the read is gated on the effective agent state — a pane
+    /// whose effective state is `Working` (an agent mid-turn) is
+    /// refused with the structured `agent_not_idle` error so callers
+    /// don't snapshot a half-rendered turn; `force: Some(true)` reads
+    /// anyway. `Blocked` is deliberately NOT gated: a pane parked at an
+    /// approval dialog is stable and legitimately readable.
+    ///
+    /// Alternate-screen boundary: when the target app uses the VT
+    /// alternate screen (full-screen agent UIs), `recent`/
+    /// `recent-unwrapped` return the same visible viewport as `visible`
+    /// — the ghostty alternate screen is created with
+    /// `max_scrollback = 0` (ghostty/src/terminal/Terminal.zig:2994) and
+    /// its `PageList::scrollbar()` is viewport-only (PageList.zig:2989),
+    /// and the ghostty C API only exposes the active screen. Paging
+    /// alt-screen history needs a ghostty VT change (nonzero alt
+    /// `max_scrollback` + a non-active-screen accessor); mux deliberately
+    /// stops at that boundary.
     AgentRead {
         target: String,
         #[serde(default)]
         source: Option<String>,
         #[serde(default)]
         lines: Option<usize>,
+        #[serde(default)]
+        force: Option<bool>,
     },
     /// Issue #75 AC4: type literal text into a pane addressed by agent
     /// name or surface id, WITHOUT a trailing CR — the caller submits
@@ -2621,10 +2634,30 @@ fn handle_command(
             mux.pane_worktree_remove(pane, &branch)?;
             Ok(json!({}))
         }
-        Command::AgentRead { target, source, lines } => {
+        Command::AgentRead { target, source, lines, force } => {
             let surface_id = mux.resolve_agent_target(&target)?;
             let surface = get_surface(mux, surface_id)?;
             require_pty(&surface)?;
+            // D2.2 busy guard: an agent mid-turn renders a moving target,
+            // so the read is refused unless forced. `Working` ONLY — a
+            // `Blocked` pane (approval dialog) is stable and legitimately
+            // readable (mirror of `send`'s `agent_blocked` gate, which
+            // gates `Blocked` only).
+            if !force.unwrap_or(false) {
+                let (state, source, _) = mux.effective_agent_state(&surface);
+                if state == crate::AgentState::Working {
+                    return Err(ServerError::new(
+                        "agent_not_idle",
+                        format!(
+                            "surface {} has an agent mid-turn (effective state working via {source}); \
+                             the read was refused to avoid a mid-turn snapshot. \
+                             Wait for idle/done (wait-agent-status), or pass --force to read anyway.",
+                            surface.id
+                        ),
+                    )
+                    .into());
+                }
+            }
             let lines = lines.unwrap_or(40);
             // Herdr's visibility ladder (review F1): `visible` reads the
             // viewport rows only; `recent`/`recent-unwrapped` read a

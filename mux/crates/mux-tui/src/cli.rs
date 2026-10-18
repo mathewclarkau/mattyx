@@ -58,15 +58,15 @@ struct FlagMap {
     exec: Option<Vec<String>>,
 }
 
-struct VerbSpec {
-    name: &'static str,
-    allowed: &'static [&'static str],
+pub(crate) struct VerbSpec {
+    pub(crate) name: &'static str,
+    pub(crate) allowed: &'static [&'static str],
     build: BuildFn,
     print: PrintFn,
     stream: bool,
 }
 
-const VERBS: &[VerbSpec] = &[
+pub(crate) const VERBS: &[VerbSpec] = &[
     VerbSpec {
         name: "identify",
         allowed: &[],
@@ -478,7 +478,7 @@ const VERBS: &[VerbSpec] = &[
     VerbSpec {
         // Issue #75 AC3: read an agent's pane by name (or surface id).
         name: "agent-read",
-        allowed: &["target", "source", "lines"],
+        allowed: &["target", "source", "lines", "force"],
         build: build_agent_read,
         print: print_read_screen,
         stream: false,
@@ -1800,6 +1800,11 @@ fn build_agent_read(flags: &FlagMap) -> Result<Value, UsageError> {
     }
     if let Some(lines) = flags.optional("lines") {
         value["lines"] = json!(parse_usize("lines", &lines)?);
+    }
+    // D2.2: `--force` bypasses the server-side `agent_not_idle` gate
+    // (mirrors `send --force` vs the `agent_blocked` gate).
+    if let Some(f) = flags.optional_bool("force") {
+        value["force"] = json!(f);
     }
     Ok(value)
 }
