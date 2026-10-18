@@ -26,6 +26,9 @@ pub mod layout;
 pub mod platform;
 pub mod server;
 
+#[cfg(test)]
+mod test_spawn;
+
 /// Windows parity layer (job objects, console APIs, Toolhelp
 /// snapshots). Empty on non-Windows targets.
 #[cfg(windows)]

@@ -1047,15 +1047,24 @@ mod tests {
             snapshot_trust_decision(Err(err), Some(1000)),
             SnapshotTrustDecision::RejectLookupError
         );
-        // A uid-bearing file with no process euid to compare fails closed.
-        let meta = meta_for(0o600);
-        assert_eq!(
-            snapshot_trust_decision(Ok(meta), None),
-            SnapshotTrustDecision::RejectLookupError
-        );
+        // Issue #129: a uid-bearing file with no process euid fails closed on
+        // unix. Windows has no uid (`file_uid` is None) and an existing file
+        // is the documented Accept fallback, so this arm is unix-only.
+        // Unfixable-on-windows without a uid concept. Linux coverage retained.
+        #[cfg(unix)]
+        {
+            let meta = meta_for(0o600);
+            assert_eq!(
+                snapshot_trust_decision(Ok(meta), None),
+                SnapshotTrustDecision::RejectLookupError
+            );
+        }
     }
 
+    // Issue #129: foreign-owner reject needs a uid. Windows `file_uid` is
+    // None (documented Accept fallback). Unfixable-on-windows. Linux retained.
     #[test]
+    #[cfg(unix)]
     fn snapshot_trust_rejects_foreign_owner() {
         // Simulated via the decision function: the real uid of the file
         // is irrelevant, only the mismatch matters.
@@ -1067,7 +1076,10 @@ mod tests {
         );
     }
 
+    // Issue #129: mode-bit reject needs unix permissions. Windows reports
+    // no uid and accepts an existing file. Unfixable-on-windows. Linux retained.
     #[test]
+    #[cfg(unix)]
     fn snapshot_trust_rejects_group_and_other_bits() {
         for mode in [0o640, 0o644, 0o660, 0o666, 0o777] {
             let meta = meta_for(mode);
