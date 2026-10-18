@@ -1,0 +1,17 @@
+pkgbase = mtyx-bin
+	pkgdesc = Agent-aware terminal multiplexer for Linux — receipted input, blocked-send gating, wait-ready, headless 64-verb CLI
+	pkgver = 0.24.0
+	pkgrel = 1
+	url = https://github.com/mathewclarkau/mattyx
+	arch = x86_64
+	license = GPL-3.0-or-later
+	depends = glibc
+	depends = gcc-libs
+	optdepends = libnotify: desktop notifications (notify-send)
+	optdepends = pipewire: audio playback for contrib alerts (paplay/pw-play)
+	provides = mtyx
+	conflicts = mtyx
+	source_x86_64 = https://github.com/mathewclarkau/mattyx/releases/download/v0.24.0/mtyx-linux-x86_64
+	sha256sums_x86_64 = e611dec0d77de42cfa473863124681a1a166fd7f56febbeb612b37e5b1f59e2a
+
+pkgname = mtyx-bin

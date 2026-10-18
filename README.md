@@ -1,5 +1,11 @@
 # mattyx
 
+**`mtyx`** — an agent-aware terminal multiplexer for Linux. Run Claude Code,
+Codex, Pi, and other coding agents in parallel panes with git-worktree
+isolation, then **orchestrate them from scripts**: every pane is addressable
+over a versioned JSON-lines Unix socket with receipted input (input-ACK),
+blocked-send gating, and post-spawn health checks.
+
 A Linux-native repurposing of [manaflow-ai/cmux](https://github.com/manaflow-ai/cmux),
 a terminal environment built for running AI coding agents (Claude Code, Codex, etc.)
 in parallel with git-worktree-style workspace isolation.
@@ -17,6 +23,35 @@ endorsed by, or supported by Manaflow, Inc. Upstream `cmux` is dual-licensed
 (GPL-3.0-or-later or a commercial license from Manaflow); this repo only
 carries forward the GPL-3.0-or-later grant — see [`LICENSE`](./LICENSE).
 
+## Agent factory in 60 seconds
+
+One daemon, three verbs, a fleet of agents — no TUI required:
+
+```bash
+# 1. install (prebuilt binary, x86_64/aarch64)
+curl -fsSL -o ~/.local/bin/mtyx \
+  "https://github.com/mathewclarkau/mattyx/releases/latest/download/mtyx-linux-$(uname -m)"
+chmod +x ~/.local/bin/mtyx
+
+# 2. start a headless session and create two agent panes
+mtyx --headless --session demo &
+sleep 1
+mtyx new-tab --cwd ~/my-repo --exec -- claude    # any agent CLI works
+mtyx new-tab --cwd ~/my-repo --exec -- aider
+
+# 3. drive + read them from a script
+mtyx send --surface 1 --text "fix the failing test" --send-cr 1
+mtyx agent-read --surface 1 --source recent-unwrapped
+mtyx wait-agent-status --target 1 --status blocked --require-transition   # blocks until it needs you
+mtyx read-screen --surface 1
+```
+
+Panes report semantic state (`working` / `blocked` / `done`) through agent
+hooks (`mtyx agents install --only claude`); everything above is also exposed
+on the socket — see [`mux/docs/protocol.md`](./mux/docs/protocol.md) for the
+versioned wire contract every verb obeys. Attach the TUI any time with
+`mtyx attach` to watch the fleet live.
+
 ## Installation
 
 ### Prebuilt Linux binary
@@ -30,6 +65,13 @@ chmod +x ~/.local/bin/mtyx
 Covers `x86_64` and `aarch64`, no Rust/clang toolchain needed — skip straight to [Run it](#run-it) below.
 Built by [`.github/workflows/release.yml`](./.github/workflows/release.yml) from a tagged commit, the same way
 `bootstrap.sh` builds it locally.
+
+### Arch Linux (AUR)
+
+```bash
+paru -S mtyx-bin        # or: yay -S mtyx-bin
+```
+
 
 ### Build from source
 
