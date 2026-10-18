@@ -2229,7 +2229,7 @@ fn handle_command(
             };
             let (surface, pane_id, screen_id, workspace_id) = if is_new_ws {
                 let (surf, p_id, s_id, w_id) =
-                    mux.new_workspace_topology_with_overrides(name.clone(), size, Some(&overrides))?;
+                    mux.new_workspace_topology_with_overrides(name.clone(), None, size, Some(&overrides))?;
                 if let Some(ref n) = name {
                     let _ = mux.rename_surface(surf.id, n.clone());
                 }
