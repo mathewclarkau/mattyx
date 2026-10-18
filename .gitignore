@@ -3,3 +3,4 @@
 /.venv/
 /.agents/teamwork/
 /daemon/remote/bin/
+/dist/
