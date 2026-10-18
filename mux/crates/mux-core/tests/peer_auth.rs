@@ -51,6 +51,24 @@ fn rpc(socket: &Path, request: Value) -> Value {
     serde_json::from_str(&line).expect("parse response")
 }
 
+/// Issue #128: only arm the "this host has SO_PEERCRED" expectation where
+/// the transport actually reports peer credentials. macos-15 CI returns
+/// false (`transport_supports_peer_creds`), and `peer_auth_decision` treats
+/// that as `Unsupported`. Failing the whole test there drops the same-uid
+/// socket path, which already passes on macOS.
+fn host_must_prove_peer_creds(supports_creds: bool) -> bool {
+    supports_creds
+}
+
+#[test]
+fn credential_host_expectation_skips_when_transport_unsupported() {
+    assert!(
+        !host_must_prove_peer_creds(false),
+        "issue #128: an unsupported transport must not fail same_uid_accepted"
+    );
+    assert!(host_must_prove_peer_creds(true));
+}
+
 // ---------------------------------------------------------------------
 // AC1: the same-uid path is unaffected — a real client connects and a
 // verb succeeds.
@@ -59,14 +77,26 @@ fn rpc(socket: &Path, request: Value) -> Value {
 #[test]
 fn same_uid_accepted() {
     let socket = scratch_socket("same_uid");
-    // The decision for our own uid must be Accept, and the host must be a
-    // credential-capable transport (Linux) for the check to be armed.
     let us = platform::daemon_uid().expect("unix host has a uid");
-    assert!(
-        platform::transport_supports_peer_creds(),
-        "this test expects a credential-capable transport"
-    );
-    assert_eq!(platform::peer_auth_decision(Ok(us), Some(us), true), PeerAuthDecision::Accept);
+    let supports = platform::transport_supports_peer_creds();
+    if host_must_prove_peer_creds(supports) {
+        // Linux: the check is armed. A same uid on a credential-capable
+        // transport is Accept. Do not weaken this branch.
+        assert!(supports, "this test expects a credential-capable transport");
+        assert_eq!(platform::peer_auth_decision(Ok(us), Some(us), true), PeerAuthDecision::Accept);
+    } else {
+        // macOS CI and any other unix host without SO_PEERCRED: the
+        // decision helper documents Unsupported, matching
+        // `peer_auth_decision(..., false)`. The live socket path below
+        // still runs.
+        assert_eq!(
+            platform::peer_auth_decision(Ok(us), Some(us), false),
+            PeerAuthDecision::Unsupported
+        );
+        // The Accept rule itself stays tested even when this host cannot
+        // arm the transport check.
+        assert_eq!(platform::peer_auth_decision(Ok(us), Some(us), true), PeerAuthDecision::Accept);
+    }
 
     let opts = SurfaceOptions::default();
     let mux = Mux::new(&format!("peer-auth-same-{}", std::process::id()), opts);
