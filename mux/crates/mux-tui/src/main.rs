@@ -547,6 +547,246 @@ mod usage_tests {
     }
 }
 
+/// D1: rewrite the `mtyx agent` noun form onto the flat wire verbs.
+///
+/// - `agent start <name> [flags] -- <argv>` → `agent-start --name <name> [flags] --exec -- <argv>`
+/// - `agent prompt <name> [text...] [--force]` → `agent-prompt --target <name> --text <joined> [--force]`
+/// - `agent wait <name> [--status S] [--timeout N] [--require-transition]` →
+///   `wait-agent-status --target <name> --status <S|blocked> --timeout <N|default> ...`
+/// - `agent read <name> [--source S] [--lines N] [--force]` → `agent-read --target <name> ...`
+/// - `agent list [--json]` → `agent-list [--json]`
+///
+/// `agent wait` defaults `--status blocked` (the factory alert case)
+/// and `--timeout` to [`cli::DEFAULT_AGENT_WAIT_MS`] — the flat verb
+/// requires `--timeout`, and supplying it here is what keeps the CLI's
+/// read-timeout override tracking the real budget (a bespoke wait verb
+/// would silently get the 10 s default and die on long waits).
+/// Global flags before the noun (`--json`, `--socket`, ...) pass
+/// through untouched via `args[..command_index]`.
+fn rewrite_agent_verb(args: &[String], command_index: usize) -> Result<Vec<String>, String> {
+    let mut out = args[..command_index].to_vec();
+    let rest = &args[command_index + 1..];
+    let take_name = |rest: &[String]| -> Result<String, String> {
+        rest.first().filter(|name| !name.is_empty() && !name.starts_with('-')).cloned().ok_or_else(
+            || {
+                "agent <start|prompt|wait|read> needs the agent name as the first argument"
+                    .to_string()
+            },
+        )
+    };
+    match rest.first().map(String::as_str) {
+        Some("start") => {
+            let name = take_name(&rest[1..])?;
+            let tail = &rest[2..];
+            let Some(sep) = tail.iter().position(|arg| arg == "--") else {
+                return Err(
+                    "agent start requires `-- <agent-cli...>` (the argv after -- is what runs)"
+                        .to_string(),
+                );
+            };
+            // Accept the `--exec --` spelling too: a `--exec` token
+            // immediately before the separator is folded back in below,
+            // so both noun spellings produce the same flat argv.
+            let flags_end = if sep > 0 && tail[sep - 1] == "--exec" { sep - 1 } else { sep };
+            let argv = &tail[sep + 1..];
+            if argv.is_empty() {
+                return Err("`--` must be followed by the agent command".to_string());
+            }
+            out.push("agent-start".to_string());
+            out.push("--name".to_string());
+            out.push(name);
+            out.extend(tail[..flags_end].to_vec());
+            out.push("--exec".to_string());
+            out.push("--".to_string());
+            out.extend(argv.to_vec());
+        }
+        Some("prompt") => {
+            let name = take_name(&rest[1..])?;
+            let mut text: Vec<String> = Vec::new();
+            let mut flags: Vec<String> = Vec::new();
+            for arg in &rest[2..] {
+                if arg == "--force" || arg.starts_with("--force=") {
+                    flags.push((*arg).clone());
+                } else if arg.starts_with("--") {
+                    return Err(format!(
+                        "unknown flag {arg:?} for agent prompt (accepted: --force)"
+                    ));
+                } else {
+                    text.push((*arg).clone());
+                }
+            }
+            if text.is_empty() {
+                return Err("agent prompt needs prompt text after the name".to_string());
+            }
+            out.push("agent-prompt".to_string());
+            out.push("--target".to_string());
+            out.push(name);
+            out.push("--text".to_string());
+            out.push(text.join(" "));
+            out.extend(flags);
+        }
+        Some("wait") => {
+            let name = take_name(&rest[1..])?;
+            let tail = &rest[2..];
+            out.push("wait-agent-status".to_string());
+            out.push("--target".to_string());
+            out.push(name);
+            out.extend(tail.to_vec());
+            // Defaults AFTER the passthrough so an explicit flag always
+            // wins (the verb's parser rejects duplicates, so only add
+            // what the caller did not pass).
+            let has =
+                |flag: &str| tail.iter().any(|a| a == flag || a.starts_with(&format!("{flag}=")));
+            if !has("--status") {
+                out.push("--status".to_string());
+                out.push("blocked".to_string());
+            }
+            if !has("--timeout") {
+                out.push("--timeout".to_string());
+                out.push(cli::DEFAULT_AGENT_WAIT_MS.to_string());
+            }
+        }
+        Some("read") => {
+            let name = take_name(&rest[1..])?;
+            out.push("agent-read".to_string());
+            out.push("--target".to_string());
+            out.push(name);
+            out.extend(rest[2..].to_vec());
+        }
+        Some("list") => {
+            out.push("agent-list".to_string());
+            out.extend(rest[1..].to_vec());
+        }
+        _ => {
+            return Err(
+                "missing or unknown subcommand (want start, prompt, wait, read, or list); \
+                 note: `mtyx agents` manages hook integrations — different command"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod agent_verb_tests {
+    use super::rewrite_agent_verb;
+
+    fn rewrite(args: &[&str]) -> Result<Vec<String>, String> {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        rewrite_agent_verb(&owned, 0)
+    }
+
+    fn ok(args: &[&str]) -> Vec<String> {
+        rewrite(args).unwrap()
+    }
+
+    #[test]
+    fn start_rewrites_to_agent_start_exec() {
+        assert_eq!(
+            ok(&["agent", "start", "demo", "--cwd", "/tmp", "--", "bash", "-c", "sleep 1"]),
+            vec![
+                "agent-start",
+                "--name",
+                "demo",
+                "--cwd",
+                "/tmp",
+                "--exec",
+                "--",
+                "bash",
+                "-c",
+                "sleep 1",
+            ]
+        );
+    }
+
+    #[test]
+    fn start_accepts_the_exec_separator_spelling() {
+        assert_eq!(
+            ok(&["agent", "start", "demo", "--env", "A=B", "--exec", "--", "pi"]),
+            vec!["agent-start", "--name", "demo", "--env", "A=B", "--exec", "--", "pi"]
+        );
+    }
+
+    #[test]
+    fn start_requires_a_separator_and_argv() {
+        assert!(rewrite(&["agent", "start", "demo", "bash"]).is_err());
+        assert!(rewrite(&["agent", "start", "demo", "--"]).is_err());
+        assert!(rewrite(&["agent", "start", "--cwd"]).is_err());
+    }
+
+    #[test]
+    fn prompt_joins_variadic_text_and_passes_force() {
+        assert_eq!(
+            ok(&["agent", "prompt", "demo", "run", "the tests", "--force"]),
+            vec!["agent-prompt", "--target", "demo", "--text", "run the tests", "--force"]
+        );
+        assert!(rewrite(&["agent", "prompt", "demo"]).is_err());
+        assert!(rewrite(&["agent", "prompt", "demo", "hi", "--shell"]).is_err());
+    }
+
+    #[test]
+    fn wait_defaults_status_blocked_and_timeout() {
+        assert_eq!(
+            ok(&["agent", "wait", "demo"]),
+            vec![
+                "wait-agent-status",
+                "--target",
+                "demo",
+                "--status",
+                "blocked",
+                "--timeout",
+                "60000",
+            ]
+        );
+    }
+
+    #[test]
+    fn wait_preserves_explicit_status_and_timeout() {
+        assert_eq!(
+            ok(&[
+                "agent",
+                "wait",
+                "demo",
+                "--status",
+                "done",
+                "--timeout",
+                "250",
+                "--require-transition",
+            ]),
+            vec![
+                "wait-agent-status",
+                "--target",
+                "demo",
+                "--status",
+                "done",
+                "--timeout",
+                "250",
+                "--require-transition",
+            ]
+        );
+    }
+
+    #[test]
+    fn read_and_list_rewrite_flat() {
+        assert_eq!(
+            ok(&["agent", "read", "demo", "--source", "recent-unwrapped", "--force"]),
+            vec!["agent-read", "--target", "demo", "--source", "recent-unwrapped", "--force"]
+        );
+        assert_eq!(ok(&["agent", "list"]), vec!["agent-list"]);
+        assert_eq!(ok(&["agent", "list", "--json"]), vec!["agent-list", "--json"]);
+    }
+
+    #[test]
+    fn bare_or_unknown_subcommand_names_the_agents_hint() {
+        for args in [&["agent"][..], &["agent", "nope"][..]] {
+            let err = rewrite(args).unwrap_err();
+            assert!(err.contains("start, prompt, wait, read, or list"), "got: {err}");
+            assert!(err.contains("mtyx agents"), "hint at the hook manager: {err}");
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Args {
     attach: bool,
@@ -699,6 +939,7 @@ fn main() {
             && first != "workspace-color"
             && first != "agents"
             && first != "agent-pattern"
+            && first != "agent"
             && first != "ssh"
             && first != "machine"
             && first != "socket-watchdog"
@@ -811,6 +1052,23 @@ fn main() {
             }
         }
         std::process::exit(cli::run(&args, &usage()));
+    }
+    // D1: `mtyx agent <start|prompt|wait|read|list>` — the named agent
+    // lifecycle noun, rewritten onto the flat verbs exactly like
+    // `agent-pattern` above (and for the same reason: the rewrite must
+    // run before `is_cli_invocation`, which would not recognise the
+    // noun as a verb). `agent` is deliberately NOT a VerbSpec; the
+    // collision tests in cli.rs pin that.
+    if raw_args.get(command_index).map(String::as_str) == Some("agent") {
+        let rewritten = match rewrite_agent_verb(&raw_args, command_index) {
+            Ok(args) => args,
+            Err(err) => {
+                eprintln!("mtyx: usage: mtyx agent <start|prompt|wait|read|list> ...");
+                eprintln!("mtyx: {err}");
+                std::process::exit(2);
+            }
+        };
+        std::process::exit(cli::run(&rewritten, &usage()));
     }
     // Issue #91: tmux-style shorthands (`ls`, `new`, `at`, ...) rewrite
     // to the canonical spelling before dispatch — and before

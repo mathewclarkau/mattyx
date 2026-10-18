@@ -124,6 +124,14 @@ $TMPDIR/mtyx-<uid>/<session>.sock
 
 The usual default is `$XDG_RUNTIME_DIR/mtyx-<uid>/main.sock` when `XDG_RUNTIME_DIR` is set, then `$TMPDIR/mtyx-<uid>/main.sock`, then `/tmp/mtyx-<uid>/main.sock`. `--session <name>` changes the final file name. `--socket <path>` bypasses the session-derived path. Server-started child processes receive `MTYX_MUX_SOCKET` with the socket path.
 
+`mtyx` resolves the control socket in the order `--socket` > `$MTYX_MUX_SOCKET` > `--session`. Because a pane sets `MTYX_MUX_SOCKET` for its children, a script running *inside* a pane that passes `--session <other>` still targets its own session; pass an explicit `--socket <other-session.sock>` to reach a foreign session deliberately.
+
+The test suite creates many short-lived temp dirs, and some tests read `std::env::temp_dir()`. Pin `TMPDIR` when running it (the CI test steps do) so a leaked or unwritable `$TMPDIR` cannot fail unrelated tests:
+
+```bash
+TMPDIR=/tmp cargo test -p mux-tui -p mux-core   # from mux/
+```
+
 ## Session persistence
 
 Every session (headless or local TUI) writes a snapshot of its workspace/screen/pane layout — split shape and ratios, names, and each tab's cwd — to `$XDG_STATE_HOME/mattyx/sessions/<session>.json` (falling back to `~/.local/state/...`), debounced a few hundred ms after each structural change and again on clean shutdown. Starting a session with the same `--session` name again (a real daemon restart, or just restarting the local TUI) replays that snapshot: same panes, same directories. Closing every workspace deletes the file rather than leaving a stale one to resurrect later.

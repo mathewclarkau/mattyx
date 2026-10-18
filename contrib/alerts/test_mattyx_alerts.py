@@ -31,6 +31,7 @@ AlertMachine = mattyx_alerts.AlertMachine
 Ding = mattyx_alerts.Ding
 LabelResolver = mattyx_alerts.LabelResolver
 DryRunEmitter = mattyx_alerts.DryRunEmitter
+Notifier = mattyx_alerts.Notifier
 
 # Verbatim sample from the verified wire capture (scout report §2).
 VERBATIM_BLOCKED_LINE = (
@@ -370,6 +371,64 @@ class DryRunEmitterTestCase(unittest.TestCase):
             Ding(surface=1, previous=None, state="blocked",
                  agent=None, message=None))
         self.assertEqual(body, "null → blocked")
+
+
+class NotifierTestCase(unittest.TestCase):
+    """notify-send leg: -A click action -> mtyx focus-pane, with fallback."""
+
+    def _notifier(self, stdout="", returncode=0, mtyx_bin="fake-mtyx"):
+        calls = []
+
+        class _Proc:
+            pass
+
+        def run(cmd, **kwargs):
+            calls.append(list(cmd))
+            proc = _Proc()
+            proc.returncode = returncode
+            proc.stdout = stdout
+            return proc
+
+        notifier = Notifier(run=run, which=lambda name: "/usr/bin/" + name,
+                            mtyx_bin=mtyx_bin)
+        return notifier, calls
+
+    def test_click_action_focuses_surface(self):
+        notifier, calls = self._notifier(stdout="mtyx-focus\n")
+        notifier.send("Worker-1", "working \u2192 blocked", surface=7)
+        self.assertEqual(calls[0][:3],
+                         ["notify-send", "-A", "mtyx-focus=Focus pane"])
+        self.assertEqual(calls[0][3:], ["Worker-1", "working \u2192 blocked"])
+        self.assertEqual(calls[1],
+                         ["fake-mtyx", "focus-pane", "--surface", "7"])
+
+    def test_dismiss_without_action_does_not_focus(self):
+        notifier, calls = self._notifier(stdout="")
+        notifier.send("Worker-1", "blocked", surface=7)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("-A", calls[0])
+
+    def test_actions_unsupported_falls_back_to_plain_form(self):
+        notifier, calls = self._notifier(returncode=1)
+        notifier.send("Worker-1", "blocked", surface=7)
+        self.assertIn("-A", calls[0])
+        self.assertEqual(calls[1], ["notify-send", "Worker-1", "blocked"])
+        # Once known-unsupported, later sends skip the action form entirely.
+        notifier.send("Worker-1", "blocked", surface=7)
+        self.assertEqual(calls[2], ["notify-send", "Worker-1", "blocked"])
+        self.assertEqual(len(calls), 3)
+
+    def test_no_surface_uses_plain_form(self):
+        notifier, calls = self._notifier()
+        notifier.send("Worker-1", "blocked")
+        self.assertEqual(calls, [["notify-send", "Worker-1", "blocked"]])
+
+    def test_unavailable_notify_send_is_silent(self):
+        calls = []
+        notifier = Notifier(run=lambda cmd, **kwargs: calls.append(cmd),
+                            which=lambda name: None, mtyx_bin="fake-mtyx")
+        notifier.send("Worker-1", "blocked", surface=7)
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

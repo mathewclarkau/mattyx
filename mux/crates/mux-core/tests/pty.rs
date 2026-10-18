@@ -744,7 +744,7 @@ fn attach_stream_orders_resize_between_output_frames() {
             Ok(AttachFrame::Output(bytes))
                 if bytes.windows(b"before-resize".len()).any(|w| w == b"before-resize") =>
             {
-                break
+                break;
             }
             Ok(_) => {}
             Err(_) => assert!(Instant::now() < deadline, "before output never arrived"),
@@ -772,7 +772,7 @@ fn attach_stream_orders_resize_between_output_frames() {
             Ok(AttachFrame::Output(bytes))
                 if bytes.windows(b"after-resize".len()).any(|w| w == b"after-resize") =>
             {
-                break
+                break;
             }
             Ok(AttachFrame::Resized { .. }) => panic!("unexpected second resize marker"),
             Ok(_) => {}
@@ -800,6 +800,20 @@ fn new_tab_on_empty_headless_session_creates_workspace() {
     assert!(mux.new_tab(Some(9999), None, None).is_err());
     assert_eq!(mux.surface_count(), before);
 
+    mux.close_surface(surface.id);
+}
+
+#[test]
+fn new_tab_on_empty_session_honours_cwd() {
+    // Regression: the empty-session fallback in new_tab_topology_with_overrides
+    // used to drop the requested cwd (new_workspace_topology_with_overrides
+    // hard-coded None), landing the child in $HOME — the exact factory case of
+    // a fresh throwaway headless session (`agent start --cwd <dir>` as the
+    // first command).
+    let opts = SurfaceOptions { command: Some(vec!["/bin/cat".to_string()]), ..Default::default() };
+    let mux = Mux::new("test-headless-cwd", opts);
+    let surface = mux.new_tab(None, Some("/tmp".to_string()), None).unwrap();
+    assert_eq!(surface.cwd().as_deref(), Some("/tmp"));
     mux.close_surface(surface.id);
 }
 

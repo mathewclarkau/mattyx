@@ -1118,7 +1118,7 @@ reattaching to remote session {session_id} on {host} \
         size: Option<(u16, u16)>,
         overrides: Option<&SpawnOverrides>,
     ) -> anyhow::Result<Arc<Surface>> {
-        self.new_workspace_topology_with_overrides(name, size, overrides)
+        self.new_workspace_topology_with_overrides(name, None, size, overrides)
             .map(|(surf, _, _, _)| surf)
     }
 
@@ -1127,10 +1127,11 @@ reattaching to remote session {session_id} on {host} \
     pub fn new_workspace_topology_with_overrides(
         self: &Arc<Self>,
         name: Option<String>,
+        cwd: Option<String>,
         size: Option<(u16, u16)>,
         overrides: Option<&SpawnOverrides>,
     ) -> anyhow::Result<(Arc<Surface>, PaneId, ScreenId, WorkspaceId)> {
-        let surface = self.spawn_surface(None, size, overrides)?;
+        let surface = self.spawn_surface(cwd, size, overrides)?;
         Ok(self.attach_new_workspace_topology(surface, name))
     }
 
@@ -1342,7 +1343,9 @@ reattaching to remote session {session_id} on {host} \
                 self.reap_if_dead(&attached);
                 return Ok((attached, pane_id, screen_id, ws_id));
             }
-            return self.new_workspace_topology_with_overrides(None, size, overrides);
+            // Empty session: the requested cwd must reach the spawn (it
+            // used to be dropped on this fallback, landing the child in $HOME).
+            return self.new_workspace_topology_with_overrides(None, cwd, size, overrides);
         };
 
         let cwd = cwd.or_else(|| self.pane_cwd(target));
@@ -4576,7 +4579,7 @@ mod tests {
     fn new_workspace_and_tab_topology_return_valid_ids() {
         let mux = test_mux();
         let (surf1, pane1, screen1, ws1) = mux
-            .new_workspace_topology_with_overrides(Some("top-test".into()), None, None)
+            .new_workspace_topology_with_overrides(Some("top-test".into()), None, None, None)
             .expect("workspace topology should allocate");
         assert!(surf1.id > 0);
         assert!(pane1 > 0);

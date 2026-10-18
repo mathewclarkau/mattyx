@@ -805,6 +805,27 @@ enum Command {
         #[serde(default)]
         state: Option<String>,
     },
+    /// D1 (`mtyx agent start`): register a unique agent NAME on a
+    /// freshly spawned surface, at HOOK authority. The report ladder is
+    /// Detected < Socket < Hook (see [`crate::AgentStateSource`]); a
+    /// socket-source registration would lose the race against a
+    /// fast-starting agent whose first hook report lands first (that
+    /// report is then current and rejects the socket report, so the
+    /// name is never stored). Registering at Hook authority closes the
+    /// window, and later hook reports — which never carry `agent` —
+    /// keep the established name (see `Surface::set_agent_report`'s
+    /// name-preservation rule), so the registration survives the
+    /// pane's whole lifetime. Any existing report's state/session/
+    /// message are preserved (a hook that fired between spawn and
+    /// registration is not clobbered); a fresh pane starts at
+    /// `unknown`. Duplicate names on OTHER surfaces are rejected with
+    /// the stable `agent_name_taken` code; empty or all-digit names
+    /// (ambiguous with surface ids in `resolve_agent_target`) with
+    /// `agent_name_invalid`.
+    AgentRegister {
+        surface: SurfaceId,
+        agent: String,
+    },
     /// Ambient agent detection on one surface (issue #78 AC1): walk the
     /// pane PTY's process tree + scrape the visible screen against the
     /// pattern registry, cache the result, and return it with a
@@ -897,6 +918,18 @@ enum Command {
         text: String,
         #[serde(default)]
         shell: Option<String>,
+    },
+    /// D1 (`mtyx agent prompt`): type text + a literal CR into the pane
+    /// addressed by agent name or surface id, carrying the SAME
+    /// blocked-send gate as `send` (`agent_blocked` unless
+    /// `force: true`) — deliberately NOT `agent-send`, which is the
+    /// un-gated raw hatch. Text is written verbatim (the target is an
+    /// agent REPL, not a shell line editor) and submitted with CR.
+    AgentPrompt {
+        target: String,
+        text: String,
+        #[serde(default)]
+        force: Option<bool>,
     },
     /// Issue #75 AC5: block until the target agent's reported state
     /// reaches `state`, or `timeout_ms` elapses (exit-1 timeout error).
@@ -2196,7 +2229,7 @@ fn handle_command(
             };
             let (surface, pane_id, screen_id, workspace_id) = if is_new_ws {
                 let (surf, p_id, s_id, w_id) =
-                    mux.new_workspace_topology_with_overrides(name.clone(), size, Some(&overrides))?;
+                    mux.new_workspace_topology_with_overrides(name.clone(), None, size, Some(&overrides))?;
                 if let Some(ref n) = name {
                     let _ = mux.rename_surface(surf.id, n.clone());
                 }
@@ -2576,6 +2609,66 @@ fn handle_command(
                 .collect::<Vec<_>>();
             Ok(json!({ "agents": agents }))
         }
+        Command::AgentRegister { surface, agent } => {
+            let surface_ref = get_surface(mux, surface)?;
+            if agent.is_empty() || agent.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(ServerError::new(
+                    "agent_name_invalid",
+                    format!(
+                        "agent name {agent:?} is invalid: names must be non-empty and not \
+                         all digits (an all-digit name would be ambiguous with a surface \
+                         id in the name-addressed agent verbs)"
+                    ),
+                )
+                .into());
+            }
+            // Uniqueness is enforced server-side (scan the live
+            // registry) so two concurrent `agent start` callers cannot
+            // both win a name — a silent second registration would make
+            // `resolve_agent_target` ambiguous for every later verb.
+            for (id, report) in mux.list_agents(None, None) {
+                if id != surface && report.agent.as_deref() == Some(agent.as_str()) {
+                    return Err(ServerError::new(
+                        "agent_name_taken",
+                        format!(
+                            "agent name {agent:?} is already registered to surface {id}; \
+                             agent names must be unique per session — close that pane or \
+                             pick another name"
+                        ),
+                    )
+                    .into());
+                }
+            }
+            // Idempotent re-registration (same surface, same name,
+            // already at hook authority): return the current report
+            // unchanged — no state_seq bump, so a waiter's
+            // `--require-transition` cannot be satisfied by a re-register.
+            if let Some(report) = surface_ref.agent_report() {
+                if report.agent.as_deref() == Some(agent.as_str())
+                    && report.source == crate::AgentStateSource::Hook
+                {
+                    return Ok(agent_report_json(surface, &report));
+                }
+            }
+            // Register at HOOK authority, preserving whatever a racing
+            // hook already reported (state/session/message); a fresh
+            // pane has no report yet, so the state starts `unknown`.
+            let (state, session, message) = match surface_ref.agent_report() {
+                Some(report) => (report.state, report.session.clone(), report.message.clone()),
+                None => (crate::AgentState::Unknown, None, None),
+            };
+            let report = mux
+                .report_agent(
+                    surface,
+                    state,
+                    crate::AgentStateSource::Hook,
+                    session,
+                    Some(agent.clone()),
+                    message,
+                )
+                .ok_or_else(|| anyhow::anyhow!("surface {surface} does not support agent state"))?;
+            Ok(agent_report_json(surface, &report))
+        }
         Command::DetectAgent { surface } => {
             let detection = mux.detect_agent(surface)?;
             Ok(detection_json(surface, &detection))
@@ -2683,6 +2776,39 @@ fn handle_command(
             // the text and leaves submitting to the caller (AC4).
             let mode = resolve_shell_mode(shell.as_deref(), surface.child_pid())?;
             let bytes = sanitise_text(mode, &text).into_bytes();
+            surface.write_bytes(&bytes)?;
+            Ok(json!({ "surface": surface_id }))
+        }
+        Command::AgentPrompt { target, text, force } => {
+            let surface_id = mux.resolve_agent_target(&target)?;
+            let surface = get_surface(mux, surface_id)?;
+            require_pty(&surface)?;
+            // The `send` blocked-send gate, verbatim: refuse to write
+            // ANY bytes into a pane whose effective agent state is
+            // `Blocked`, so an orchestrator cannot blow through an
+            // approval dialog; `force` restores raw behaviour.
+            // `agent-send` deliberately has NO gate — `agent-prompt` is
+            // the gated, CR-submitting wrapper the `mtyx agent prompt`
+            // noun maps to.
+            if !force.unwrap_or(false) {
+                let (state, source, _) = mux.effective_agent_state(&surface);
+                if state == crate::AgentState::Blocked {
+                    return Err(ServerError::new(
+                        "agent_blocked",
+                        format!(
+                            "surface {} is blocked by an agent approval/dialog \
+                             (effective state via {source}); no input was sent. \
+                             Resolve the prompt in the pane, or pass --force to send anyway.",
+                            surface.id
+                        ),
+                    )
+                    .into());
+                }
+            }
+            // Text verbatim (the target is an agent REPL, not a shell
+            // line editor) + a literal CR to submit it.
+            let mut bytes = text.into_bytes();
+            bytes.push(b'\r');
             surface.write_bytes(&bytes)?;
             Ok(json!({ "surface": surface_id }))
         }

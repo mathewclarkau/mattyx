@@ -5,8 +5,9 @@
 //! `cli.rs` updates every shell's completions with no extra bookkeeping.
 //!
 //! `mtyx completions <bash|zsh|fish>` is a `main.rs` special-case (like
-//! `theme`) rather than a verb-table entry, so the verb count stays at 64
-//! and the subcommand never reaches the control socket.
+//! `theme`) rather than a verb-table entry, so the subcommand never
+//! reaches the control socket. (D1 added `agent-start`, `agent-prompt`,
+//! `agent-list`, moving the pinned count 64 -> 67.)
 
 use crate::cli::VERBS;
 
@@ -135,7 +136,7 @@ mod tests {
         for verb in VERBS {
             assert!(script.contains(verb.name), "{shell} script is missing verb {:?}", verb.name);
         }
-        assert_eq!(VERBS.len(), 64, "verb table drifted from the pinned count");
+        assert_eq!(VERBS.len(), 67, "verb table drifted from the pinned count");
     }
 
     #[test]

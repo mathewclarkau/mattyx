@@ -517,6 +517,39 @@ pub(crate) const VERBS: &[VerbSpec] = &[
         stream: false,
     },
     VerbSpec {
+        // D1 (`mtyx agent start <name> ... -- <argv>`): spawn the agent
+        // pane (new-tab --exec) and register the unique name on it
+        // (agent-register) in one CLI flow. Special-cased in
+        // `run_command` (two RPCs); `build` documents the carried
+        // flags.
+        name: "agent-start",
+        allowed: &["name", "cwd", "env", "exec", "pane", "cols", "rows"],
+        build: build_agent_start,
+        print: print_surface,
+        stream: false,
+    },
+    VerbSpec {
+        // D1 (`mtyx agent prompt <name> <text...>`): gated text+CR into
+        // a named agent's pane (the `send` blocked gate applies
+        // server-side).
+        name: "agent-prompt",
+        allowed: &["target", "text", "force"],
+        build: build_agent_prompt,
+        print: print_empty,
+        stream: false,
+    },
+    VerbSpec {
+        // D1 (`mtyx agent list`): list-agents (name/state) joined with
+        // list-workspaces pane_json (kind/cwd) — list-agents alone
+        // carries no cwd/kind. Special-cased in `run_command` (two
+        // RPCs).
+        name: "agent-list",
+        allowed: &[],
+        build: build_no_args,
+        print: print_empty,
+        stream: false,
+    },
+    VerbSpec {
         name: "browser-reload",
         allowed: &["surface"],
         build: build_surface,
@@ -926,6 +959,8 @@ fn run_command(args: CliArgs) -> i32 {
         "layout-apply" => return run_layout_apply(&args.global, &args.flags),
         "layout-export-all" => return run_layout_export_all(&args.global, &args.flags),
         "screenshot" => return run_screenshot(&args.global, &args.flags),
+        "agent-start" => return run_agent_start(&args.global, &args.flags),
+        "agent-list" => return run_agent_list(&args.global),
         _ => {}
     }
     let request = match (args.verb.build)(&args.flags) {
@@ -1829,6 +1864,33 @@ fn build_agent_send(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(value)
 }
 
+/// D1: `agent-prompt` — the gated text+CR write into a named agent's
+/// pane. Mirrors `agent-send`'s build plus `--force`; the blocked gate
+/// itself lives server-side (copied verbatim from `send`).
+fn build_agent_prompt(flags: &FlagMap) -> Result<Value, UsageError> {
+    let mut value = json!({
+        "target": flags.required("target")?,
+        "text": flags.required("text")?,
+    });
+    if let Some(force) = flags.optional_bool("force") {
+        value["force"] = json!(force);
+    }
+    Ok(value)
+}
+
+/// D1: `agent-start` — the carried flags for the two-RPC runner. The
+/// actual requests are assembled by `run_agent_start` (new-tab via
+/// `build_new_tab`, then agent-register); this documents the schema and
+/// keeps a direct flat invocation parseable.
+fn build_agent_start(flags: &FlagMap) -> Result<Value, UsageError> {
+    let mut value = json!({ "name": flags.required("name")? });
+    flags.insert_optional_string(&mut value, "cwd");
+    flags.insert_optional_u64(&mut value, "pane")?;
+    flags.insert_optional_size(&mut value)?;
+    insert_exec_env(flags, &mut value)?;
+    Ok(value)
+}
+
 fn build_wait_for(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(json!({
         "surface": flags.required_u64("surface")?,
@@ -1904,6 +1966,16 @@ fn build_wait_agent_status(flags: &FlagMap) -> Result<Value, UsageError> {
 /// Issue #93: `wait-agent-status --require-transition` is applied by the
 /// builder below; declared here so the flag spelling lives in one place.
 const _WAIT_AGENT_TRANSITION_DOC: &str = "--require-transition";
+
+/// D1 (`mtyx agent wait`): the default wait budget the noun rewrite
+/// supplies when `--timeout` is absent. The flat `wait-agent-status`
+/// verb REQUIRES `--timeout`; the rewrite always provides one so the
+/// CLI's socket read-timeout override (keyed on the parsed `timeout`
+/// flag) tracks the real budget instead of dying at the 10 s default.
+/// 60 s covers a turn that ends in an approval prompt without hanging
+/// a script forever; the server caps at 10 min
+/// (`MAX_AGENT_WAIT_MS`).
+pub(crate) const DEFAULT_AGENT_WAIT_MS: u64 = 60_000;
 
 fn build_kill_session(flags: &FlagMap) -> Result<Value, UsageError> {
     let mut value = json!({});
@@ -2649,6 +2721,161 @@ fn run_layout_export_all(global: &GlobalArgs, flags: &FlagMap) -> i32 {
     }
 }
 
+/// D1 `mtyx agent start <name> [flags] -- <argv>`: spawn the agent
+/// pane (`new-tab --exec`) and register the name (`agent-register`) in
+/// one CLI flow. The registration runs in the SAME flow, immediately
+/// after new-tab returns, at HOOK authority — registering via a plain
+/// socket-source `report-agent` after the spawn would lose the race
+/// against a fast-starting agent whose first hook report lands first
+/// (the authority ladder is Detected < Socket < Hook: a hook report
+/// current at register time rejects the socket report, so the name is
+/// never stored). Exit codes mirror the other runners: 0 ok · 1 server
+/// error · 2 bad flags · 3 transport. On a registration failure the
+/// just-spawned pane is closed again (best-effort) so a retry with a
+/// different name does not leak panes.
+fn run_agent_start(global: &GlobalArgs, flags: &FlagMap) -> i32 {
+    let name = match flags.required("name") {
+        Ok(name) => name,
+        Err(err) => return cli_error(global.json, 2, &format!("mtyx: {}", err.0)),
+    };
+    if flags.exec.as_ref().map(|argv| argv.is_empty()).unwrap_or(true) {
+        return cli_error(global.json, 2, "mtyx: agent-start requires --exec -- <agent-cli...>");
+    }
+    // Same builder as the flat `new-tab` verb, so flag semantics
+    // (cwd/env/pane/cols/rows/exec) cannot drift between the two.
+    let request = match build_new_tab(flags) {
+        Ok(mut value) => {
+            value["cmd"] = json!("new-tab");
+            value["id"] = json!(REQUEST_ID);
+            value
+        }
+        Err(err) => return cli_error(global.json, 2, &format!("mtyx: {}", err.0)),
+    };
+    let socket = resolve_socket(global);
+    let surface = match one_shot_rpc(&socket, request) {
+        OneShotOutcome::Ok(value) => {
+            match value.get("data").and_then(|data| data.get("surface")).and_then(Value::as_u64) {
+                Some(id) => id,
+                None => {
+                    return cli_error(global.json, 1, "mtyx: new-tab reply missing surface id");
+                }
+            }
+        }
+        OneShotOutcome::ServerErr(e) => return cli_error(global.json, 1, &format!("mtyx: {e}")),
+        OneShotOutcome::ConnectErr(e) => return cli_error(global.json, 3, &e),
+    };
+    let register =
+        json!({ "cmd": "agent-register", "surface": surface, "agent": name, "id": REQUEST_ID });
+    match one_shot_rpc(&socket, register) {
+        OneShotOutcome::Ok(_) => {
+            if global.json {
+                println!("{}", json!({ "surface": surface, "agent": name }));
+            } else {
+                println!("{surface}");
+            }
+            0
+        }
+        OneShotOutcome::ServerErr(e) => {
+            // The pane exists but the name did not take (duplicate /
+            // invalid): roll it back best-effort so the retry is clean.
+            let _ = one_shot_rpc(
+                &socket,
+                json!({ "cmd": "close-surface", "surface": surface, "id": REQUEST_ID }),
+            );
+            cli_error(global.json, 1, &format!("mtyx: {e}"))
+        }
+        OneShotOutcome::ConnectErr(e) => cli_error(global.json, 3, &e),
+    }
+}
+
+/// D1 `mtyx agent list [--json]`: the agent registry (`list-agents`:
+/// name/state/source/session/message/...) joined with the workspace
+/// tree (`list-workspaces` pane_json: kind/cwd), because list-agents
+/// carries no cwd/kind and pane_json carries no assigned report name.
+/// The join is by surface id, client-side; `--json` prints the merged
+/// rows, human output is `<surface> <agent> <state> <kind> <cwd>`.
+fn run_agent_list(global: &GlobalArgs) -> i32 {
+    let socket = resolve_socket(global);
+    let agents = match one_shot_rpc(&socket, json!({ "cmd": "list-agents", "id": REQUEST_ID })) {
+        OneShotOutcome::Ok(value) => value
+            .get("data")
+            .and_then(|data| data.get("agents"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        OneShotOutcome::ServerErr(e) => return cli_error(global.json, 1, &format!("mtyx: {e}")),
+        OneShotOutcome::ConnectErr(e) => return cli_error(global.json, 3, &e),
+    };
+    let tree = match one_shot_rpc(&socket, json!({ "cmd": "list-workspaces", "id": REQUEST_ID })) {
+        OneShotOutcome::Ok(value) => value.get("data").cloned().unwrap_or(Value::Null),
+        OneShotOutcome::ServerErr(e) => {
+            return cli_error(global.json, 1, &format!("mtyx: {e}"));
+        }
+        OneShotOutcome::ConnectErr(e) => return cli_error(global.json, 3, &e),
+    };
+    // surface id → (kind, cwd) from every pane's tabs.
+    let mut kind_by_surface = BTreeMap::new();
+    let mut cwd_by_surface = BTreeMap::new();
+    if let Some(workspaces) = tree.get("workspaces").and_then(Value::as_array) {
+        for workspace in workspaces {
+            let Some(screens) = workspace.get("screens").and_then(Value::as_array) else {
+                continue;
+            };
+            for screen in screens {
+                let Some(panes) = screen.get("panes").and_then(Value::as_array) else {
+                    continue;
+                };
+                for pane in panes {
+                    let Some(tabs) = pane.get("tabs").and_then(Value::as_array) else {
+                        continue;
+                    };
+                    for tab in tabs {
+                        if let Some(id) = tab.get("surface").and_then(Value::as_u64) {
+                            kind_by_surface.insert(
+                                id,
+                                tab.get("kind").and_then(Value::as_str).unwrap_or("?").to_string(),
+                            );
+                            cwd_by_surface.insert(
+                                id,
+                                tab.get("cwd").and_then(Value::as_str).map(str::to_string),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut rows: Vec<Value> = agents
+        .iter()
+        .map(|agent| {
+            let mut row = agent.clone();
+            let id = agent.get("surface").and_then(Value::as_u64).unwrap_or(0);
+            row["kind"] = json!(kind_by_surface.get(&id).map(String::as_str).unwrap_or("?"));
+            row["cwd"] = match cwd_by_surface.get(&id) {
+                Some(Some(cwd)) => json!(cwd),
+                _ => Value::Null,
+            };
+            row
+        })
+        .collect();
+    rows.sort_by_key(|row| row.get("surface").and_then(Value::as_u64).unwrap_or(0));
+    if global.json {
+        println!("{}", json!({ "agents": rows }));
+    } else {
+        for row in &rows {
+            println!(
+                "{} {} {} {} {}",
+                row.get("surface").and_then(Value::as_u64).unwrap_or(0),
+                row.get("agent").and_then(Value::as_str).unwrap_or("-"),
+                row.get("state").and_then(Value::as_str).unwrap_or("unknown"),
+                row.get("kind").and_then(Value::as_str).unwrap_or("?"),
+                row.get("cwd").and_then(Value::as_str).unwrap_or("-"),
+            );
+        }
+    }
+    0
+}
+
 /// `mtyx screenshot --surface <id> [--output] <file>` (issue #84):
 /// capture a surface's visible text to a file. The request is the plain
 /// `read-screen` command — the file's bytes are exactly what `mtyx
@@ -3374,6 +3601,91 @@ mod tests {
                 "alias {alias:?} points at unknown command {canonical:?}"
             );
         }
+    }
+
+    // --- D1: the `agent` noun vs the verb table ---
+
+    /// `agent` is a main.rs pre-dispatch noun (like `agent-pattern`),
+    /// never a VerbSpec or an alias: the noun rewrite happens BEFORE
+    /// `is_cli_invocation`, so a verb named `agent` would be dead code
+    /// at best and an ambiguously-ordered dispatch at worst. Pin both
+    /// invariants the way `verb_aliases_never_collide_with_existing_verbs`
+    /// pins the alias set.
+    #[test]
+    fn agent_noun_is_never_a_verb_or_alias() {
+        assert!(verb_by_name("agent").is_none(), "`agent` must not be a VerbSpec");
+        assert!(
+            VERB_ALIASES.iter().all(|(alias, _)| *alias != "agent"),
+            "`agent` must not be a VERB_ALIASES entry"
+        );
+    }
+
+    /// The flat verb the noun rewrites onto is a real verb with the
+    /// documented flags, and `build_agent_prompt` maps them onto the
+    /// `agent-prompt` wire shape.
+    #[test]
+    fn agent_prompt_parses_target_text_force() {
+        let parsed = parse_ok(&["agent-prompt", "--target", "demo", "--text", "hi there"]);
+        assert_eq!(parsed.verb.name, "agent-prompt");
+        let built = (parsed.verb.build)(&parsed.flags).unwrap();
+        assert_eq!(built["target"], json!("demo"));
+        assert_eq!(built["text"], json!("hi there"));
+        assert!(built.get("force").is_none(), "force must be optional");
+
+        let forced = parse_ok(&["agent-prompt", "--target", "demo", "--text", "x", "--force"]);
+        let built = (forced.verb.build)(&forced.flags).unwrap();
+        assert_eq!(built["force"], json!(true));
+    }
+
+    /// `agent-start` carries the name plus the verbatim `--exec --`
+    /// argv, and `build_agent_start` maps them onto the new-tab request
+    /// shape (the runner reuses `build_new_tab` for the real RPC).
+    #[test]
+    fn agent_start_carries_name_and_exec() {
+        let parsed = parse_ok(&[
+            "agent-start",
+            "--name",
+            "demo",
+            "--cwd",
+            "/tmp",
+            "--exec",
+            "--",
+            "bash",
+            "-c",
+            "sleep 1",
+        ]);
+        assert_eq!(parsed.verb.name, "agent-start");
+        assert_eq!(
+            parsed.flags.exec.as_deref(),
+            Some(["bash".to_string(), "-c".to_string(), "sleep 1".to_string()].as_slice())
+        );
+        let built = (parsed.verb.build)(&parsed.flags).unwrap();
+        assert_eq!(built["name"], json!("demo"));
+        assert_eq!(built["cwd"], json!("/tmp"));
+        assert_eq!(built["command"], json!(["bash", "-c", "sleep 1"]));
+    }
+
+    /// The noun's other two rewrites land on existing verbs
+    /// (`wait-agent-status`, `agent-read`), which parse with the
+    /// defaults the rewrite supplies.
+    #[test]
+    fn agent_wait_and_read_rewrite_targets_parse() {
+        let wait = parse_ok(&[
+            "wait-agent-status",
+            "--target",
+            "demo",
+            "--status",
+            "blocked",
+            "--timeout",
+            "60000",
+        ]);
+        assert_eq!(wait.verb.name, "wait-agent-status");
+
+        let read = parse_ok(&["agent-read", "--target", "demo", "--source", "recent-unwrapped"]);
+        assert_eq!(read.verb.name, "agent-read");
+        let built = (read.verb.build)(&read.flags).unwrap();
+        assert_eq!(built["target"], json!("demo"));
+        assert_eq!(built["source"], json!("recent-unwrapped"));
     }
 
     /// AC2 + AC1: every alias rewrites to its canonical spelling, and
