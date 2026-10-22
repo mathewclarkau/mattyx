@@ -324,14 +324,20 @@ AGENT DETECTION
       Ambiently detect which AI agent is running in a pane (issue #78):
       walks the pane PTY's process tree (/proc comm/cmdline) and scrapes
       the visible screen against the pattern registry. Prints
-      `<surface> <agent> <confidence> <evidence>` (agent is one of
-      claude, codex, pi, opencode, cursor, aider, unknown — plus any
-      user-added names; confidence is high/medium/low or none). The
+      `<surface> <agent> <confidence> <evidence>` (agent is one of 16
+      bundled names — claude, codex, pi, opencode, cursor, aider, grok,
+      devin, droid, amp, copilot, kilo, qoder, kiro, gemini, cline (see
+      `mtyx agent-pattern list`) — unknown, or any user-added name;
+      confidence is high/medium/low or none). The
       result is cached and surfaces in `list-workspaces` as agent_name.
   mtyx detect-agents
       Detection on every pane in one call: `<surface> <agent>` rows
       (the issue's `agent detect-batch`; --json prints
       {\"agents\":{\"<surface>\":\"<agent>\"}} — keys are surface ids).
+      Issue #140: --json also carries an additive {\"detections\":{...}}
+      map (state/source/confidence/evidence per surface), and the human
+      rows grow to `<surface> <agent> <state> <source>` when it is
+      present.
   mtyx agent-pattern <add|list|remove>
       Manage the live detection registry. add: `mtyx agent-pattern add
       <name> --pattern <marker> [--kind process|screen] [--confidence
