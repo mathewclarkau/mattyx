@@ -865,12 +865,33 @@ fn detect_agents_batch_returns_map_for_every_pane() {
     assert_eq!(agents.get(&s1.to_string()).and_then(|v| v.as_str()), Some("unknown"));
     assert_eq!(agents.get(&s2.to_string()).and_then(|v| v.as_str()), Some("unknown"));
 
-    // Human output: `<surface> <agent>` rows.
+    // Issue #140 AC3: the same reply carries the additive `detections`
+    // map (agent/state/source/confidence/evidence), so consumers can tell
+    // heuristic-grade state from hook-grade state. The legacy `agents`
+    // name-map above stays verbatim.
+    let detections = value["detections"].as_object().expect("detections map");
+    assert_eq!(detections.len(), 2, "one record per surface, got {detections:?}");
+    let record = detections.get(&s1.to_string()).expect("detection record for s1");
+    assert_eq!(record["agent"].as_str(), Some("unknown"));
+    assert_eq!(record["source"].as_str(), Some("heuristic"));
+    assert!(record["state"].is_string(), "state column present: {record}");
+    assert!(record.get("evidence").is_some(), "evidence carried: {record}");
+
+    // Human output: `<surface> <agent>` rows, grown with ` <state>
+    // <source>` now that the reply has a `detections` map.
     let plain = cli(&server, &["detect-agents"]);
     assert_success(&plain);
     let text = String::from_utf8(plain.stdout).unwrap();
     assert!(text.contains(&format!("{s1} unknown")), "rows were {text:?}");
     assert!(text.contains(&format!("{s2} unknown")), "rows were {text:?}");
+    let row = text
+        .lines()
+        .find(|line| line.starts_with(&format!("{s1} ")))
+        .unwrap_or_else(|| panic!("no row for {s1} in {text:?}"));
+    let columns: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(columns.len(), 4, "`<surface> <agent> <state> <source>`, got {row:?}");
+    assert_eq!(columns[1], "unknown");
+    assert_eq!(columns[3], "heuristic", "source column, got {row:?}");
 }
 
 /// Issue #140 AC5: the bundled name-match table covers the ten agents
