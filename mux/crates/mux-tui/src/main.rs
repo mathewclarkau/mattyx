@@ -1372,6 +1372,55 @@ fn run_server(args: Args) -> anyhow::Result<()> {
         enabled: config.agent_detection.enabled,
         min_confidence: config.agent_detection.min_confidence,
     });
+    // Issue #140: user signatures from `[[agent_detection]]` extend the
+    // live detection registry. Each is validated (warn + skip on error,
+    // matching the config file's degradation style) and pushed with
+    // `agent-pattern-add` semantics (duplicates rejected).
+    for signature in &config.agent_detection.signatures {
+        let kind = match signature.kind.as_str() {
+            "process" => mux_core::agent_detect::PatternKind::Process,
+            "screen" => mux_core::agent_detect::PatternKind::Screen,
+            other => {
+                eprintln!(
+                    "mtyx: ignoring agent_detection signature {:?}; bad kind {other:?} (expected \"process\" or \"screen\")",
+                    signature.name
+                );
+                continue;
+            }
+        };
+        let confidence = match mux_core::agent_detect::Confidence::parse(&signature.confidence) {
+            Some(confidence) => confidence,
+            None => {
+                eprintln!(
+                    "mtyx: ignoring agent_detection signature {:?}; bad confidence {:?} (expected \"high\", \"medium\", or \"low\")",
+                    signature.name, signature.confidence
+                );
+                continue;
+            }
+        };
+        let pattern = mux_core::agent_detect::AgentPattern {
+            name: signature.name.clone(),
+            kind,
+            pattern: signature.pattern.clone(),
+            confidence,
+            case_insensitive: signature.case_insensitive,
+        };
+        match mux.agent_pattern_add(pattern) {
+            Ok(()) => {}
+            Err(err) => eprintln!(
+                "mtyx: ignoring agent_detection signature {:?}: {err}",
+                signature.name
+            ),
+        }
+    }
+    // Issue #140 AC1: the zero-config heuristic poller. Default interval
+    // is 1000ms (worst-case freshness ~2s, inside the 5s budget);
+    // `poll_interval_ms = 0` keeps it off.
+    if config.agent_detection.poll_interval_ms > 0 {
+        mux.enable_heuristic_polling(std::time::Duration::from_millis(
+            config.agent_detection.poll_interval_ms,
+        ));
+    }
     // Issue #77 AC6: the operator's [[worktree_pattern]] override, or
     // None for the default `<repo>/../<repo>.<branch>/`.
     mux.set_worktree_pattern(config.worktree_pattern.clone());
