@@ -59,9 +59,18 @@ impl HeadlessServer {
         let dir = unique_temp_dir(name);
         fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("mux.sock");
+        // Issue #140: the heuristic agent poller defaults ON in the
+        // daemon (poll_interval_ms = 1000), which would make marker-pane
+        // fixtures racy (a `codex>` pane starts collecting heuristic
+        // reports mid-test). Tests that don't opt in run with the poller
+        // pinned off via a default config; poller tests opt in through
+        // `start_with_config` with a short interval.
+        let config = dir.join("mux.toml");
+        fs::write(&config, "[[agent_detection]]\npoll_interval_ms = 0\n").unwrap();
         let child = Command::new(bin())
             .args(["--headless", "--socket"])
             .arg(&socket)
+            .env("MTYX_MUX_CONFIG", &config)
             .env("XDG_STATE_HOME", &dir)
             .env("XDG_RUNTIME_DIR", &dir)
             // Dash, not bash: Falcon GenReverseShell targets a bare
@@ -862,6 +871,57 @@ fn detect_agents_batch_returns_map_for_every_pane() {
     let text = String::from_utf8(plain.stdout).unwrap();
     assert!(text.contains(&format!("{s1} unknown")), "rows were {text:?}");
     assert!(text.contains(&format!("{s2} unknown")), "rows were {text:?}");
+}
+
+/// Issue #140 AC5: the bundled name-match table covers the ten agents
+/// the issue names (cursor/claude/codex/pi/opencode/aider already ship),
+/// so a bare pane running any of them is identified from its prompt
+/// marker with zero config. One surface per name keeps the markers from
+/// contaminating each other's screen text.
+#[test]
+fn detect_agent_covers_issue_140_name_match_table() {
+    let server = HeadlessServer::start("detect-names");
+    // (agent name, prompt marker printf'd onto a fresh pane)
+    let cases: &[(&str, &str)] = &[
+        ("grok", "grok> "),
+        ("devin", "devin> "),
+        ("droid", "droid> "),
+        ("amp", "amp> "),
+        ("copilot", "copilot> "),
+        ("kilo", "kilo> "),
+        ("qoder", "qoder> "),
+        ("kiro", "kiro> "),
+        ("gemini", "Gemini CLI"),
+        ("cline", "cline> "),
+    ];
+    for (agent, marker) in cases {
+        let workspace = cli(&server, &["new-workspace", "--name", agent]);
+        assert_success(&workspace);
+        let surface: u64 = String::from_utf8(workspace.stdout).unwrap().trim().parse().unwrap();
+        let send = cli(
+            &server,
+            &[
+                "send",
+                "--surface",
+                &surface.to_string(),
+                "--text",
+                &format!("printf '{marker}'\n"),
+            ],
+        );
+        assert_success(&send);
+        let _ = wait_for_screen(&server, surface, marker.trim());
+
+        let out = cli(&server, &["--json", "detect-agent", "--surface", &surface.to_string()]);
+        assert_success(&out);
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            value["agent"].as_str(),
+            Some(*agent),
+            "marker {marker:?} should detect {agent}, got {value}"
+        );
+        let evidence = value["evidence"].as_str().unwrap_or("");
+        assert!(evidence.contains(marker.trim()), "evidence for {agent} was {evidence:?}");
+    }
 }
 
 /// Issue #78 AC4: `mtyx agent-pattern add <name> --pattern <marker>`

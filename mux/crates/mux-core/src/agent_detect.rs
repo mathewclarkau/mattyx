@@ -563,15 +563,22 @@ mod tests {
         ProcessEvidence { pid, comm: comm.into(), cmdline: cmdline.into(), starttime }
     }
 
-    /// T1 (plan §4): the bundled registry parses and covers the top-6
-    /// agents, each with at least one process and one screen pattern.
+    /// T1 (plan §4): the bundled registry parses and covers every agent
+    /// it ships — the original top-6 plus issue #140 AC5's name-match
+    /// list — each with at least one process and one screen pattern.
     #[test]
-    fn bundled_patterns_parse_and_cover_top_six_agents() {
+    fn bundled_patterns_parse_and_cover_every_bundled_agent() {
         let patterns = bundled_patterns().expect("bundled agents.json should parse");
         let mut names: Vec<&str> = patterns.iter().map(|p| p.name.as_str()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names, vec!["aider", "claude", "codex", "cursor", "opencode", "pi"]);
+        assert_eq!(
+            names,
+            vec![
+                "aider", "amp", "claude", "cline", "codex", "copilot", "cursor", "devin",
+                "droid", "gemini", "grok", "kilo", "kiro", "opencode", "pi", "qoder"
+            ]
+        );
         for name in names {
             assert!(
                 patterns.iter().any(|p| p.name == name && p.kind == PatternKind::Process),
@@ -581,6 +588,33 @@ mod tests {
                 patterns.iter().any(|p| p.name == name && p.kind == PatternKind::Screen),
                 "{name} needs at least one screen pattern"
             );
+        }
+    }
+
+    /// Issue #140 AC5: the added name-match rows must never fire on a
+    /// lookalike — `droid` ⊂ `android`, `amp` ⊂ `ramp`. Process patterns
+    /// are token-exact and screen patterns are prompt-shaped for exactly
+    /// this reason.
+    #[test]
+    fn issue_140_name_match_rows_ignore_lookalike_evidence() {
+        let patterns = bundled_patterns().unwrap();
+        // Lookalike process names: `android`/`ramp` are single tokens, so
+        // a bare `droid`/`amp` pattern cannot match them.
+        let process = vec![ev(10, "android", "android studio", Some(10))];
+        let detection = detect(&process, "", &patterns, Confidence::Low);
+        assert_eq!(detection.agent, "unknown", "android must not detect droid");
+
+        // Lookalike screen text: the markers are `droid> `/`amp> `, not
+        // the bare agent names, so prose containing the substring is
+        // not evidence.
+        let detection =
+            detect(&[], "ramp up the build\nandroid emulator\n", &patterns, Confidence::Low);
+        assert_eq!(detection.agent, "unknown", "ramp/android prose must not detect amp/droid");
+
+        // The real prompt markers still do.
+        for (name, text) in [("amp", "amp> "), ("droid", "droid> "), ("grok", "grok> ")] {
+            let detection = detect(&[], text, &patterns, Confidence::Low);
+            assert_eq!(detection.agent, name, "{text:?} should detect {name}");
         }
     }
 
