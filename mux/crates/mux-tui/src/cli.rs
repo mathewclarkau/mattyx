@@ -2535,12 +2535,47 @@ pub(crate) fn kill_stale(global: &GlobalArgs) -> usize {
     let mut cleaned = 0;
     for s in &sessions {
         if !s.live {
+            // Issue #136 R5: the discovery verdict can be stale by the
+            // time we unlink — re-verify liveness immediately before each
+            // reap so a session that came up in between is never removed.
+            if mux_core::server::is_session_socket_live(&s.socket_path) {
+                continue;
+            }
             let _ = std::fs::remove_file(&s.socket_path);
             let _ = std::fs::remove_file(mux_core::server::pid_path(&s.socket_path));
             cleaned += 1;
         }
     }
     cleaned
+}
+
+/// Issue #136 AC1: the daemon-startup reap. Enumerates the canonical and
+/// legacy runtime roots (explicit roots — no [`GlobalArgs`], because the
+/// headless `run_server` call site has none), skips the session being
+/// started (`skip_socket`) and every row classified live, and — like
+/// [`kill_stale`] — re-verifies liveness immediately before each unlink
+/// (R5) so a concurrently-starting daemon is never reaped. Returns how
+/// many `.sock`/`.pid` pairs were removed.
+pub(crate) fn sweep_stale_sessions(skip_socket: &std::path::Path) -> usize {
+    let mut sessions = discover_sessions_in_roots(&[
+        mux_core::platform::runtime_dir(),
+        mux_core::platform::legacy_runtime_dir(),
+    ]);
+    sessions.sort_by(|a, b| a.session.cmp(&b.session));
+    sessions.retain(|s| !s.live && s.socket_path.as_path() != skip_socket);
+    let mut swept = 0;
+    for s in &sessions {
+        // R5: re-verify immediately before the unlink — the classifier's
+        // verdict is stale by now; a socket that accepts a connection (or
+        // has gained a pid file naming a live mtyx) is never reaped.
+        if mux_core::server::is_session_socket_live(&s.socket_path) {
+            continue;
+        }
+        let _ = std::fs::remove_file(&s.socket_path);
+        let _ = std::fs::remove_file(mux_core::server::pid_path(&s.socket_path));
+        swept += 1;
+    }
+    swept
 }
 
 /// `mtyx rename-session --old <name> --new <name>` (issue #63). Resolves

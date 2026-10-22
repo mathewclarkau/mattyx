@@ -1396,6 +1396,24 @@ fn run_server(args: Args) -> anyhow::Result<()> {
         }
     }
     mux.enable_persistence();
+    // Issue #136 AC1: reap the stale `.sock`/`.pid` pairs left by dead
+    // sessions before binding, so a daemon restart inherits a clean
+    // runtime root. Guarded (R4): an explicit `--socket` whose parent is
+    // neither runtime root opts out — those pairs are not ours to reap.
+    let sweepable = match args.socket.as_deref() {
+        None => true,
+        Some(explicit) => {
+            let parent = explicit.parent();
+            parent == Some(mux_core::platform::runtime_dir().as_path())
+                || parent == Some(mux_core::platform::legacy_runtime_dir().as_path())
+        }
+    };
+    if sweepable {
+        let swept = cli::sweep_stale_sessions(&socket_path);
+        if swept > 0 {
+            eprintln!("mtyx: swept {swept} stale session(s)");
+        }
+    }
     mux_core::server::serve(mux.clone(), Some(socket_path.clone()))
         .with_context(|| format!("binding control socket at {}", socket_path.display()))?;
     // Issue #27: detached companion that unlinks .sock/.pid if we die via
