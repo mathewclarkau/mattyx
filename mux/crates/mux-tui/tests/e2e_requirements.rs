@@ -67,6 +67,7 @@ impl HeadlessServer {
             .args(["--headless", "--socket"])
             .arg(&socket)
             .env("XDG_STATE_HOME", &dir)
+            .env("XDG_RUNTIME_DIR", &dir)
             .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
