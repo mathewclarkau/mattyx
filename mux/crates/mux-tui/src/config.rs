@@ -96,7 +96,11 @@ impl Default for ThemeValue {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     #[serde(default)]
@@ -131,6 +135,28 @@ struct RawConfig {
     /// `"alt_shortcuts": false`.
     #[serde(default)]
     keys: HashMap<String, Value>,
+    /// Issue #132: enable the once-per-24h GitHub release update check on
+    /// TUI startup. Defaults to `true` when omitted.
+    #[serde(default = "default_true")]
+    update_check: bool,
+}
+
+impl Default for RawConfig {
+    fn default() -> Self {
+        RawConfig {
+            theme: ThemeValue::default(),
+            tabs: RawTabs::default(),
+            sidebar: RawSidebar::default(),
+            browser: RawBrowser::default(),
+            scrollbar: RawScrollbar::default(),
+            headless: RawHeadless::default(),
+            workspaces: Vec::new(),
+            agent_detection: Vec::new(),
+            worktree_pattern: Vec::new(),
+            keys: HashMap::new(),
+            update_check: true,
+        }
+    }
 }
 
 /// Raw `[[agent_detection]]` table (issue #78 AC7).
@@ -946,7 +972,7 @@ fn parse_chord(s: &str) -> Option<Chord> {
 }
 
 /// Full resolved configuration.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub theme: Theme,
     pub tabs: Tabs,
@@ -961,6 +987,27 @@ pub struct Config {
     /// `[[worktree_pattern]]` entry's `pattern`, or `None` for the
     /// default `<repo>/../<repo>.<branch>/`.
     pub worktree_pattern: Option<String>,
+    /// Issue #132: whether to run the background release update check on
+    /// TUI startup (default `true`).
+    pub update_check: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            theme: Theme::default(),
+            tabs: Tabs::default(),
+            sidebar: Sidebar::default(),
+            browser: Browser::default(),
+            scrollbar: Scrollbar::default(),
+            headless: Headless::default(),
+            keys: Keys::default(),
+            workspaces: Vec::new(),
+            agent_detection: AgentDetectionConfig::default(),
+            worktree_pattern: None,
+            update_check: true,
+        }
+    }
 }
 
 /// Resolved `[[agent_detection]]` settings (issue #78 AC7). Detection is
@@ -1195,6 +1242,7 @@ pub fn load() -> Config {
     config.keys.apply(&raw.keys);
     apply_worktree_pattern(&mut config, &raw.worktree_pattern);
     config.workspaces = raw.workspaces;
+    config.update_check = raw.update_check;
     // Issue #78 AC7: `[[agent_detection]]` entries apply in order; the
     // last value for each key wins. An unknown min_confidence warns and
     // is ignored (config degradation, matching the browser settings).
@@ -2519,5 +2567,22 @@ prefix = "ctrl+s"
 
         std::env::remove_var("XDG_CONFIG_HOME");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_check_defaults_true_and_parses_false_in_json_and_toml() {
+        let json_default: RawConfig = serde_json::from_str("{}").unwrap();
+        assert!(json_default.update_check);
+
+        let json_off: RawConfig = serde_json::from_str(r#"{"update_check": false}"#).unwrap();
+        assert!(!json_off.update_check);
+
+        let toml_default: RawConfig = toml::from_str("").unwrap();
+        assert!(toml_default.update_check);
+
+        let toml_off: RawConfig = toml::from_str("update_check = false\n").unwrap();
+        assert!(!toml_off.update_check);
+
+        assert!(Config::default().update_check);
     }
 }

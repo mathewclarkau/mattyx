@@ -66,6 +66,13 @@ Covers `x86_64` and `aarch64`, no Rust/clang toolchain needed — skip straight 
 Built by [`.github/workflows/release.yml`](./.github/workflows/release.yml) from a tagged commit, the same way
 `bootstrap.sh` builds it locally.
 
+Once installed, upgrade in place at any time (downloads the matching release asset, verifies its `.sha256` sidecar, and atomically swaps the binary):
+
+```bash
+mtyx update           # download, sha256-verify, and install the latest release
+mtyx update --check   # check for a newer release without downloading
+```
+
 ### Arch Linux (AUR)
 
 ```bash

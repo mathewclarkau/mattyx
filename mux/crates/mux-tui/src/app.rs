@@ -305,6 +305,7 @@ pub(crate) fn flash_active(elapsed: Duration) -> bool {
 pub struct Toast {
     pub text: String,
     deadline: Instant,
+    dismiss_on_key: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -466,6 +467,7 @@ pub struct App {
     /// Key binding help overlay (`leader ?`), generated from the live keys.
     pub help: Option<crate::help::HelpState>,
     pub toast: Option<Toast>,
+    update_check: crate::update_check::UpdateCheckHandle,
     pub(crate) shake_frames: u8,
     /// Workspaces with an active manual flash pulse, keyed by when it
     /// started. Checked (and lazily expired) in the sidebar render and
@@ -727,6 +729,7 @@ pub fn run(
     };
     let graphics_writer =
         if graphics_supported { Some(GraphicsWriter::spawn(stdout_lock.clone())?) } else { None };
+    let update_check = crate::update_check::spawn(config.update_check);
 
     let mut app = App {
         session,
@@ -758,6 +761,7 @@ pub fn run(
         tx,
         help: None,
         toast: None,
+        update_check,
         shake_frames: 0,
         flashing: HashMap::new(),
         selection: None,
@@ -846,6 +850,10 @@ impl App {
                     if self.check_consumption_watch() {
                         action = action.merge(RenderAction::Draw);
                     }
+                    if let Some(banner) = self.update_check.poll() {
+                        self.show_update_toast(banner);
+                        action = action.merge(RenderAction::Draw);
+                    }
                     None
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -869,6 +877,10 @@ impl App {
                 action = action.merge(RenderAction::Draw);
             }
             if self.check_consumption_watch() {
+                action = action.merge(RenderAction::Draw);
+            }
+            if let Some(banner) = self.update_check.poll() {
+                self.show_update_toast(banner);
                 action = action.merge(RenderAction::Draw);
             }
             match action {
@@ -1268,6 +1280,12 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Ok(RenderAction::None);
         }
+        let dismissed_toast = if self.toast.as_ref().is_some_and(|t| t.dismiss_on_key) {
+            self.toast = None;
+            RenderAction::Draw
+        } else {
+            RenderAction::None
+        };
         self.status_message = None;
         if self.prompt.is_some() {
             return self.handle_prompt_key(key);
@@ -1333,7 +1351,7 @@ impl App {
         // Typing replaces any selection highlight.
         self.selection = None;
         self.forward_key(&key);
-        Ok(RenderAction::None)
+        Ok(dismissed_toast)
     }
 
     /// Commit the open rename dialog (Enter or the OK button).
@@ -3083,7 +3101,19 @@ impl App {
     }
 
     fn show_toast(&mut self, text: String) {
-        self.toast = Some(Toast { text, deadline: Instant::now() + Duration::from_millis(1500) });
+        self.toast = Some(Toast {
+            text,
+            deadline: Instant::now() + Duration::from_millis(1500),
+            dismiss_on_key: false,
+        });
+    }
+
+    fn show_update_toast(&mut self, text: String) {
+        self.toast = Some(Toast {
+            text,
+            deadline: Instant::now() + Duration::from_secs(10),
+            dismiss_on_key: true,
+        });
     }
 
     fn expire_toast(&mut self) -> bool {
