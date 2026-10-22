@@ -77,8 +77,10 @@ fn wait_for_child_argv0(child_pid: u32, argv0: &str) {
     assert!(ok.is_some(), "child {child_pid} never exec'd {argv0:?}");
 }
 
-/// Issue #88 AC1 (capability record): `identify` bumps the protocol to 7
-/// and advertises `input-ack`, and the shared client-side gate accepts it.
+/// Issue #88 AC1 (capability record): `identify` bumps the protocol (7
+/// introduced the capability; 8 is issue #140's `heuristic` agent-state
+/// source) and advertises `input-ack`, and the shared client-side gate
+/// accepts it.
 #[test]
 fn identify_advertises_input_ack_capability() {
     isolate_runtime_dir();
@@ -91,7 +93,11 @@ fn identify_advertises_input_ack_capability() {
 
     let ident = rpc(&sock, json!({"id": 1, "cmd": "identify"}));
     assert_eq!(ident["ok"], json!(true), "identify failed: {ident}");
-    assert_eq!(ident["data"]["protocol"].as_u64(), Some(7), "protocol must be 7: {ident}");
+    assert_eq!(
+        ident["data"]["protocol"].as_u64(),
+        Some(mux_core::server::PROTOCOL_VERSION as u64),
+        "protocol must be the shipped version: {ident}"
+    );
     assert_eq!(
         ident["data"]["capabilities"]["input-ack"],
         json!(true),

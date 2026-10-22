@@ -329,7 +329,7 @@ object{
   surface:Id,
   previous:"working"|"blocked"|"idle"|"done"|"unknown"|null,
   state:"working"|"blocked"|"idle"|"done"|"unknown",
-  source:"detected"|"socket"|"hook",
+  source:"heuristic"|"detected"|"socket"|"hook",  // "heuristic" since protocol 8 (issue #140)
   session:string|null,
   agent:string|null,
   message:string|null,
@@ -337,7 +337,7 @@ object{
 }
 ```
 
-Meaning: The authoritative agent state for a surface changed. Hook-authority and socket reports override detection as described in `commands.md`. `agent`/`message` are issue #75's report fields (the pane's agent name and the latest report's free-text message; `null` on older servers).
+Meaning: The authoritative agent state for a surface changed. Hook-authority and socket reports override detection as described in `commands.md`; `heuristic` (protocol 8, issue #140's zero-config screen heuristics) is the lowest tier. `agent`/`message` are issue #75's report fields (the pane's agent name and the latest report's free-text message; `null` on older servers).
 
 Example:
 
