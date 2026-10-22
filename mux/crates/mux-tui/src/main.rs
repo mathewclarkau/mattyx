@@ -33,6 +33,7 @@ mod opencode_hook;
 mod pi_hook;
 mod plugin;
 mod plugin_host;
+mod self_update;
 mod session;
 mod session_manager;
 mod session_picker;
@@ -41,6 +42,7 @@ mod socket_watchdog;
 mod ssh_bootstrap;
 mod theme;
 mod ui;
+mod update_check;
 #[cfg(windows)]
 mod win_console;
 
@@ -182,6 +184,7 @@ USAGE:
   mtyx plugin <subcommand> Manage mtyx-plugin.toml manifests (see below)
   mtyx ssh <host> [OPTS]   Open a remote workspace over SSH (see below)
   mtyx machine <subcommand>  Manage saved SSH machines (see below)
+  mtyx update [--check]    Update mtyx to the latest release (or check only)
 
 OPTIONS:
   --session <name>   Session name (default: main). Determines the socket path.
@@ -493,6 +496,19 @@ MACHINES (issue #94, multi-machine SSH fleet)
       and a failed remote command exits with the remote's status - the
       verb is never silently re-run locally.
       Windows SSH hosts are out of scope.
+
+UPDATE (issues #132, #133)
+  mtyx update [--check]
+      Download the latest GitHub release binary for this OS/arch, verify its
+      SHA-256 against the release `<asset>.sha256` sidecar, verify
+      `<staged> --version`, and atomically replace the running executable.
+      With `--check`, only check and print the running and latest release
+      versions without downloading or modifying anything.
+      Refuses to overwrite symlinks (e.g. `ln -sf .../target/release/mtyx`)
+      or read-only package-manager paths (e.g. `/usr/bin/mtyx`).
+      SSH/remote `mtyxd-remote` binaries on remote hosts are out of scope for
+      `mtyx update` — they re-upload automatically on the next
+      `mtyx ssh <host>` after the local binary upgrades.
 ";
 
 /// Full help text. The CLI VERBS name list is generated from
@@ -943,6 +959,7 @@ fn main() {
             && first != "ssh"
             && first != "machine"
             && first != "socket-watchdog"
+            && first != "update"
         {
             if plugin::lookup_plugin(first).is_ok() {
                 // Resolve the session's control-socket path the same

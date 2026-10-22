@@ -40,8 +40,17 @@ pub(crate) struct GlobalArgs {
 /// error or swallowing the next flag as a value (issue #100). Valued
 /// forms (`--group 1`, `--group 0`) still work. `confirm`/`no-confirm`
 /// (issue #88) join the same convention.
-const BARE_BOOL_FLAGS: &[&str] =
-    &["group", "confirm", "no-confirm", "force", "wait", "require-transition", "all", "new-workspace"];
+const BARE_BOOL_FLAGS: &[&str] = &[
+    "group",
+    "confirm",
+    "no-confirm",
+    "force",
+    "wait",
+    "require-transition",
+    "all",
+    "new-workspace",
+    "check",
+];
 
 /// Verbs that accept one bare positional argument alongside their flags
 /// (issue #84: `mtyx screenshot --surface <id> <file>`), mapped onto the
@@ -625,6 +634,16 @@ pub(crate) const VERBS: &[VerbSpec] = &[
         print: print_empty,
         stream: false,
     },
+    VerbSpec {
+        // Issue #133: self-update verb (`mtyx update [--check]`).
+        // Special-cased in `run_command` (downloads, verifies SHA-256,
+        // and atomically swaps the local binary without a control socket).
+        name: "update",
+        allowed: &["check"],
+        build: build_update,
+        print: print_empty,
+        stream: false,
+    },
 ];
 
 pub fn is_cli_invocation(args: &[String]) -> bool {
@@ -961,6 +980,7 @@ fn run_command(args: CliArgs) -> i32 {
         "screenshot" => return run_screenshot(&args.global, &args.flags),
         "agent-start" => return run_agent_start(&args.global, &args.flags),
         "agent-list" => return run_agent_list(&args.global),
+        "update" => return run_update(&args.flags),
         _ => {}
     }
     let request = match (args.verb.build)(&args.flags) {
@@ -2015,6 +2035,19 @@ fn build_screenshot(flags: &FlagMap) -> Result<Value, UsageError> {
     flags.insert_optional_string(&mut value, "surface");
     flags.insert_optional_string(&mut value, "output");
     Ok(value)
+}
+
+fn build_update(flags: &FlagMap) -> Result<Value, UsageError> {
+    let mut value = json!({});
+    if let Some(check) = flags.optional_bool("check") {
+        value["check"] = json!(check);
+    }
+    Ok(value)
+}
+
+fn run_update(flags: &FlagMap) -> i32 {
+    let check_only = flags.optional_bool("check").unwrap_or(false);
+    crate::self_update::run(check_only)
 }
 
 /// `rename-session` parser: carry the `--old`/`--new` flags. The real

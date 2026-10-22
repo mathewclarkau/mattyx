@@ -136,7 +136,7 @@ mod tests {
         for verb in VERBS {
             assert!(script.contains(verb.name), "{shell} script is missing verb {:?}", verb.name);
         }
-        assert_eq!(VERBS.len(), 67, "verb table drifted from the pinned count");
+        assert_eq!(VERBS.len(), 68, "verb table drifted from the pinned count");
     }
 
     #[test]
