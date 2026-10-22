@@ -131,6 +131,12 @@ struct RawConfig {
     /// `"alt_shortcuts": false`.
     #[serde(default)]
     keys: HashMap<String, Value>,
+    /// Release-available check on TUI startup (issue #132): absent key
+    /// means enabled. Read via `update_check_enabled()`; deliberately not
+    /// part of the resolved `Config` — a thin-client attach rebuilds that
+    /// from server chrome and would silently lose a local opt-out.
+    #[serde(default)]
+    update_check: Option<bool>,
 }
 
 /// Raw `[[agent_detection]]` table (issue #78 AC7).
@@ -1403,6 +1409,15 @@ fn agent_in_title(tabs: &Tabs, title: &str) -> Option<String> {
     tabs.agents.iter().find(|agent| words.contains(&agent.as_str())).cloned()
 }
 
+/// Issue #132: is the release-available check enabled? Reads the local
+/// config file fresh — never `App.config`, which a thin-client attach
+/// rebuilds from `Config::default()` + server chrome. Absent key, missing
+/// file, or an unparseable config all mean *enabled* (matching
+/// `load_raw_config`'s fall-back-to-defaults rule).
+pub fn update_check_enabled() -> bool {
+    load_raw_config().update_check.unwrap_or(true)
+}
+
 fn load_raw_config() -> RawConfig {
     let Some(path) = platform::config_path() else { return RawConfig::default() };
     let Ok(text) = std::fs::read_to_string(&path) else { return RawConfig::default() };
@@ -2519,5 +2534,94 @@ prefix = "ctrl+s"
 
         std::env::remove_var("XDG_CONFIG_HOME");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #132: the release-available check is enabled unless the user
+    /// opts out. An absent key — or no config file at all — means enabled.
+    #[test]
+    fn update_check_defaults_to_enabled_when_absent() {
+        let toml: RawConfig = toml::from_str("").unwrap();
+        assert_eq!(toml.update_check, None);
+        let json: RawConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(json.update_check, None);
+
+        // Missing file: `load_raw_config` falls back to the defaults.
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap();
+        let dir = unique_dir("update-check-missing");
+        let path = dir.join("mux.json");
+        std::env::set_var("MTYX_MUX_CONFIG", &path);
+        let enabled = update_check_enabled();
+        std::env::remove_var("MTYX_MUX_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(enabled, "an absent config file must leave the check enabled");
+    }
+
+    #[test]
+    fn update_check_false_parses_toml_and_json() {
+        let toml: RawConfig = toml::from_str("update_check = false\n").unwrap();
+        assert_eq!(toml.update_check, Some(false));
+
+        let json: RawConfig = serde_json::from_str(r##"{"update_check": false}"##).unwrap();
+        assert_eq!(json.update_check, Some(false));
+
+        let json_on: RawConfig = serde_json::from_str(r##"{"update_check": true}"##).unwrap();
+        assert_eq!(json_on.update_check, Some(true));
+    }
+
+    /// Issue #132: `update_check = false` in the config file reaches
+    /// `update_check_enabled()` for both JSON and TOML, and an explicit
+    /// `true` re-enables the check.
+    #[test]
+    fn update_check_opt_out_via_env_config_file() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap();
+        let dir = unique_dir("update-check-opt-out");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let json_path = dir.join("mux.json");
+        let toml_path = dir.join("mux.toml");
+
+        std::fs::write(&json_path, r##"{"update_check": false}"##).unwrap();
+        std::env::set_var("MTYX_MUX_CONFIG", &json_path);
+        assert!(!update_check_enabled(), "JSON opt-out must disable the check");
+
+        std::fs::write(&json_path, r##"{"update_check": true}"##).unwrap();
+        assert!(update_check_enabled(), "an explicit true must re-enable the check");
+
+        std::fs::write(&toml_path, "update_check = false\n").unwrap();
+        std::env::set_var("MTYX_MUX_CONFIG", &toml_path);
+        assert!(!update_check_enabled(), "TOML opt-out must disable the check");
+
+        std::env::remove_var("MTYX_MUX_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #132 AC: the opt-out key composes with unrelated known keys,
+    /// so adding it to an existing `mux.json` keeps that file valid.
+    #[test]
+    fn update_check_config_with_foreign_keys_still_parses() {
+        let json: RawConfig = serde_json::from_str(
+            r##"{"theme": "none", "update_check": false, "tabs": {"min_width": 12}}"##,
+        )
+        .unwrap();
+        assert_eq!(json.update_check, Some(false));
+        assert_eq!(json.tabs.min_width, Some(12));
+        assert!(matches!(json.theme, ThemeValue::String(ref name) if name == "none"));
+    }
+
+    /// A broken config must not take the check down with it:
+    /// `load_raw_config` warns and falls back to the defaults (enabled).
+    #[test]
+    fn update_check_invalid_config_falls_back_to_enabled() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap();
+        let dir = unique_dir("update-check-invalid");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mux.toml");
+        std::fs::write(&path, "not [valid\n").unwrap();
+        std::env::set_var("MTYX_MUX_CONFIG", &path);
+        let enabled = update_check_enabled();
+        std::env::remove_var("MTYX_MUX_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(enabled, "an unparseable config must fall back to enabled");
     }
 }

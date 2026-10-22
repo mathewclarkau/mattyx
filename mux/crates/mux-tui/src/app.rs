@@ -302,6 +302,12 @@ pub(crate) fn flash_active(elapsed: Duration) -> bool {
     elapsed < FLASH_DURATION
 }
 
+/// Issue #132: how long the release-available toast stays on screen —
+/// longer than the 1500ms action toasts (informational, not a
+/// confirmation). While a toast is up the event loop ticks at 30ms, so
+/// this stays modest (12s, no more).
+const UPDATE_TOAST_TTL: Duration = Duration::from_secs(12);
+
 pub struct Toast {
     pub text: String,
     deadline: Instant,
@@ -431,6 +437,10 @@ pub struct App {
     pub prefix_armed: bool,
     pub answer_armed: bool,
     pub consumption_watch: Option<ConsumptionWatch>,
+    /// Issue #132: pending release-available check, polled once per loop
+    /// iteration until its worker reports (then dropped). `None` = no
+    /// check was due, or it already reported.
+    pub update_check: Option<crate::update_check::UpdateCheckState>,
     pub session_label: String,
     pub sidebar_visible: bool,
     /// Width of the sidebar in the current frame (0 when hidden).
@@ -628,6 +638,7 @@ pub fn run(
     session_label: String,
     overlay: Option<crate::config::Overlay>,
     initial_status: Option<String>,
+    update_check: Option<crate::update_check::UpdateCheckState>,
 ) -> anyhow::Result<RunOutcome> {
     // For a thin-client attach (issue #40 blocker 1) the local `Overlay`
     // must layer on top of the *server's* resolved config, not the
@@ -741,6 +752,7 @@ pub fn run(
         prefix_armed: false,
         answer_armed: false,
         consumption_watch: None,
+        update_check,
         session_label,
         sidebar_visible: true,
         sidebar_width: 0,
@@ -846,6 +858,9 @@ impl App {
                     if self.check_consumption_watch() {
                         action = action.merge(RenderAction::Draw);
                     }
+                    if self.check_update_notice() {
+                        action = action.merge(RenderAction::Draw);
+                    }
                     None
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -869,6 +884,9 @@ impl App {
                 action = action.merge(RenderAction::Draw);
             }
             if self.check_consumption_watch() {
+                action = action.merge(RenderAction::Draw);
+            }
+            if self.check_update_notice() {
                 action = action.merge(RenderAction::Draw);
             }
             match action {
@@ -2308,6 +2326,29 @@ impl App {
         }
     }
 
+    /// Issue #132: poll the startup release check. Once-per-session via
+    /// `noticed`; once the worker has reported (either a banner or
+    /// "nothing newer"), the state is dropped so the loop stops polling
+    /// entirely. Never blocks — `try_recv` only.
+    pub fn check_update_notice(&mut self) -> bool {
+        let Some(state) = self.update_check.as_mut() else { return false };
+        if state.noticed {
+            return false;
+        }
+        match state.rx.try_recv() {
+            Ok(Some(text)) => {
+                state.noticed = true;
+                self.show_toast_for(text, UPDATE_TOAST_TTL);
+                true
+            }
+            Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.update_check = None;
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+        }
+    }
+
     pub fn write_answer_bytes(&mut self, bytes: &[u8]) {
         let Some(surface) = self.active_surface_handle() else { return };
         let surface_id = self.active_surface();
@@ -3083,7 +3124,13 @@ impl App {
     }
 
     fn show_toast(&mut self, text: String) {
-        self.toast = Some(Toast { text, deadline: Instant::now() + Duration::from_millis(1500) });
+        self.show_toast_for(text, Duration::from_millis(1500));
+    }
+
+    /// Issue #132: toast variant with an explicit lifetime, for notices
+    /// that should outlive the default 1500ms action confirmation.
+    fn show_toast_for(&mut self, text: String, ttl: Duration) {
+        self.toast = Some(Toast { text, deadline: Instant::now() + ttl });
     }
 
     fn expire_toast(&mut self) -> bool {

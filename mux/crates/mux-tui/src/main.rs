@@ -41,6 +41,7 @@ mod socket_watchdog;
 mod ssh_bootstrap;
 mod theme;
 mod ui;
+mod update_check;
 #[cfg(windows)]
 mod win_console;
 
@@ -1424,7 +1425,14 @@ fn run_tui(
         eprintln!("mtyx: failed to set default colors: {err}");
     }
     raw_result?;
-    app::run(session, session_label, overlay, initial_status)
+
+    // Issue #132: release-available check, TUI startup only — `mtyx ssh`,
+    // the headless daemon and the hook/agent verbs never reach run_tui.
+    // Spawns one detached thread that never touches stdout and always
+    // reaps its curl child (see desktop_notify); None = opted out /
+    // throttled / no HOME.
+    let update_check = update_check::spawn_pending();
+    app::run(session, session_label, overlay, initial_status, update_check)
 }
 
 fn run_headless(mux: &Arc<Mux>, socket_path: &std::path::Path) -> anyhow::Result<()> {

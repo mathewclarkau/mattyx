@@ -148,10 +148,19 @@ Each action override replaces all default chords for that action. Values may be 
 
 Chord strings can be single characters or a key name with optional `ctrl`, `control`, `alt`, `option`, or `shift` modifiers. Examples: `"c"`, `"%"`, `"ctrl+b"`, `"alt+enter"`, `"tab"`, `"backtab"`, `"shift+tab"`, `"pageup"`, `"pagedown"`, `"esc"`, `"space"`, `"left"`, `"right"`, `"up"`, `"down"`, `"home"`, and `"end"`.
 
+## Update check
+
+| Key | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `update_check` | boolean | `true` | Release-available check on TUI startup |
+
+When enabled, mtyx performs at most one check per 24 hours at startup for a newer release (a single background request to the GitHub releases API) and shows a banner when one is available; the banner is shown at most once per TUI session. Set `update_check` to `false` to skip the check entirely, or set the `MTYX_NO_UPDATE_CHECK=1` environment variable to disable it without editing the config file — either switch suppresses all network access from the check. The key is top-level, not part of any table, and an absent key means enabled.
+
 ## Example
 
 ```json
 {
+  "update_check": false,
   "theme": {
     "selection_background": "#355c7d",
     "selection_foreground": null,
@@ -216,6 +225,9 @@ override", matching the JSON absent-key semantics.
 ```toml
 # mtyx TOML config: the user-facing surface. When both mux.json and
 # mux.toml exist, mux.json wins (it is the explicit override).
+
+# Top-level keys must precede the tables below.
+update_check = false
 
 [theme]
 selection_background = "#355c7d"
