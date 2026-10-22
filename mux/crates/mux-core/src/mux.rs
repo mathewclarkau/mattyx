@@ -1040,6 +1040,42 @@ reattaching to remote session {session_id} on {host} \
         });
     }
 
+    /// Issue #140 AC1: enable the background heuristic poller. A
+    /// daemon-side thread runs [`Self::poll_agent_heuristics`] over
+    /// every live PTY surface once per `interval`, so screen-derived
+    /// agent state stays fresh (working→idle within ~2×`interval`) with
+    /// no client attached and no hooks installed. Modelled on
+    /// [`Self::enable_persistence`] (a `Weak<Mux>` + an event
+    /// subscription whose disconnect is the shutdown signal); the
+    /// subscription here only detects shutdown — ticks, not events,
+    /// drive polling, so a busy event stream cannot starve the poller.
+    /// Tests and one-shot CLI invocations leave it off (a `Mux` on its
+    /// own never polls).
+    pub fn enable_heuristic_polling(self: &Arc<Self>, interval: std::time::Duration) {
+        let events = self.subscribe();
+        let mux = Arc::downgrade(self);
+        let _ = std::thread::Builder::new()
+            .name("mux-agent-heuristics".into())
+            .spawn(move || {
+                let mut last_poll = std::time::Instant::now();
+                loop {
+                    let elapsed = last_poll.elapsed();
+                    let wait =
+                        if elapsed >= interval { std::time::Duration::ZERO } else { interval - elapsed };
+                    match events.recv_timeout(wait) {
+                        // Drain events without resetting the deadline:
+                        // the channel is only the shutdown signal.
+                        Ok(_) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                    let Some(mux) = mux.upgrade() else { break };
+                    last_poll = std::time::Instant::now();
+                    mux.poll_agent_heuristics();
+                }
+            });
+    }
+
     pub fn set_cell_pixel_size(&self, width_px: u16, height_px: u16) {
         let next = (width_px.max(1), height_px.max(1));
         {
@@ -2409,6 +2445,69 @@ reattaching to remote session {session_id} on {host} \
         }
         let ids: Vec<SurfaceId> = self.with_state(|s| s.surfaces.keys().copied().collect());
         ids.into_iter().map(|id| Ok((id, self.detect_agent(id)?))).collect()
+    }
+
+    /// One heuristic-detection pass over every live PTY surface (issue
+    /// #140 AC1), driven by [`Self::enable_heuristic_polling`]'s thread.
+    /// Wider publish policy than the manual `detect-agent` path's
+    /// blocked/working-only gate: a `Heuristic`-tier report is published
+    /// when the classifier says `Blocked`/`Working` OR when it says
+    /// `Idle` and the agent is identified (`!= "unknown"`/`"generic"`)
+    /// — this lights the idle chip on a real agent's resting prompt
+    /// (`pi> `) without putting chips on bare shells. `Unknown` never
+    /// publishes. Publish-side dedup keeps a steady screen quiet:
+    ///   1. skip the whole surface when `(agent, screen_state)` matches
+    ///      the cached detection (no report attempt, no `TreeChanged`);
+    ///   2. skip `report_agent` when the current report is already
+    ///      `Heuristic` with the same state (equal-tier overwrite would
+    ///      otherwise re-emit `AgentStateChanged` every tick).
+    /// Higher-tier reports (`Detected`/`Socket`/`Hook`) win for free:
+    /// `Surface::set_agent_report` rejects `Heuristic` while any of them
+    /// is current.
+    pub fn poll_agent_heuristics(&self) {
+        if !self.agent_detection().enabled {
+            return;
+        }
+        let surfaces: Vec<Arc<Surface>> =
+            self.with_state(|s| s.surfaces.values().cloned().collect());
+        for surface in surfaces {
+            if surface.kind() != crate::SurfaceKind::Pty {
+                continue;
+            }
+            let Ok(detection) = self.detect_on_surface(&surface) else { continue };
+            // Dedup (1): an unchanged (agent, state) observation is a
+            // no-op — no events, no terminal re-lock churn.
+            let unchanged = surface.detected_agent().is_some_and(|cached| {
+                cached.agent == detection.agent && cached.screen_state == detection.screen_state
+            });
+            if unchanged {
+                continue;
+            }
+            let publish = match detection.screen_state {
+                AgentState::Blocked | AgentState::Working => true,
+                AgentState::Idle => detection.agent != "unknown" && detection.agent != "generic",
+                AgentState::Unknown | AgentState::Done => false,
+            };
+            if publish {
+                // Dedup (2): belt-and-braces on top of (1), so a cached
+                // detection can never re-emit an identical report.
+                let already_reported = surface.agent_report().is_some_and(|r| {
+                    r.source == AgentStateSource::Heuristic && r.state == detection.screen_state
+                });
+                if !already_reported {
+                    self.report_agent(
+                        surface.id,
+                        detection.screen_state,
+                        AgentStateSource::Heuristic,
+                        None,
+                        None,
+                        None,
+                    );
+                }
+            }
+            surface.set_detected_agent(detection);
+            self.emit(MuxEvent::TreeChanged);
+        }
     }
 
     /// Evidence collection + scoring for one surface, shared by
