@@ -924,6 +924,43 @@ fn detect_agent_covers_issue_140_name_match_table() {
     }
 }
 
+/// Issue #140 AC4: a user signature from
+/// `[[agent_detection.signatures]]` must reach the live detector, so a
+/// marker no bundled pattern knows is still identified.
+#[test]
+#[ignore = "issue #140: needs the TUI host to push agent_detection.signatures into the daemon"]
+fn agent_detection_signature_from_config_reaches_the_detector() {
+    let server = HeadlessServer::start_with_config(
+        "agent-signature-config",
+        r#"
+[[agent_detection]]
+poll_interval_ms = 0
+
+[[agent_detection.signatures]]
+name = "mysig"
+kind = "screen"
+pattern = "MYSIGMARKER>"
+confidence = "high"
+"#,
+    );
+    let workspace = cli(&server, &["new-workspace", "--name", "sig"]);
+    assert_success(&workspace);
+    let surface: u64 = String::from_utf8(workspace.stdout).unwrap().trim().parse().unwrap();
+
+    let send = cli(
+        &server,
+        &["send", "--surface", &surface.to_string(), "--text", "printf 'MYSIGMARKER> '\n"],
+    );
+    assert_success(&send);
+    let _ = wait_for_screen(&server, surface, "MYSIGMARKER>");
+
+    let out = cli(&server, &["--json", "detect-agent", "--surface", &surface.to_string()]);
+    assert_success(&out);
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["agent"].as_str(), Some("mysig"), "config signature must register: {value}");
+    assert_eq!(value["confidence"].as_str(), Some("high"));
+}
+
 /// Issue #78 AC4: `mtyx agent-pattern add <name> --pattern <marker>`
 /// extends the live registry (noun form), `list` shows it, detection
 /// hits it, duplicates are rejected, and `remove` drops it.
