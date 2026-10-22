@@ -949,7 +949,6 @@ fn detect_agent_covers_issue_140_name_match_table() {
 /// `[[agent_detection.signatures]]` must reach the live detector, so a
 /// marker no bundled pattern knows is still identified.
 #[test]
-#[ignore = "issue #140: needs the TUI host to push agent_detection.signatures into the daemon"]
 fn agent_detection_signature_from_config_reaches_the_detector() {
     let server = HeadlessServer::start_with_config(
         "agent-signature-config",
