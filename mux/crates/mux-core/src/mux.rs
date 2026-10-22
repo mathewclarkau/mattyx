@@ -2375,19 +2375,23 @@ reattaching to remote session {session_id} on {host} \
         let surface =
             self.surface(surface).ok_or_else(|| anyhow::anyhow!("unknown surface {surface}"))?;
         let detection = self.detect_on_surface(&surface)?;
-        // Issue #96: publish a screen-derived (`Detected`-tier) state only
-        // when the classifier found an unambiguous `blocked`/`working`
-        // marker. The authority rules in `Surface::set_agent_report`
-        // already reject a `Detected` report while a `Socket`/`Hook`
-        // report is current, so this can never override a self-report;
-        // and the `blocked`/`working`-only gate keeps it from
-        // downgrading one to `idle`/`unknown` either.
+        // Issue #96/#140: publish a screen-derived state only when the
+        // classifier found an unambiguous `blocked`/`working` marker.
+        // Issue #140 moved this publish from the `Detected` tier to the
+        // new lowest `Heuristic` tier — the screen classifier IS the
+        // heuristic layer (the `Detected` tier stays with the OSC 9/777
+        // notification watcher in `surface.rs`). The authority rules in
+        // `Surface::set_agent_report` reject a `Heuristic` report while
+        // a `Detected`/`Socket`/`Hook` report is current, so this can
+        // never override a self-report or an OSC observation; and the
+        // `blocked`/`working`-only gate keeps it from downgrading one to
+        // `idle`/`unknown` either.
         if matches!(detection.screen_state, crate::AgentState::Blocked | crate::AgentState::Working)
         {
             self.report_agent(
                 surface.id,
                 detection.screen_state,
-                crate::AgentStateSource::Detected,
+                crate::AgentStateSource::Heuristic,
                 None,
                 None,
                 None,
@@ -3875,6 +3879,109 @@ mod tests {
             .unwrap();
         assert_eq!(report.state, AgentState::Blocked);
         assert_eq!(report.source, AgentStateSource::Hook);
+    }
+
+    /// Issue #140 AC2/D1: `Heuristic` is the new lowest-authority tier
+    /// (declared FIRST in `AgentStateSource`, so the derived `Ord` ranks
+    /// it below `Detected`). A heuristic report applies on a fresh pane,
+    /// repeated heuristic polls overwrite each other (equal tier), and a
+    /// heuristic report is rejected while any higher tier — detected,
+    /// socket, or hook — is current.
+    #[test]
+    fn report_agent_heuristic_is_lowest_authority_and_never_overrides_reports() {
+        let mux = test_mux();
+        mux.new_workspace(None, None).unwrap();
+        let surface = mux.with_state(|s| {
+            let pane = s.workspaces[0].screens[0].active_pane;
+            s.panes[&pane].tabs[0]
+        });
+
+        // Applies on a fresh pane, and repeated heuristic polls overwrite
+        // each other (equal tier): working -> idle is not a rejection.
+        let report = mux
+            .report_agent(
+                surface,
+                AgentState::Working,
+                AgentStateSource::Heuristic,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(report.state, AgentState::Working);
+        assert_eq!(report.source, AgentStateSource::Heuristic);
+        let report = mux
+            .report_agent(surface, AgentState::Idle, AgentStateSource::Heuristic, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Idle, "equal-tier heuristic reports overwrite");
+        assert_eq!(report.source, AgentStateSource::Heuristic);
+
+        // A `Detected` report (the OSC-notification watcher's tier)
+        // overrides the heuristic report…
+        let report = mux
+            .report_agent(surface, AgentState::Blocked, AgentStateSource::Detected, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Blocked);
+        assert_eq!(report.source, AgentStateSource::Detected);
+
+        // …and later heuristic ticks cannot downgrade it (the poller
+        // would keep classifying the same screen).
+        let report = mux
+            .report_agent(surface, AgentState::Idle, AgentStateSource::Heuristic, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Blocked, "heuristic must not override a detected report");
+        assert_eq!(report.source, AgentStateSource::Detected);
+
+        // Socket outranks Detected; heuristic still cannot override it.
+        let report = mux
+            .report_agent(surface, AgentState::Working, AgentStateSource::Socket, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Working);
+        assert_eq!(report.source, AgentStateSource::Socket);
+        let report = mux
+            .report_agent(surface, AgentState::Idle, AgentStateSource::Heuristic, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Working, "heuristic must not override a socket report");
+        assert_eq!(report.source, AgentStateSource::Socket);
+
+        // Hook outranks everything (AC2): it applies over socket…
+        let report = mux
+            .report_agent(
+                surface,
+                AgentState::Blocked,
+                AgentStateSource::Hook,
+                Some("sess-1".into()),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(report.state, AgentState::Blocked);
+        assert_eq!(report.source, AgentStateSource::Hook);
+
+        // …and heuristic ticks never downgrade a hook report.
+        let report = mux
+            .report_agent(
+                surface,
+                AgentState::Working,
+                AgentStateSource::Heuristic,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(report.state, AgentState::Blocked, "heuristic must not override a hook report");
+        assert_eq!(report.source, AgentStateSource::Hook);
+    }
+
+    /// Issue #140 D1: the wire name round-trips and the declaration
+    /// order keeps `Heuristic` strictly below `Detected < Socket < Hook`.
+    #[test]
+    fn agent_state_source_heuristic_round_trips_and_ranks_lowest() {
+        assert_eq!(AgentStateSource::Heuristic.as_str(), "heuristic");
+        assert_eq!(AgentStateSource::parse("heuristic"), Some(AgentStateSource::Heuristic));
+        assert!(AgentStateSource::Heuristic < AgentStateSource::Detected);
+        assert!(AgentStateSource::Detected < AgentStateSource::Socket);
+        assert!(AgentStateSource::Socket < AgentStateSource::Hook);
     }
 
     #[test]
