@@ -51,7 +51,21 @@ fn assert_envelope(resp: &Value, id: u64) {
 }
 
 /// A live mux with one default PTY workspace, plus its control socket.
-fn mux_with_workspace(prefix: &str) -> (std::sync::Arc<Mux>, std::path::PathBuf, u64) {
+/// RAII guard: dropping it removes the session's `.sock`/`.pid` pair
+/// (issue #136 — this suite used to leak one session per test).
+struct WireServer {
+    mux: std::sync::Arc<Mux>,
+    sock: std::path::PathBuf,
+    surface: u64,
+}
+
+impl Drop for WireServer {
+    fn drop(&mut self) {
+        mux_core::server::cleanup(&self.sock);
+    }
+}
+
+fn mux_with_workspace(prefix: &str) -> WireServer {
     let mux = Mux::new(
         unique_session(prefix),
         SurfaceOptions {
@@ -62,7 +76,7 @@ fn mux_with_workspace(prefix: &str) -> (std::sync::Arc<Mux>, std::path::PathBuf,
     );
     let surface = mux.new_workspace(None, None).unwrap();
     let sock = mux_core::server::serve(mux.clone(), None).unwrap();
-    (mux, sock, surface.id)
+    WireServer { mux, sock, surface: surface.id }
 }
 
 /// First pane id from the live tree, for verbs that target a pane.
@@ -75,8 +89,8 @@ fn first_pane(sock: &Path) -> u64 {
 
 #[test]
 fn identify_envelope_and_data_shape() {
-    let (_mux, sock, _surface) = mux_with_workspace("wire-identify");
-    let resp = rpc(&sock, json!({"id": 7, "cmd": "identify"}));
+    let server = mux_with_workspace("wire-identify");
+    let resp = rpc(&server.sock, json!({"id": 7, "cmd": "identify"}));
     assert_envelope(&resp, 7);
 
     let data = &resp["data"];
@@ -96,8 +110,8 @@ fn identify_envelope_and_data_shape() {
 
 #[test]
 fn list_workspaces_shape() {
-    let (_mux, sock, _surface) = mux_with_workspace("wire-list-ws");
-    let resp = rpc(&sock, json!({"id": 2, "cmd": "list-workspaces"}));
+    let server = mux_with_workspace("wire-list-ws");
+    let resp = rpc(&server.sock, json!({"id": 2, "cmd": "list-workspaces"}));
     assert_envelope(&resp, 2);
 
     let workspaces = &resp["data"]["workspaces"];
@@ -115,10 +129,10 @@ fn list_workspaces_shape() {
 
 #[test]
 fn get_resolved_config_shape() {
-    let (mux, sock, _surface) = mux_with_workspace("wire-chrome");
+    let server = mux_with_workspace("wire-chrome");
 
     // No chrome registered yet: the handler substitutes an empty object.
-    let resp = rpc(&sock, json!({"id": 3, "cmd": "get-resolved-config"}));
+    let resp = rpc(&server.sock, json!({"id": 3, "cmd": "get-resolved-config"}));
     assert_envelope(&resp, 3);
     assert!(resp["data"].is_object(), "get-resolved-config data must be an object: {resp}");
 
@@ -126,24 +140,24 @@ fn get_resolved_config_shape() {
     // the wire contract is "an opaque object", so we pin round-tripping
     // rather than inventing a schema the server does not enforce).
     let chrome = json!({"theme": "dark", "tabs": {}, "sidebar": {}, "keys": []});
-    mux.set_resolved_chrome(chrome.clone());
-    let resp = rpc(&sock, json!({"id": 4, "cmd": "get-resolved-config"}));
+    server.mux.set_resolved_chrome(chrome.clone());
+    let resp = rpc(&server.sock, json!({"id": 4, "cmd": "get-resolved-config"}));
     assert_envelope(&resp, 4);
     assert_eq!(resp["data"], chrome, "resolved chrome must round-trip verbatim");
 }
 
 #[test]
 fn list_agents_shape() {
-    let (_mux, sock, _surface) = mux_with_workspace("wire-list-agents");
-    let resp = rpc(&sock, json!({"id": 5, "cmd": "list-agents"}));
+    let server = mux_with_workspace("wire-list-agents");
+    let resp = rpc(&server.sock, json!({"id": 5, "cmd": "list-agents"}));
     assert_envelope(&resp, 5);
     assert!(resp["data"]["agents"].is_array(), "data.agents must be an array: {resp}");
 }
 
 #[test]
 fn agent_pattern_list_shape() {
-    let (_mux, sock, _surface) = mux_with_workspace("wire-patterns");
-    let resp = rpc(&sock, json!({"id": 6, "cmd": "agent-pattern-list"}));
+    let server = mux_with_workspace("wire-patterns");
+    let resp = rpc(&server.sock, json!({"id": 6, "cmd": "agent-pattern-list"}));
     assert_envelope(&resp, 6);
     let patterns = resp["data"]["patterns"].as_array().expect("data.patterns must be an array");
     if let Some(pattern) = patterns.first() {
@@ -157,17 +171,17 @@ fn agent_pattern_list_shape() {
 
 #[test]
 fn pane_worktree_list_shape() {
-    let (_mux, sock, _surface) = mux_with_workspace("wire-worktrees");
-    let pane = first_pane(&sock);
-    let resp = rpc(&sock, json!({"id": 8, "cmd": "pane-worktree-list", "pane": pane}));
+    let server = mux_with_workspace("wire-worktrees");
+    let pane = first_pane(&server.sock);
+    let resp = rpc(&server.sock, json!({"id": 8, "cmd": "pane-worktree-list", "pane": pane}));
     assert_envelope(&resp, 8);
     assert!(resp["data"]["worktrees"].is_array(), "data.worktrees must be an array: {resp}");
 }
 
 #[test]
 fn layout_export_shape() {
-    let (_mux, sock, _surface) = mux_with_workspace("wire-layout");
-    let resp = rpc(&sock, json!({"id": 9, "cmd": "layout-export"}));
+    let server = mux_with_workspace("wire-layout");
+    let resp = rpc(&server.sock, json!({"id": 9, "cmd": "layout-export"}));
     assert_envelope(&resp, 9);
 
     // The response `data` IS the LayoutDocument (no wrapper key).
@@ -189,8 +203,9 @@ fn layout_export_shape() {
 
 #[test]
 fn read_screen_shape() {
-    let (_mux, sock, surface) = mux_with_workspace("wire-read-screen");
-    let resp = rpc(&sock, json!({"id": 10, "cmd": "read-screen", "surface": surface}));
+    let server = mux_with_workspace("wire-read-screen");
+    let resp =
+        rpc(&server.sock, json!({"id": 10, "cmd": "read-screen", "surface": server.surface}));
     assert_envelope(&resp, 10);
 
     // server.rs:2117 — ReadScreen returns ONLY `{"text": <string>}`; there
@@ -202,8 +217,8 @@ fn read_screen_shape() {
 
 #[test]
 fn notify_ack_shape() {
-    let (_mux, sock, _surface) = mux_with_workspace("wire-notify-ack");
-    let resp = rpc(&sock, json!({"id": 11, "cmd": "notify-ack", "client": "golden"}));
+    let server = mux_with_workspace("wire-notify-ack");
+    let resp = rpc(&server.sock, json!({"id": 11, "cmd": "notify-ack", "client": "golden"}));
     assert_envelope(&resp, 11);
 
     let data = &resp["data"];
@@ -218,9 +233,11 @@ fn notify_ack_shape() {
 /// it; the pinned part here is the KEY SET, not the values.
 #[test]
 fn agent_register_shape() {
-    let (_mux, sock, surface) = mux_with_workspace("wire-agent-register");
-    let resp =
-        rpc(&sock, json!({"id": 12, "cmd": "agent-register", "surface": surface, "agent": "demo"}));
+    let server = mux_with_workspace("wire-agent-register");
+    let resp = rpc(
+        &server.sock,
+        json!({"id": 12, "cmd": "agent-register", "surface": server.surface, "agent": "demo"}),
+    );
     assert_envelope(&resp, 12);
 
     let data = &resp["data"];
@@ -236,14 +253,16 @@ fn agent_register_shape() {
 /// `agent_name_taken` code (`mtyx agent start` maps it to exit 1).
 #[test]
 fn agent_register_rejects_duplicate_names_with_stable_code() {
-    let (mux, sock, surface) = mux_with_workspace("wire-agent-dup");
-    let first =
-        rpc(&sock, json!({"id": 13, "cmd": "agent-register", "surface": surface, "agent": "dup"}));
+    let server = mux_with_workspace("wire-agent-dup");
+    let first = rpc(
+        &server.sock,
+        json!({"id": 13, "cmd": "agent-register", "surface": server.surface, "agent": "dup"}),
+    );
     assert_envelope(&first, 13);
 
-    let second_surface = mux.new_workspace(None, None).unwrap();
+    let second_surface = server.mux.new_workspace(None, None).unwrap();
     let resp = rpc(
-        &sock,
+        &server.sock,
         json!({"id": 14, "cmd": "agent-register", "surface": second_surface.id, "agent": "dup"}),
     );
     assert_eq!(resp["ok"], json!(false), "duplicate register must fail: {resp}");
@@ -256,13 +275,16 @@ fn agent_register_rejects_duplicate_names_with_stable_code() {
 /// the stub `/bin/cat` PTY, so this is shape-only.
 #[test]
 fn agent_prompt_shape_and_blocked_gate() {
-    let (_mux, sock, surface) = mux_with_workspace("wire-agent-prompt");
-    let reg =
-        rpc(&sock, json!({"id": 15, "cmd": "agent-register", "surface": surface, "agent": "demo"}));
+    let server = mux_with_workspace("wire-agent-prompt");
+    let reg = rpc(
+        &server.sock,
+        json!({"id": 15, "cmd": "agent-register", "surface": server.surface, "agent": "demo"}),
+    );
     assert_envelope(&reg, 15);
 
     // Ungated (fresh registration reports `unknown`): text + CR write.
-    let resp = rpc(&sock, json!({"id": 16, "cmd": "agent-prompt", "target": "demo", "text": "hi"}));
+    let resp =
+        rpc(&server.sock, json!({"id": 16, "cmd": "agent-prompt", "target": "demo", "text": "hi"}));
     assert_envelope(&resp, 16);
     assert!(resp["data"]["surface"].is_number(), "data.surface must be a number: {resp}");
 
@@ -270,8 +292,8 @@ fn agent_prompt_shape_and_blocked_gate() {
     // carry `agent`; the ladder preserves it) — the factory race the
     // hook-authority registration exists to close.
     let blocked = rpc(
-        &sock,
-        json!({"id": 17, "cmd": "report-agent", "surface": surface, "state": "blocked", "source": "hook"}),
+        &server.sock,
+        json!({"id": 17, "cmd": "report-agent", "surface": server.surface, "state": "blocked", "source": "hook"}),
     );
     assert_envelope(&blocked, 17);
     assert_eq!(
@@ -281,12 +303,12 @@ fn agent_prompt_shape_and_blocked_gate() {
     );
 
     let refused =
-        rpc(&sock, json!({"id": 18, "cmd": "agent-prompt", "target": "demo", "text": "hi"}));
+        rpc(&server.sock, json!({"id": 18, "cmd": "agent-prompt", "target": "demo", "text": "hi"}));
     assert_eq!(refused["ok"], json!(false), "blocked prompt must fail: {refused}");
     assert_eq!(refused["code"], json!("agent_blocked"), "stable error code: {refused}");
 
     let forced = rpc(
-        &sock,
+        &server.sock,
         json!({"id": 19, "cmd": "agent-prompt", "target": "demo", "text": "hi", "force": true}),
     );
     assert_envelope(&forced, 19);
