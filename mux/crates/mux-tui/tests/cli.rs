@@ -3175,6 +3175,365 @@ fn kill_stale_removes_stale_pair_and_leaves_live_untouched() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Issue #136 AC2: `kill-stale --dry-run` reports what WOULD be reaped and
+/// removes nothing — the stale pair survives, and the live pair is neither
+/// removed nor reported. Modelled on
+/// `kill_stale_removes_stale_pair_and_leaves_live_untouched` (:3117).
+#[test]
+fn kill_stale_dry_run_removes_nothing_and_reports() {
+    let dir = unique_temp_dir("kill-stale-dry-run");
+    fs::create_dir_all(&dir).unwrap();
+    let live_socket = dir.join("live-sess.sock");
+    let mut child = Command::new(bin())
+        .args(["--headless", "--socket"])
+        .arg(&live_socket)
+        .env("XDG_RUNTIME_DIR", &dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let live_pid = dir.join("live-sess.pid");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if live_socket.exists() && live_pid.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // Fake stale pair (nonexistent PID 999999), like the reap test above.
+    let stale_socket = dir.join("stale-sess.sock");
+    let stale_pid = dir.join("stale-sess.pid");
+    fs::write(&stale_socket, "fake").unwrap();
+    fs::write(&stale_pid, "999999\n").unwrap();
+
+    // Human mode: names the stale session, unlinks nothing.
+    let output = run_against(&live_socket, &dir, &["kill-stale", "--dry-run"]);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stale-sess"), "dry run must report the stale session: {stdout:?}");
+    assert!(stale_socket.exists(), "--dry-run must not remove the stale socket");
+    assert!(stale_pid.exists(), "--dry-run must not remove the stale pid file");
+    assert!(live_socket.exists(), "live socket should be untouched");
+    assert!(live_pid.exists(), "live pid file should be untouched");
+
+    // JSON mode: the machine-readable preview of the same set.
+    let json_out = run_against(&live_socket, &dir, &["--json", "kill-stale", "--dry-run"]);
+    assert_success(&json_out);
+    let value: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
+    assert_eq!(value["ok"], true, "payload: {value}");
+    assert_eq!(value["dry_run"], true, "payload: {value}");
+    assert_eq!(value["cleaned"], 0, "dry run must clean nothing: {value}");
+    let stale = value["stale"].as_array().unwrap_or_else(|| panic!("no stale array: {value}"));
+    assert_eq!(stale.len(), 1, "only the fake stale session is stale: {value}");
+    assert_eq!(stale[0]["session"], "stale-sess");
+    assert_eq!(stale[0]["pid"], 999999);
+    let socket_field = stale[0]["socket"].as_str().unwrap_or_default();
+    assert!(socket_field.ends_with("stale-sess.sock"), "unexpected socket field: {socket_field}");
+    assert!(
+        !stale.iter().any(|row| row["session"] == "live-sess"),
+        "the live session must not be listed as stale: {value}"
+    );
+
+    assert!(stale_socket.exists(), "--json --dry-run must not remove the stale socket");
+    assert!(stale_pid.exists(), "--json --dry-run must not remove the stale pid file");
+    assert!(live_socket.exists(), "live socket should be untouched");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Issue #136 AC2: `gc` is a `VERB_ALIASES` shorthand for `kill-stale`
+/// (same convention as `ls`/`new`/`at`), so it runs the exact same code
+/// path — including `--dry-run`.
+#[test]
+fn gc_alias_runs_kill_stale() {
+    let dir = unique_temp_dir("gc-alias");
+    fs::create_dir_all(&dir).unwrap();
+    let live_socket = dir.join("live-sess.sock");
+    let mut child = Command::new(bin())
+        .args(["--headless", "--socket"])
+        .arg(&live_socket)
+        .env("XDG_RUNTIME_DIR", &dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let live_pid = dir.join("live-sess.pid");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if live_socket.exists() && live_pid.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let stale_socket = dir.join("gc-stale.sock");
+    let stale_pid = dir.join("gc-stale.pid");
+    fs::write(&stale_socket, "fake").unwrap();
+    fs::write(&stale_pid, "999999\n").unwrap();
+
+    let output = run_against(&live_socket, &dir, &["--json", "gc", "--dry-run"]);
+    assert_success(&output);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ok"], true, "payload: {value}");
+    assert_eq!(value["dry_run"], true, "`gc` must resolve to kill-stale: {value}");
+    assert_eq!(value["cleaned"], 0, "dry run must clean nothing: {value}");
+    let stale = value["stale"].as_array().unwrap_or_else(|| panic!("no stale array: {value}"));
+    assert!(stale.iter().any(|row| row["session"] == "gc-stale"), "payload: {value}");
+
+    assert!(stale_socket.exists(), "`gc --dry-run` must not remove the stale socket");
+    assert!(stale_pid.exists(), "`gc --dry-run` must not remove the stale pid file");
+    assert!(live_socket.exists(), "live socket should be untouched");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The canonical `$XDG_RUNTIME_DIR/mtyx-<uid>` runtime root a default-path
+/// headless daemon binds in. Found by scanning rather than hardcoding the
+/// uid suffix (CI runners are not always 1000).
+fn wait_for_runtime_root(xdg: &std::path::Path) -> PathBuf {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if let Ok(entries) = fs::read_dir(xdg) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with("mtyx-") {
+                    return entry.path();
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("no mtyx-<uid> runtime root appeared under {}", xdg.display());
+}
+
+/// Poll until `<root>/<name>.sock` AND `<name>.pid` exist (a bound,
+/// pid-published daemon), then return the socket path.
+fn wait_for_session_pair(root: &std::path::Path, name: &str) -> PathBuf {
+    let sock = root.join(format!("{name}.sock"));
+    let pid = root.join(format!("{name}.pid"));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if sock.exists() && pid.exists() {
+            return sock;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("session {name} never bound {} (+ .pid)", sock.display());
+}
+
+/// Issue #136 AC1+AC3: a headless daemon sweeps the stale `.sock`/`.pid`
+/// pairs in its runtime root at startup — before `serve()` binds — while
+/// the live session started before it stays untouched, and `list-sessions`
+/// no longer reports the reaped name. Pre-feature this fails: the planted
+/// stale pair survives daemon B's start.
+#[test]
+fn headless_start_sweeps_stale_and_keeps_live() {
+    let rt = unique_temp_dir("sweep-start");
+    fs::create_dir_all(&rt).unwrap();
+
+    // Live daemon A on the default socket path: its bind creates the
+    // canonical mtyx-<uid> root under XDG_RUNTIME_DIR.
+    let mut a = Command::new(bin())
+        .args(["--headless", "--session", "live-a"])
+        .env("XDG_RUNTIME_DIR", &rt)
+        .env("XDG_STATE_HOME", &rt)
+        .env("SHELL", "/bin/sh")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let root = wait_for_runtime_root(&rt);
+    let a_sock = wait_for_session_pair(&root, "live-a");
+    let a_pid = root.join("live-a.pid");
+
+    // The graveyard entry: a dead session's pair (nonexistent pid 999999).
+    let stale_sock = root.join("stale-old.sock");
+    let stale_pid = root.join("stale-old.pid");
+    fs::write(&stale_sock, "fake").unwrap();
+    fs::write(&stale_pid, "999999\n").unwrap();
+
+    // Daemon B, same runtime root, different session: its startup sweep
+    // is the feature under test.
+    let mut b = Command::new(bin())
+        .args(["--headless", "--session", "sweep-b"])
+        .env("XDG_RUNTIME_DIR", &rt)
+        .env("XDG_STATE_HOME", &rt)
+        .env("SHELL", "/bin/sh")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let b_sock = wait_for_session_pair(&root, "sweep-b");
+
+    assert!(!stale_sock.exists(), "daemon start must sweep the stale socket");
+    assert!(!stale_pid.exists(), "daemon start must sweep the stale pid file");
+    assert!(a_sock.exists(), "live session A's socket must survive B's sweep");
+    assert!(a_pid.exists(), "live session A's pid file must survive B's sweep");
+    assert!(b_sock.exists(), "daemon B must be up");
+
+    // AC1's user-visible half: `list-sessions` no longer knows the reaped
+    // name and reports no stale rows.
+    let out = run_against(&b_sock, &rt, &["--json", "list-sessions"]);
+    assert_success(&out);
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let sessions =
+        value["sessions"].as_array().unwrap_or_else(|| panic!("no sessions array: {value}"));
+    assert!(
+        !sessions.iter().any(|row| row["session"] == "stale-old"),
+        "reaped session must not be listed: {value}"
+    );
+    assert!(
+        !sessions.iter().any(|row| row["status"] == "stale"),
+        "no stale rows should remain: {value}"
+    );
+    assert!(
+        sessions.iter().any(|row| row["session"] == "live-a" && row["status"] == "live"),
+        "live session A must be listed live: {value}"
+    );
+
+    let _ = a.kill();
+    let _ = a.wait();
+    let _ = b.kill();
+    let _ = b.wait();
+    let _ = fs::remove_dir_all(&rt);
+}
+
+/// Issue #136 AC3 (R5): a connectable socket with NO pid file — the
+/// bind-before-pidfile window of a concurrently-starting daemon
+/// (serve():1105→1117) — is LIVE and must never be reaped. The planted
+/// dead pair next to it proves the sweep actually ran, so a surviving
+/// `starting.sock` cannot be vacuous.
+#[test]
+fn sweep_leaves_connectable_socket_without_pid_file() {
+    let rt = unique_temp_dir("sweep-starting");
+    fs::create_dir_all(&rt).unwrap();
+
+    let mut guard_daemon = Command::new(bin())
+        .args(["--headless", "--session", "live-guard"])
+        .env("XDG_RUNTIME_DIR", &rt)
+        .env("XDG_STATE_HOME", &rt)
+        .env("SHELL", "/bin/sh")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let root = wait_for_runtime_root(&rt);
+    let guard_sock = wait_for_session_pair(&root, "live-guard");
+
+    // A concurrently-starting daemon's socket: bound and accepting, but
+    // its pid file is not written yet.
+    let starting = root.join("starting.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&starting).unwrap();
+    assert!(!root.join("starting.pid").exists());
+
+    let stale_sock = root.join("stale-start.sock");
+    let stale_pid = root.join("stale-start.pid");
+    fs::write(&stale_sock, "fake").unwrap();
+    fs::write(&stale_pid, "999999\n").unwrap();
+
+    let mut sweeper = Command::new(bin())
+        .args(["--headless", "--session", "sweeper"])
+        .env("XDG_RUNTIME_DIR", &rt)
+        .env("XDG_STATE_HOME", &rt)
+        .env("SHELL", "/bin/sh")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let sweeper_sock = wait_for_session_pair(&root, "sweeper");
+
+    assert!(!stale_sock.exists(), "the sweep must have run (stale socket removed)");
+    assert!(!stale_pid.exists(), "the sweep must have run (stale pid removed)");
+    assert!(
+        starting.exists(),
+        "a connectable socket with no pid file is LIVE — never reap it"
+    );
+    assert!(guard_sock.exists(), "the live guard daemon must be untouched");
+    assert!(sweeper_sock.exists(), "the sweeping daemon must be up");
+
+    drop(listener);
+    let _ = guard_daemon.kill();
+    let _ = guard_daemon.wait();
+    let _ = sweeper.kill();
+    let _ = sweeper.wait();
+    let _ = fs::remove_dir_all(&rt);
+}
+
+/// Issue #136 R4: an explicit `--socket` whose parent is neither runtime
+/// root opts the daemon OUT of the startup sweep — pairs under the
+/// runtime roots are not that daemon's to reap. Fails if the sweep is
+/// ever made unconditional.
+#[test]
+fn explicit_socket_outside_runtime_roots_skips_sweep() {
+    let rt_a = unique_temp_dir("sweep-inside");
+    let rt_b = unique_temp_dir("sweep-outside");
+    fs::create_dir_all(&rt_a).unwrap();
+    fs::create_dir_all(&rt_b).unwrap();
+
+    // A live default-path daemon creates the canonical root in rt_a.
+    let mut a = Command::new(bin())
+        .args(["--headless", "--session", "live-r4"])
+        .env("XDG_RUNTIME_DIR", &rt_a)
+        .env("XDG_STATE_HOME", &rt_a)
+        .env("SHELL", "/bin/sh")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let root = wait_for_runtime_root(&rt_a);
+    let a_sock = wait_for_session_pair(&root, "live-r4");
+
+    let stale_sock = root.join("stale-r4.sock");
+    let stale_pid = root.join("stale-r4.pid");
+    fs::write(&stale_sock, "fake").unwrap();
+    fs::write(&stale_pid, "999999\n").unwrap();
+
+    // Explicit --socket in rt_b (outside the runtime roots): no sweep.
+    let outside = rt_b.join("x.sock");
+    let outside_pid = rt_b.join("x.pid");
+    let mut c = Command::new(bin())
+        .args(["--headless", "--socket"])
+        .arg(&outside)
+        .env("XDG_RUNTIME_DIR", &rt_a)
+        .env("XDG_STATE_HOME", &rt_b)
+        .env("SHELL", "/bin/sh")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if outside.exists() && outside_pid.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(outside.exists(), "daemon with explicit socket must be up");
+
+    assert!(
+        stale_sock.exists(),
+        "explicit --socket outside the runtime roots must NOT sweep the stale socket"
+    );
+    assert!(
+        stale_pid.exists(),
+        "explicit --socket outside the runtime roots must NOT sweep the stale pid file"
+    );
+    assert!(a_sock.exists(), "live session A untouched");
+
+    let _ = a.kill();
+    let _ = a.wait();
+    let _ = c.kill();
+    let _ = c.wait();
+    let _ = fs::remove_dir_all(&rt_a);
+    let _ = fs::remove_dir_all(&rt_b);
+}
+
 /// `mtyx attach --session-list --json` lists discovered sessions with a
 /// `socket_path` per entry (issue #63, layer L1). Same shape as
 /// `list-sessions --json` plus `socket_path`; exit 0. Modelled on
