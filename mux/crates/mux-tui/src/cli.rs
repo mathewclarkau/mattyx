@@ -50,6 +50,7 @@ const BARE_BOOL_FLAGS: &[&str] = &[
     "all",
     "new-workspace",
     "check",
+    "dry-run",
 ];
 
 /// Verbs that accept one bare positional argument alongside their flags
@@ -581,8 +582,8 @@ pub(crate) const VERBS: &[VerbSpec] = &[
     },
     VerbSpec {
         name: "kill-stale",
-        allowed: &[],
-        build: build_no_args,
+        allowed: &["dry-run"],
+        build: build_kill_stale,
         print: print_empty,
         stream: false,
     },
@@ -1670,6 +1671,10 @@ const VERB_ALIASES: &[(&str, &str)] = &[
     ("at", "attach"),
     ("read", "read-screen"),
     ("shot", "screenshot"),
+    // Issue #136: `gc` collects the stale `.sock`/`.pid` pairs through the
+    // same `kill-stale` code path — an alias, not a second verb, so the
+    // completions verb-count pin is unaffected.
+    ("gc", "kill-stale"),
 ];
 
 pub(crate) fn resolve_verb_alias(args: &mut [String]) {
@@ -2000,6 +2005,17 @@ pub(crate) const DEFAULT_AGENT_WAIT_MS: u64 = 60_000;
 fn build_kill_session(flags: &FlagMap) -> Result<Value, UsageError> {
     let mut value = json!({});
     flags.insert_optional_string(&mut value, "session");
+    Ok(value)
+}
+
+/// Issue #136: `kill-stale --dry-run`. The verb is client-side (it never
+/// issues a socket request), so this payload is inert — it exists only so
+/// the flag passes parsing and reaches `run_kill_stale`.
+fn build_kill_stale(flags: &FlagMap) -> Result<Value, UsageError> {
+    let mut value = json!({});
+    if let Some(dry_run) = flags.optional_bool("dry-run") {
+        value["dry_run"] = json!(dry_run);
+    }
     Ok(value)
 }
 
@@ -2463,12 +2479,49 @@ fn run_kill_session(global: &GlobalArgs, flags: &FlagMap) -> i32 {
     0
 }
 
-fn run_kill_stale(global: &GlobalArgs, _flags: &FlagMap) -> i32 {
+fn run_kill_stale(global: &GlobalArgs, flags: &FlagMap) -> i32 {
+    // Issue #136 AC2: `--dry-run` is the read-only preview of the reap —
+    // it reports the stale set and unlinks nothing.
+    if flags.optional_bool("dry-run") == Some(true) {
+        let stale = stale_sessions(global);
+        if global.json {
+            let rows: Vec<Value> = stale
+                .iter()
+                .map(|s| {
+                    json!({
+                        "session": s.session,
+                        "socket": s.socket_path.display().to_string(),
+                        "pid": s.pid,
+                    })
+                })
+                .collect();
+            println!("{}", json!({ "ok": true, "dry_run": true, "cleaned": 0, "stale": rows }));
+        } else if stale.is_empty() {
+            println!("no stale sessions");
+        } else {
+            for s in &stale {
+                println!("{}\t{}", s.session, s.socket_path.display());
+            }
+        }
+        return 0;
+    }
+
     let cleaned = kill_stale(global);
     if global.json {
         println!("{}", json!({ "ok": true, "cleaned": cleaned }));
     }
     0
+}
+
+/// The stale (socket-not-connectable) sessions in the runtime roots
+/// honoured by `global`, sorted by session name. Shared by [`kill_stale`]
+/// (what it removes) and the `kill-stale --dry-run` preview (what it
+/// reports) so the two can never disagree about the set (issue #136).
+pub(crate) fn stale_sessions(global: &GlobalArgs) -> Vec<DiscoveredSession> {
+    let mut sessions = discover_sessions(global);
+    sessions.sort_by(|a, b| a.session.cmp(&b.session));
+    sessions.retain(|s| !s.live);
+    sessions
 }
 
 /// Kill every stale (socket-not-connectable) session in the runtime dir
@@ -2478,8 +2531,7 @@ fn run_kill_stale(global: &GlobalArgs, _flags: &FlagMap) -> i32 {
 /// pre-attach picker (L1), and the in-TUI session manager (L3) so all three
 /// exercise one code path.
 pub(crate) fn kill_stale(global: &GlobalArgs) -> usize {
-    let mut sessions = discover_sessions(global);
-    sessions.sort_by(|a, b| a.session.cmp(&b.session));
+    let sessions = stale_sessions(global);
     let mut cleaned = 0;
     for s in &sessions {
         if !s.live {

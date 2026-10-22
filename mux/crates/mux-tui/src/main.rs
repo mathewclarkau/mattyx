@@ -383,6 +383,18 @@ RENAME-SESSION
       path. See the server.rs docstring for the mechanism and the watchdog
       caveat (a SIGKILL after rename is cleaned by the next serve()/kill-stale).
 
+KILL-STALE
+  mtyx kill-stale [--dry-run] [--json]      (alias: mtyx gc)
+      Removes stale session `.sock`/`.pid` pairs — sessions whose daemon is
+      gone (the socket no longer accepts a connection). Live sessions are
+      never touched, and snapshots are never deleted.
+      --dry-run lists what WOULD be removed and removes nothing (with
+      --json: {\"ok\":true,\"dry_run\":true,\"cleaned\":0,\"stale\":[{session,
+      socket, pid}]}). Without --dry-run the JSON is {\"ok\":true,
+      \"cleaned\":<n>}. Exit 0 in both modes.
+      Stale pairs are also swept automatically at daemon startup, so the
+      verb is only needed to clean up without starting/restarting a session.
+
 CLAUDE CODE HOOK INTEGRATION
   mtyx claude install-hooks [--uninstall]
       Wires ~/.claude/settings.json's hooks to call `mtyx claude hook`

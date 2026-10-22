@@ -81,9 +81,11 @@ Notes on the mapping between CLI verbs and socket commands:
   (`down`, `up`, `enter`, `esc`, `ctrl-c`, `1`–`9`) to the raw bytes and sends
   a base64 `write-bytes` request. On the wire there is no separate `answer`
   command.
-- The CLI verbs `list-sessions`, `kill-session`, `kill-stale`, and `screenshot`
-  are client-side operations (they inspect the runtime directory / render
-  locally) — they issue no dedicated socket command of the same name.
+- The CLI verbs `list-sessions`, `kill-session`, `kill-stale` (alias `gc`),
+  and `screenshot` are client-side operations (they inspect the runtime
+  directory / render locally) — they issue no dedicated socket command of
+  the same name. `kill-stale --dry-run` is a read-only preview of the same
+  reap: it reports the stale `.sock`/`.pid` pairs and unlinks nothing.
 - `mtyx agent <start|prompt|wait|read|list>` is a CLI-only noun rewritten
   onto flat verbs before dispatch (the `agent-pattern` pattern): `agent
   start` composes `new-tab` + `agent-register` in one CLI flow, `agent

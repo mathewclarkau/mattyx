@@ -3175,6 +3175,125 @@ fn kill_stale_removes_stale_pair_and_leaves_live_untouched() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Issue #136 AC2: `kill-stale --dry-run` reports what WOULD be reaped and
+/// removes nothing — the stale pair survives, and the live pair is neither
+/// removed nor reported. Modelled on
+/// `kill_stale_removes_stale_pair_and_leaves_live_untouched` (:3117).
+#[test]
+fn kill_stale_dry_run_removes_nothing_and_reports() {
+    let dir = unique_temp_dir("kill-stale-dry-run");
+    fs::create_dir_all(&dir).unwrap();
+    let live_socket = dir.join("live-sess.sock");
+    let mut child = Command::new(bin())
+        .args(["--headless", "--socket"])
+        .arg(&live_socket)
+        .env("XDG_RUNTIME_DIR", &dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let live_pid = dir.join("live-sess.pid");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if live_socket.exists() && live_pid.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // Fake stale pair (nonexistent PID 999999), like the reap test above.
+    let stale_socket = dir.join("stale-sess.sock");
+    let stale_pid = dir.join("stale-sess.pid");
+    fs::write(&stale_socket, "fake").unwrap();
+    fs::write(&stale_pid, "999999\n").unwrap();
+
+    // Human mode: names the stale session, unlinks nothing.
+    let output = run_against(&live_socket, &dir, &["kill-stale", "--dry-run"]);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stale-sess"), "dry run must report the stale session: {stdout:?}");
+    assert!(stale_socket.exists(), "--dry-run must not remove the stale socket");
+    assert!(stale_pid.exists(), "--dry-run must not remove the stale pid file");
+    assert!(live_socket.exists(), "live socket should be untouched");
+    assert!(live_pid.exists(), "live pid file should be untouched");
+
+    // JSON mode: the machine-readable preview of the same set.
+    let json_out = run_against(&live_socket, &dir, &["--json", "kill-stale", "--dry-run"]);
+    assert_success(&json_out);
+    let value: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
+    assert_eq!(value["ok"], true, "payload: {value}");
+    assert_eq!(value["dry_run"], true, "payload: {value}");
+    assert_eq!(value["cleaned"], 0, "dry run must clean nothing: {value}");
+    let stale = value["stale"].as_array().unwrap_or_else(|| panic!("no stale array: {value}"));
+    assert_eq!(stale.len(), 1, "only the fake stale session is stale: {value}");
+    assert_eq!(stale[0]["session"], "stale-sess");
+    assert_eq!(stale[0]["pid"], 999999);
+    let socket_field = stale[0]["socket"].as_str().unwrap_or_default();
+    assert!(socket_field.ends_with("stale-sess.sock"), "unexpected socket field: {socket_field}");
+    assert!(
+        !stale.iter().any(|row| row["session"] == "live-sess"),
+        "the live session must not be listed as stale: {value}"
+    );
+
+    assert!(stale_socket.exists(), "--json --dry-run must not remove the stale socket");
+    assert!(stale_pid.exists(), "--json --dry-run must not remove the stale pid file");
+    assert!(live_socket.exists(), "live socket should be untouched");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Issue #136 AC2: `gc` is a `VERB_ALIASES` shorthand for `kill-stale`
+/// (same convention as `ls`/`new`/`at`), so it runs the exact same code
+/// path — including `--dry-run`.
+#[test]
+fn gc_alias_runs_kill_stale() {
+    let dir = unique_temp_dir("gc-alias");
+    fs::create_dir_all(&dir).unwrap();
+    let live_socket = dir.join("live-sess.sock");
+    let mut child = Command::new(bin())
+        .args(["--headless", "--socket"])
+        .arg(&live_socket)
+        .env("XDG_RUNTIME_DIR", &dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let live_pid = dir.join("live-sess.pid");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if live_socket.exists() && live_pid.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let stale_socket = dir.join("gc-stale.sock");
+    let stale_pid = dir.join("gc-stale.pid");
+    fs::write(&stale_socket, "fake").unwrap();
+    fs::write(&stale_pid, "999999\n").unwrap();
+
+    let output = run_against(&live_socket, &dir, &["--json", "gc", "--dry-run"]);
+    assert_success(&output);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ok"], true, "payload: {value}");
+    assert_eq!(value["dry_run"], true, "`gc` must resolve to kill-stale: {value}");
+    assert_eq!(value["cleaned"], 0, "dry run must clean nothing: {value}");
+    let stale = value["stale"].as_array().unwrap_or_else(|| panic!("no stale array: {value}"));
+    assert!(stale.iter().any(|row| row["session"] == "gc-stale"), "payload: {value}");
+
+    assert!(stale_socket.exists(), "`gc --dry-run` must not remove the stale socket");
+    assert!(stale_pid.exists(), "`gc --dry-run` must not remove the stale pid file");
+    assert!(live_socket.exists(), "live socket should be untouched");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// `mtyx attach --session-list --json` lists discovered sessions with a
 /// `socket_path` per entry (issue #63, layer L1). Same shape as
 /// `list-sessions --json` plus `socket_path`; exit 0. Modelled on
