@@ -371,7 +371,7 @@ mod tests {
     /// present so capture's exclusion list is exercised.
     fn test_mux() -> Arc<Mux> {
         let opts = SurfaceOptions {
-            command: Some(vec!["/bin/cat".to_string()]),
+            command: Some(crate::test_spawn::idle_child_argv()),
             extra_env: vec![
                 ("MTYX_MUX_SOCKET".into(), "/tmp/mtyx-layout-test.sock".into()),
                 ("MTYX_SOCKET_PATH".into(), "/tmp/mtyx-layout-test.sock".into()),
@@ -516,7 +516,10 @@ mod tests {
     }
 
     // 6. `layout_doc_capture_records_command_and_env_dropping_mtyx_auto_vars`
+    // Issue #129: records a POSIX `/bin/sh -c` argv and a `/tmp` cwd.
+    // windows-latest cannot spawn that path. Linux coverage retained.
     #[test]
+    #[cfg(unix)]
     fn layout_doc_capture_records_command_and_env_dropping_mtyx_auto_vars() {
         let mux = test_mux();
         let s1 = mux.new_workspace(Some("fleet".into()), None).unwrap();

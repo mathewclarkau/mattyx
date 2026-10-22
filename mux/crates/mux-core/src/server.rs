@@ -3510,15 +3510,16 @@ mod tests {
         use crate::{Mux, SurfaceOptions};
         use std::sync::OnceLock;
 
-        // One shared daemon: SurfaceOptions spawns /bin/cat panes so no
+        // One shared daemon: SurfaceOptions spawns a quiet long-lived child
+        // (unix `/bin/cat`, Windows PowerShell sleep; issue #129) so no
         // user shell is involved; OSC 7 never fires, so the pane cwd is
-        // the spawn cwd — exactly what the worktree resolution uses.
+        // the spawn cwd. That is exactly what the worktree resolution uses.
         static MUX: OnceLock<Arc<Mux>> = OnceLock::new();
         let mux = MUX.get_or_init(|| {
             Mux::new(
                 "wt-wire",
                 SurfaceOptions {
-                    command: Some(vec!["/bin/cat".to_string()]),
+                    command: Some(crate::test_spawn::idle_child_argv()),
                     ..Default::default()
                 },
             )

@@ -229,8 +229,21 @@ mod tests {
         assert_eq!(path, base.join("wt").join("feat-auth"));
 
         // Absolute patterns are used verbatim after substitution.
-        let abs = resolve_worktree_path(&repo, "/var/tmp/mtyx-wt/<repo>-<branch>", "x").unwrap();
-        assert_eq!(abs, Path::new("/var/tmp/mtyx-wt/proj-x"));
+        // Issue #129: a leading `/` is not absolute on Windows, so the
+        // unix fixture would be joined onto the repo drive (`C:\var\...`)
+        // and fail the equality. Drive-absolute is the Windows equivalent.
+        // Linux coverage of the verbatim `/var/tmp` case is retained.
+        #[cfg(unix)]
+        let (abs_pattern, expected) =
+            ("/var/tmp/mtyx-wt/<repo>-<branch>", PathBuf::from("/var/tmp/mtyx-wt/proj-x"));
+        #[cfg(windows)]
+        let (abs_pattern, expected) =
+            ("C:/var/tmp/mtyx-wt/<repo>-<branch>", PathBuf::from("C:/var/tmp/mtyx-wt/proj-x"));
+        #[cfg(not(any(unix, windows)))]
+        let (abs_pattern, expected) =
+            ("/var/tmp/mtyx-wt/<repo>-<branch>", PathBuf::from("/var/tmp/mtyx-wt/proj-x"));
+        let abs = resolve_worktree_path(&repo, abs_pattern, "x").unwrap();
+        assert_eq!(abs, expected);
         std::fs::remove_dir_all(&base).unwrap();
     }
 
