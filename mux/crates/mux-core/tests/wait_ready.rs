@@ -20,6 +20,19 @@ fn unique_session(prefix: &str) -> String {
     format!("{prefix}-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Point `XDG_RUNTIME_DIR` at a throwaway dir before any `serve(.., None)`:
+/// the default (`platform::runtime_dir()`) is the operator's real
+/// `/run/user/<uid>/mtyx-<uid>/` on a dev box, and tests must never touch it.
+/// One dir per test binary; `serve()` re-reads the env on every call.
+fn isolate_runtime_dir() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("mtyx-core-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+    });
+}
+
 fn connect(path: &Path) -> Box<dyn transport::Stream> {
     transport::connect(path).unwrap()
 }
@@ -42,6 +55,7 @@ fn rpc(socket: &Path, request: Value) -> Value {
 /// ready with spawn metadata (`child.pid`/`child.comm` + prompt_seen).
 #[test]
 fn wait_ready_reports_ready_with_child_after_send() {
+    isolate_runtime_dir();
     // `sh -c 'printf "$ "; sleep 30'` draws a `$ ` prompt (the generic
     // idle marker) and forks `sleep`, so both readiness halves hold.
     // The script stays as the PTY child; `sleep` is its descendant.
@@ -88,6 +102,7 @@ fn wait_ready_reports_ready_with_child_after_send() {
 /// turns that into a nonzero exit (covered in mux-tui's unit tests).
 #[test]
 fn wait_ready_times_out_not_ready_for_wedged_pane() {
+    isolate_runtime_dir();
     // `sleep 30` as the direct PTY child: a live process-tree child
     // exists, but the screen never shows a prompt, so readiness must
     // stay false after the (short) timeout.
@@ -122,6 +137,7 @@ fn wait_ready_times_out_not_ready_for_wedged_pane() {
 /// ready — `child` is null even if a prompt was drawn earlier.
 #[test]
 fn wait_ready_child_null_after_child_exit() {
+    isolate_runtime_dir();
     // Print a prompt-like marker, then exit immediately: the screen may
     // still show `$ ` but the process tree is empty.
     let mux = Mux::new(
