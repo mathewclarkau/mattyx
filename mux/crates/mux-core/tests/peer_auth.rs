@@ -59,12 +59,19 @@ fn rpc(socket: &Path, request: Value) -> Value {
 #[test]
 fn same_uid_accepted() {
     let socket = scratch_socket("same_uid");
-    // The decision for our own uid must be Accept, and the host must be a
-    // credential-capable transport (Linux) for the check to be armed.
     let us = platform::daemon_uid().expect("unix host has a uid");
+    // Issue #128: only Linux reports peer credentials. Linux must keep the
+    // check armed. Other unix hosts (macos-15 CI) use the documented
+    // filesystem-permissions fallback.
+    #[cfg(target_os = "linux")]
     assert!(
         platform::transport_supports_peer_creds(),
         "this test expects a credential-capable transport"
+    );
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(
+        platform::peer_auth_decision(Ok(us), Some(us), platform::transport_supports_peer_creds()),
+        PeerAuthDecision::Unsupported
     );
     assert_eq!(platform::peer_auth_decision(Ok(us), Some(us), true), PeerAuthDecision::Accept);
 
