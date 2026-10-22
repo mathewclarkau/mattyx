@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use mux_core::{AgentState, Rect};
+use mux_core::{AgentState, AgentStateSource, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::Frame;
 
@@ -175,8 +175,20 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
         let sub_style = if active { active_style.add_modifier(Modifier::DIM) } else { dim };
         let agent_state = pane.and_then(|p| p.active_agent_state());
         if let Some(state) = agent_state {
+            // Issue #140 AC6: heuristic-grade state renders hollow (○) —
+            // zero-config screen heuristics, any hook report would
+            // overwrite it — while report-grade state (detected/socket/
+            // hook) keeps the filled chip (●). Color still follows the
+            // state itself.
+            let glyph = if pane.and_then(|p| p.active_agent_source())
+                == Some(AgentStateSource::Heuristic)
+            {
+                "○"
+            } else {
+                "●"
+            };
             let glyph_style = sub_style.fg(agent_glyph_color(state)).remove_modifier(Modifier::DIM);
-            buf[(1, y + 1)].set_symbol("●").set_style(glyph_style);
+            buf[(1, y + 1)].set_symbol(glyph).set_style(glyph_style);
         }
         set_line_from(buf, 2, y + 1, subtitle.trim_start(), sub_style);
         hits.push((row_rect(y + 1), Hit::Workspace { index: i, id: ws.id }));
