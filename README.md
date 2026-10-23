@@ -70,10 +70,10 @@ See [`SKILL.md`](./SKILL.md) ([`skills/mtyx/SKILL.md`](./skills/mtyx/SKILL.md)) 
 
 ### 1. Install script (Linux & macOS, `x86_64` / `aarch64`)
 
-Downloads the release asset for your OS/arch, verifies its `.sha256` sidecar before installation, and installs to `~/.local/bin/mtyx` (no `sudo`):
+Downloads the release asset for your OS/arch, verifies its `.sha256` sidecar before installation, and installs to `~/.local/bin/mtyx` (no `sudo`). The one-liner is tag-pinned so the script you audit is the script that runs — substitute the latest release tag:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mathewclarkau/mattyx/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mathewclarkau/mattyx/v0.27.0/scripts/install.sh | bash
 ```
 
 ### 2. Homebrew (macOS & Linux)

@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # One-command installer for `mtyx` (issue #141).
 #
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/mathewclarkau/mattyx/main/scripts/install.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/mathewclarkau/mattyx/main/scripts/install.sh | bash -s -- --version v0.18.0
+# Usage (pin the tag so the script you audit is the script that runs):
+#   curl -fsSL https://raw.githubusercontent.com/mathewclarkau/mattyx/v0.27.0/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/mathewclarkau/mattyx/v0.27.0/scripts/install.sh | bash -s -- --version v0.18.0
 #
-# Environment overrides (also used by offline CI tests):
+# Environment overrides (these exist for offline testing — see
+# scripts/tests/install-sh-test.sh — and change where files are fetched from;
+# they are not part of the default trust story):
 #   MTYX_INSTALL_DIR          target directory (default: $HOME/.local/bin)
 #   MTYX_INSTALL_VERSION      release tag to install (default: latest via GitHub API)
 #   MTYX_INSTALL_API_URL      override GitHub releases/latest JSON endpoint (or file://)
@@ -13,6 +15,12 @@
 #   MTYX_INSTALL_OS           override detected OS (linux | macos | windows)
 #   MTYX_INSTALL_ARCH         override detected arch (x86_64 | aarch64)
 #   MTYX_INSTALL_SKIP_VERIFY_VERSION=1  skip executing `<staged> --version` (for cross-OS tests)
+#
+# NOTE on the trust model: the mandatory SHA-256 check below compares the
+# binary against a `.sha256` sidecar fetched from the *same* origin. That is
+# an integrity check (the payload matches the sidecar), not an authenticity
+# check — no signatures are involved, and the trust root is the download
+# origin itself. This mirrors `mtyx update` (self_update.rs).
 #
 # Security posture (per #133 & AGENTS.md):
 #   - Mandatory SHA-256 verification against `<asset>.sha256` sidecar before installation.
@@ -207,6 +215,19 @@ if [ -L "$INSTALL_DIR" ]; then
 fi
 mkdir -p "$INSTALL_DIR"
 
+# Mirror `mtyx update`'s ensure_target_writable (self_update.rs): the install
+# directory must exist and be writable *before* staging, so a read-only
+# directory or mount surfaces as actionable guidance here instead of a raw
+# mktemp/mv failure late in the install.
+if [ ! -d "$INSTALL_DIR" ]; then
+  echo "install.sh: install directory ${INSTALL_DIR} is not a directory — if installed via a package manager (paru/yay), update with that instead, or download from ${RELEASES_URL}" >&2
+  exit 1
+fi
+if [ ! -w "$INSTALL_DIR" ]; then
+  echo "install.sh: cannot write to ${INSTALL_DIR} (permission denied) — if installed via a package manager (paru/yay), update with that instead, or download from ${RELEASES_URL}" >&2
+  exit 1
+fi
+
 TARGET_PATH="${INSTALL_DIR%/}/${BIN_NAME}"
 
 # Rule (#133 / AGENTS.md): refuse to overwrite a symlink target so a
@@ -234,8 +255,22 @@ fi
 ASSET_URL="${BASE_URL}/${ASSET}"
 SIDECAR_URL="${BASE_URL}/${ASSET}.sha256"
 
-STAGED_BIN="${INSTALL_DIR%/}/.mtyx-install-$$.tmp"
-STAGED_SHA="${INSTALL_DIR%/}/.mtyx-install-$$.sha256.tmp"
+# Rule (#133 / AGENTS.md symlink-before-write): stage the downloads with
+# mktemp in the destination directory — O_EXCL creation with 0600 perms, so a
+# pre-planted symlink at a predictable path can never be written through —
+# and re-check each staged path for symlinks immediately before its fetch,
+# the same discipline as `mtyx update` (self_update.rs::ensure_not_symlink).
+# (The O_EXCL-created files are deliberately NOT removed before fetching:
+# removing them would reopen the race the mktemp creation just closed.)
+STAGED_BIN="$(mktemp "${INSTALL_DIR%/}/.mtyx-install-XXXXXX")"
+STAGED_SHA="$(mktemp "${INSTALL_DIR%/}/.mtyx-install-XXXXXX")"
+
+ensure_staged_not_symlink() {
+  if [ -L "$1" ]; then
+    echo "install.sh: refusing to write through staged symlink $1 — the install directory may be tampered with; investigate ${INSTALL_DIR} before retrying" >&2
+    exit 1
+  fi
+}
 
 cleanup() {
   rm -f "$STAGED_BIN" "$STAGED_SHA"
@@ -243,7 +278,9 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> fetching ${TAG} (${ASSET})..."
+ensure_staged_not_symlink "$STAGED_SHA"
 fetch_to_file "$SIDECAR_URL" "$STAGED_SHA"
+ensure_staged_not_symlink "$STAGED_BIN"
 fetch_to_file "$ASSET_URL" "$STAGED_BIN"
 
 EXPECTED_SHA="$(awk 'NF {print tolower($1); exit}' "$STAGED_SHA" | tr -d '\r')"
