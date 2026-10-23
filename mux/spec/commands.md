@@ -1,6 +1,6 @@
 # Command Contract
 
-This file specifies the JSON command contract for the mtyx protocol. Implemented commands match protocol v7 in `mux/crates/mux-core/src/server.rs`. Proposed commands are future protocol design (protocol 7 shipped the `identify` capabilities record and confirmed/receipted `send`, issue #88).
+This file specifies the JSON command contract for the mtyx protocol. Implemented commands match protocol v8 in `mux/crates/mux-core/src/server.rs`. Proposed commands are future protocol design (protocol 7 shipped the `identify` capabilities record and confirmed/receipted `send`, issue #88; protocol 8 added the `heuristic` agent-state source, issue #140).
 
 ## Notation
 
@@ -2332,7 +2332,7 @@ Example:
 | status | implemented    |
 | since  | protocol 6     |
 
-Reports agent state for a surface. This is a telemetry command and must not change focus. Reports with `source:"hook"` have hook authority and override detector-derived state. Reports with `source:"socket"` override detector-derived state but are lower priority than a newer hook report (concretely: a `socket` report is rejected outright while the current report's source is `hook`, regardless of timing).
+Reports agent state for a surface. This is a telemetry command and must not change focus. Reports with `source:"hook"` have hook authority and override detector-derived state. Reports with `source:"socket"` override detector-derived state but are lower priority than a newer hook report (concretely: a `socket` report is rejected outright while the current report's source is `hook`, regardless of timing). `source:"heuristic"` (protocol 8, issue #140) is the lowest tier: the zero-config screen heuristics behind `detect-agent` and the daemon's background poller publish there, and it is rejected while a `detected`/`socket`/`hook` report is current — hooks always win.
 
 Params:
 
@@ -2340,7 +2340,7 @@ Params:
 | --------- | --------- | ---------------- | ------------------------------------------------------------ |
 | `surface` | `IdRef`   | required         | Surface associated with the agent                            |
 | `state`   | `string`  | required         | `"working"`, `"blocked"`, `"idle"`, `"done"`, or `"unknown"` |
-| `source`  | `string`  | default `"socket"` | `"detected"`, `"socket"`, or `"hook"`                       |
+| `source`  | `string`  | default `"socket"` | `"heuristic"` (protocol 8), `"detected"`, `"socket"`, or `"hook"` |
 | `session` | `string`  | default null     | Optional upstream agent session id                           |
 | `agent`   | `string`  | default null     | Optional agent name (issue #75); preserved by later reports that omit it, used for the name-addressed verbs |
 | `message` | `string`  | default null     | Optional free-text context (issue #75); the latest applied report wins |
@@ -2365,7 +2365,7 @@ CLI mapping:
 | Item         | Value                           |
 | ------------ | ------------------------------- |
 | Verb         | `report-agent`                  |
-| Flags        | `[--surface <id>] --state working | blocked | idle | done | unknown [--source detected | socket | hook] [--agent-session <id>] [--agent <name>] [--message <text>]` |
+| Flags        | `[--surface <id>] --state working | blocked | idle | done | unknown [--source heuristic | detected | socket | hook] [--agent-session <id>] [--agent <name>] [--message <text>]` |
 | Plain stdout | no output                       |
 | JSON stdout  | exact result object             |
 | Exit codes   | common                          |
@@ -2773,7 +2773,9 @@ object{
   surface: Id,
   agent: string,            // "claude"|"codex"|"pi"|"opencode"|"cursor"|"aider"|"unknown"|user-added
   confidence: "high"|"medium"|"low"|null,  // null iff agent == "unknown"
-  evidence: string          // e.g. "process 'claude' (pid 1234)" / "screen marker 'pi> '"
+  evidence: string,         // e.g. "process 'claude' (pid 1234)" / "screen marker 'pi> '"
+  state: "working"|"blocked"|"idle"|"done"|"unknown",  // issue #96 screen classification
+  source: "heuristic"       // issue #140: the tier a classification publishes at
 }
 ```
 
@@ -2799,7 +2801,7 @@ Example:
 
 ```json
 {"id":120,"cmd":"detect-agent","surface":3}
-{"id":120,"ok":true,"data":{"surface":3,"agent":"claude","confidence":"high","evidence":"process 'claude' (pid 1234)"}}
+{"id":120,"ok":true,"data":{"surface":3,"agent":"claude","confidence":"high","evidence":"process 'claude' (pid 1234)","state":"unknown","source":"heuristic"}}
 ```
 
 ### detect-agents
@@ -2810,14 +2812,17 @@ Example:
 | status | implemented     |
 | since  | protocol 6      |
 
-Runs `detect-agent` on every live surface in one call (issue #78's `agent detect-batch`, for fleet dashboards). Keys of the map are surface ids — this repo's pane-content ids (`Workspace → Screen → Pane → Surface`).
+Runs `detect-agent` on every live surface in one call (issue #78's `agent detect-batch`, for fleet dashboards). Keys of the maps are surface ids — this repo's pane-content ids (`Workspace → Screen → Pane → Surface`). Since protocol 8 (issue #140 AC3) the result also carries a `detections` map with one full detection record per surface (the same shape as `detect-agent`'s result, including `state` and `source: "heuristic"`), so a dashboard can show state and provenance in one round trip. The legacy `agents` name-map is unchanged.
 
 Params: none.
 
 Result:
 
 ```text
-object{agents: map<string, string>}  // {"3": "claude", "7": "unknown", ...}
+object{
+  agents:      map<string, string>,  // {"3": "claude", "7": "unknown", ...} — unchanged (issue #78)
+  detections:  map<string, object{surface:Id,agent:string,confidence:string|null,evidence:string,state:string,source:"heuristic"}>  // since protocol 8
+}
 ```
 
 Errors: same `agent detection disabled by configuration` gate as `detect-agent`.

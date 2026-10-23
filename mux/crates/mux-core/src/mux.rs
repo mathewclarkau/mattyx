@@ -1040,6 +1040,42 @@ reattaching to remote session {session_id} on {host} \
         });
     }
 
+    /// Issue #140 AC1: enable the background heuristic poller. A
+    /// daemon-side thread runs [`Self::poll_agent_heuristics`] over
+    /// every live PTY surface once per `interval`, so screen-derived
+    /// agent state stays fresh (working→idle within ~2×`interval`) with
+    /// no client attached and no hooks installed. Modelled on
+    /// [`Self::enable_persistence`] (a `Weak<Mux>` + an event
+    /// subscription whose disconnect is the shutdown signal); the
+    /// subscription here only detects shutdown — ticks, not events,
+    /// drive polling, so a busy event stream cannot starve the poller.
+    /// Tests and one-shot CLI invocations leave it off (a `Mux` on its
+    /// own never polls).
+    pub fn enable_heuristic_polling(self: &Arc<Self>, interval: std::time::Duration) {
+        let events = self.subscribe();
+        let mux = Arc::downgrade(self);
+        let _ = std::thread::Builder::new()
+            .name("mux-agent-heuristics".into())
+            .spawn(move || {
+                let mut last_poll = std::time::Instant::now();
+                loop {
+                    let elapsed = last_poll.elapsed();
+                    let wait =
+                        if elapsed >= interval { std::time::Duration::ZERO } else { interval - elapsed };
+                    match events.recv_timeout(wait) {
+                        // Drain events without resetting the deadline:
+                        // the channel is only the shutdown signal.
+                        Ok(_) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                    let Some(mux) = mux.upgrade() else { break };
+                    last_poll = std::time::Instant::now();
+                    mux.poll_agent_heuristics();
+                }
+            });
+    }
+
     pub fn set_cell_pixel_size(&self, width_px: u16, height_px: u16) {
         let next = (width_px.max(1), height_px.max(1));
         {
@@ -2375,19 +2411,23 @@ reattaching to remote session {session_id} on {host} \
         let surface =
             self.surface(surface).ok_or_else(|| anyhow::anyhow!("unknown surface {surface}"))?;
         let detection = self.detect_on_surface(&surface)?;
-        // Issue #96: publish a screen-derived (`Detected`-tier) state only
-        // when the classifier found an unambiguous `blocked`/`working`
-        // marker. The authority rules in `Surface::set_agent_report`
-        // already reject a `Detected` report while a `Socket`/`Hook`
-        // report is current, so this can never override a self-report;
-        // and the `blocked`/`working`-only gate keeps it from
-        // downgrading one to `idle`/`unknown` either.
+        // Issue #96/#140: publish a screen-derived state only when the
+        // classifier found an unambiguous `blocked`/`working` marker.
+        // Issue #140 moved this publish from the `Detected` tier to the
+        // new lowest `Heuristic` tier — the screen classifier IS the
+        // heuristic layer (the `Detected` tier stays with the OSC 9/777
+        // notification watcher in `surface.rs`). The authority rules in
+        // `Surface::set_agent_report` reject a `Heuristic` report while
+        // a `Detected`/`Socket`/`Hook` report is current, so this can
+        // never override a self-report or an OSC observation; and the
+        // `blocked`/`working`-only gate keeps it from downgrading one to
+        // `idle`/`unknown` either.
         if matches!(detection.screen_state, crate::AgentState::Blocked | crate::AgentState::Working)
         {
             self.report_agent(
                 surface.id,
                 detection.screen_state,
-                crate::AgentStateSource::Detected,
+                crate::AgentStateSource::Heuristic,
                 None,
                 None,
                 None,
@@ -2405,6 +2445,69 @@ reattaching to remote session {session_id} on {host} \
         }
         let ids: Vec<SurfaceId> = self.with_state(|s| s.surfaces.keys().copied().collect());
         ids.into_iter().map(|id| Ok((id, self.detect_agent(id)?))).collect()
+    }
+
+    /// One heuristic-detection pass over every live PTY surface (issue
+    /// #140 AC1), driven by [`Self::enable_heuristic_polling`]'s thread.
+    /// Wider publish policy than the manual `detect-agent` path's
+    /// blocked/working-only gate: a `Heuristic`-tier report is published
+    /// when the classifier says `Blocked`/`Working` OR when it says
+    /// `Idle` and the agent is identified (`!= "unknown"`/`"generic"`)
+    /// — this lights the idle chip on a real agent's resting prompt
+    /// (`pi> `) without putting chips on bare shells. `Unknown` never
+    /// publishes. Publish-side dedup keeps a steady screen quiet:
+    ///   1. skip the whole surface when `(agent, screen_state)` matches
+    ///      the cached detection (no report attempt, no `TreeChanged`);
+    ///   2. skip `report_agent` when the current report is already
+    ///      `Heuristic` with the same state (equal-tier overwrite would
+    ///      otherwise re-emit `AgentStateChanged` every tick).
+    /// Higher-tier reports (`Detected`/`Socket`/`Hook`) win for free:
+    /// `Surface::set_agent_report` rejects `Heuristic` while any of them
+    /// is current.
+    pub fn poll_agent_heuristics(&self) {
+        if !self.agent_detection().enabled {
+            return;
+        }
+        let surfaces: Vec<Arc<Surface>> =
+            self.with_state(|s| s.surfaces.values().cloned().collect());
+        for surface in surfaces {
+            if surface.kind() != crate::SurfaceKind::Pty {
+                continue;
+            }
+            let Ok(detection) = self.detect_on_surface(&surface) else { continue };
+            // Dedup (1): an unchanged (agent, state) observation is a
+            // no-op — no events, no terminal re-lock churn.
+            let unchanged = surface.detected_agent().is_some_and(|cached| {
+                cached.agent == detection.agent && cached.screen_state == detection.screen_state
+            });
+            if unchanged {
+                continue;
+            }
+            let publish = match detection.screen_state {
+                AgentState::Blocked | AgentState::Working => true,
+                AgentState::Idle => detection.agent != "unknown" && detection.agent != "generic",
+                AgentState::Unknown | AgentState::Done => false,
+            };
+            if publish {
+                // Dedup (2): belt-and-braces on top of (1), so a cached
+                // detection can never re-emit an identical report.
+                let already_reported = surface.agent_report().is_some_and(|r| {
+                    r.source == AgentStateSource::Heuristic && r.state == detection.screen_state
+                });
+                if !already_reported {
+                    self.report_agent(
+                        surface.id,
+                        detection.screen_state,
+                        AgentStateSource::Heuristic,
+                        None,
+                        None,
+                        None,
+                    );
+                }
+            }
+            surface.set_detected_agent(detection);
+            self.emit(MuxEvent::TreeChanged);
+        }
     }
 
     /// Evidence collection + scoring for one surface, shared by
@@ -3630,6 +3733,29 @@ mod tests {
         (base.join("proj.feat-auth"), base.join("proj.feat-auth2"))
     }
 
+    /// Windows: a just-closed worktree child can hold the fixture dir open
+    /// for a few hundred ms after `close_workspace_reported` (os error 32,
+    /// ERROR_SHARING_VIOLATION), so a single `remove_dir_all` races the
+    /// child's last handle. Retry briefly; if it still will not go, leave
+    /// the dir under `std::env::temp_dir()` rather than failing the test's
+    /// actual assertions — this is cleanup, not semantics.
+    fn remove_dir_all_retrying(path: &std::path::Path) {
+        let mut last_err = None;
+        for _ in 0..20 {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => return,
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+        eprintln!(
+            "test cleanup: fixture dir {} left behind: {last_err:?}",
+            path.display()
+        );
+    }
+
     #[test]
     fn close_workspace_reports_surviving_worktree_children() {
         let (worktree, sibling) = worktree_dir_fixture("report");
@@ -3712,7 +3838,7 @@ mod tests {
         // Unknown workspace: no report, `close_workspace` behaviour.
         assert!(mux.close_workspace_reported(9999, false).is_none());
 
-        std::fs::remove_dir_all(std::path::Path::new(&worktree).parent().unwrap()).unwrap();
+        remove_dir_all_retrying(std::path::Path::new(&worktree).parent().unwrap());
     }
 
     #[test]
@@ -3752,7 +3878,7 @@ mod tests {
         assert!(report.survivors.is_empty());
         mux.with_state(|s| assert!(s.workspaces.is_empty()));
 
-        std::fs::remove_dir_all(&base).unwrap();
+        remove_dir_all_retrying(&base);
     }
 
     #[test]
@@ -3875,6 +4001,109 @@ mod tests {
             .unwrap();
         assert_eq!(report.state, AgentState::Blocked);
         assert_eq!(report.source, AgentStateSource::Hook);
+    }
+
+    /// Issue #140 AC2/D1: `Heuristic` is the new lowest-authority tier
+    /// (declared FIRST in `AgentStateSource`, so the derived `Ord` ranks
+    /// it below `Detected`). A heuristic report applies on a fresh pane,
+    /// repeated heuristic polls overwrite each other (equal tier), and a
+    /// heuristic report is rejected while any higher tier — detected,
+    /// socket, or hook — is current.
+    #[test]
+    fn report_agent_heuristic_is_lowest_authority_and_never_overrides_reports() {
+        let mux = test_mux();
+        mux.new_workspace(None, None).unwrap();
+        let surface = mux.with_state(|s| {
+            let pane = s.workspaces[0].screens[0].active_pane;
+            s.panes[&pane].tabs[0]
+        });
+
+        // Applies on a fresh pane, and repeated heuristic polls overwrite
+        // each other (equal tier): working -> idle is not a rejection.
+        let report = mux
+            .report_agent(
+                surface,
+                AgentState::Working,
+                AgentStateSource::Heuristic,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(report.state, AgentState::Working);
+        assert_eq!(report.source, AgentStateSource::Heuristic);
+        let report = mux
+            .report_agent(surface, AgentState::Idle, AgentStateSource::Heuristic, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Idle, "equal-tier heuristic reports overwrite");
+        assert_eq!(report.source, AgentStateSource::Heuristic);
+
+        // A `Detected` report (the OSC-notification watcher's tier)
+        // overrides the heuristic report…
+        let report = mux
+            .report_agent(surface, AgentState::Blocked, AgentStateSource::Detected, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Blocked);
+        assert_eq!(report.source, AgentStateSource::Detected);
+
+        // …and later heuristic ticks cannot downgrade it (the poller
+        // would keep classifying the same screen).
+        let report = mux
+            .report_agent(surface, AgentState::Idle, AgentStateSource::Heuristic, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Blocked, "heuristic must not override a detected report");
+        assert_eq!(report.source, AgentStateSource::Detected);
+
+        // Socket outranks Detected; heuristic still cannot override it.
+        let report = mux
+            .report_agent(surface, AgentState::Working, AgentStateSource::Socket, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Working);
+        assert_eq!(report.source, AgentStateSource::Socket);
+        let report = mux
+            .report_agent(surface, AgentState::Idle, AgentStateSource::Heuristic, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Working, "heuristic must not override a socket report");
+        assert_eq!(report.source, AgentStateSource::Socket);
+
+        // Hook outranks everything (AC2): it applies over socket…
+        let report = mux
+            .report_agent(
+                surface,
+                AgentState::Blocked,
+                AgentStateSource::Hook,
+                Some("sess-1".into()),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(report.state, AgentState::Blocked);
+        assert_eq!(report.source, AgentStateSource::Hook);
+
+        // …and heuristic ticks never downgrade a hook report.
+        let report = mux
+            .report_agent(
+                surface,
+                AgentState::Working,
+                AgentStateSource::Heuristic,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(report.state, AgentState::Blocked, "heuristic must not override a hook report");
+        assert_eq!(report.source, AgentStateSource::Hook);
+    }
+
+    /// Issue #140 D1: the wire name round-trips and the declaration
+    /// order keeps `Heuristic` strictly below `Detected < Socket < Hook`.
+    #[test]
+    fn agent_state_source_heuristic_round_trips_and_ranks_lowest() {
+        assert_eq!(AgentStateSource::Heuristic.as_str(), "heuristic");
+        assert_eq!(AgentStateSource::parse("heuristic"), Some(AgentStateSource::Heuristic));
+        assert!(AgentStateSource::Heuristic < AgentStateSource::Detected);
+        assert!(AgentStateSource::Detected < AgentStateSource::Socket);
+        assert!(AgentStateSource::Socket < AgentStateSource::Hook);
     }
 
     #[test]

@@ -165,14 +165,48 @@ impl Default for RawConfig {
     }
 }
 
-/// Raw `[[agent_detection]]` table (issue #78 AC7).
+/// Raw `[[agent_detection]]` table (issue #78 AC7, extended by issue #140).
+///
+/// Deliberately **not** `deny_unknown_fields`, unlike its sibling
+/// sub-tables: issue #140 AC4 asks for a signature config whose foreign
+/// keys are *preserved*, and a hard parse error is the opposite of
+/// preserved. Nothing is swallowed silently — `apply_agent_detection`
+/// reports each unrecognised key to stderr and carries on, which is the
+/// same degradation every other path in this file uses.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawAgentDetection {
     #[serde(default)]
     enabled: Option<bool>,
     #[serde(default)]
     min_confidence: Option<String>,
+    /// Issue #140: heuristic poll interval in milliseconds; `0` disables
+    /// the poller. Absent keeps the resolved default (1000 ms).
+    #[serde(default)]
+    poll_interval_ms: Option<u64>,
+    /// Issue #140: user-supplied detection signatures, appended to the
+    /// bundled registry. The last entry that sets this key wins.
+    #[serde(default)]
+    signatures: Option<Vec<RawAgentSignature>>,
+    /// Foreign keys, reported (not fatal) by `apply_agent_detection`.
+    #[serde(flatten)]
+    unknown: HashMap<String, Value>,
+}
+
+/// One `[[agent_detection.signatures]]` row (issue #140 AC4). Every field
+/// is optional so a half-written row degrades to a warning instead of a
+/// parse error; `resolve_signature` applies the defaults and validates.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawAgentSignature {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    pattern: Option<String>,
+    #[serde(default)]
+    confidence: Option<String>,
+    #[serde(default)]
+    case_insensitive: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1018,10 +1052,16 @@ impl Default for Config {
 
 /// Resolved `[[agent_detection]]` settings (issue #78 AC7). Detection is
 /// on with a `low` threshold by default, so every match surfaces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDetectionConfig {
     pub enabled: bool,
     pub min_confidence: mux_core::agent_detect::Confidence,
+    /// Issue #140: how often the background heuristic poller re-scans
+    /// each pane. `0` disables it.
+    pub poll_interval_ms: u64,
+    /// Issue #140: user signatures from `[[agent_detection.signatures]]`,
+    /// pushed into the daemon's registry by the TUI host.
+    pub signatures: Vec<AgentSignature>,
 }
 
 impl Default for AgentDetectionConfig {
@@ -1029,8 +1069,26 @@ impl Default for AgentDetectionConfig {
         AgentDetectionConfig {
             enabled: true,
             min_confidence: mux_core::agent_detect::Confidence::Low,
+            poll_interval_ms: 1000,
+            signatures: Vec::new(),
         }
     }
+}
+
+/// One user-supplied detection signature (issue #140 AC4), resolved from
+/// `[[agent_detection.signatures]]`. `kind`/`confidence` are kept as the
+/// same lowercase strings the wire/CLI speak — `mux-core`'s
+/// `PatternKind`/`Confidence` parse them, so this stays a transport
+/// struct with no second copy of the enums.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSignature {
+    pub name: String,
+    /// `process` or `screen`.
+    pub kind: String,
+    pub pattern: String,
+    /// `high`, `medium` or `low`.
+    pub confidence: String,
+    pub case_insensitive: bool,
 }
 
 impl Config {
@@ -1250,9 +1308,17 @@ pub fn load() -> Config {
     config.workspaces = raw.workspaces;
     config.update_check = raw.update_check;
     // Issue #78 AC7: `[[agent_detection]]` entries apply in order; the
-    // last value for each key wins. An unknown min_confidence warns and
-    // is ignored (config degradation, matching the browser settings).
-    for entry in &raw.agent_detection {
+    // last value for each key wins (issue #140 extends the table).
+    apply_agent_detection(&mut config, &raw.agent_detection);
+    config
+}
+
+/// Resolve `[[agent_detection]]` onto the config: entries apply in order,
+/// the last value for each key wins. Every degradation warns and is
+/// ignored (matching the browser settings), because a bad signature row
+/// must not cost the user the rest of their config.
+fn apply_agent_detection(config: &mut Config, raw: &[RawAgentDetection]) {
+    for entry in raw {
         if let Some(enabled) = entry.enabled {
             config.agent_detection.enabled = enabled;
         }
@@ -1264,8 +1330,57 @@ pub fn load() -> Config {
                 ),
             }
         }
+        if let Some(interval) = entry.poll_interval_ms {
+            config.agent_detection.poll_interval_ms = interval;
+        }
+        if let Some(signatures) = &entry.signatures {
+            let mut resolved = Vec::with_capacity(signatures.len());
+            for (index, raw_signature) in signatures.iter().enumerate() {
+                match resolve_signature(raw_signature) {
+                    Ok(signature) => resolved.push(signature),
+                    Err(error) => {
+                        eprintln!("mtyx: ignoring agent_detection.signatures[{index}]: {error}")
+                    }
+                }
+            }
+            config.agent_detection.signatures = resolved;
+        }
+        // Issue #140 AC4: foreign keys are preserved (warned, not fatal).
+        let mut unknown: Vec<&String> = entry.unknown.keys().collect();
+        unknown.sort();
+        for key in unknown {
+            eprintln!("mtyx: ignoring unknown agent_detection key {key:?}");
+        }
     }
-    config
+}
+
+/// Resolve one raw signature row. Omitted `kind`/`confidence` fall back to
+/// `screen`/`medium` (the conventional prompt-marker pair); name and
+/// pattern are validated with `mux_core::agent_detect::AgentPattern::validate`
+/// so config and socket input cannot drift apart.
+fn resolve_signature(raw: &RawAgentSignature) -> Result<AgentSignature, String> {
+    let kind_text = raw.kind.clone().unwrap_or_else(|| "screen".to_string());
+    let confidence_text = raw.confidence.clone().unwrap_or_else(|| "medium".to_string());
+    let kind = mux_core::agent_detect::PatternKind::parse(&kind_text)
+        .ok_or_else(|| format!("kind {kind_text:?}; expected process or screen"))?;
+    let confidence = mux_core::agent_detect::Confidence::parse(&confidence_text)
+        .ok_or_else(|| format!("confidence {confidence_text:?}; expected high, medium, or low"))?;
+    let signature = AgentSignature {
+        name: raw.name.clone().unwrap_or_default(),
+        kind: kind.as_str().to_string(),
+        pattern: raw.pattern.clone().unwrap_or_default(),
+        confidence: confidence.as_str().to_string(),
+        case_insensitive: raw.case_insensitive.unwrap_or(false),
+    };
+    mux_core::agent_detect::AgentPattern {
+        name: signature.name.clone(),
+        kind,
+        pattern: signature.pattern.clone(),
+        confidence,
+        case_insensitive: signature.case_insensitive,
+    }
+    .validate()?;
+    Ok(signature)
 }
 
 /// Resolve `[[worktree_pattern]]` onto the config: the FIRST entry wins
@@ -1619,36 +1734,111 @@ min_confidence = "high"
         assert_eq!(config.agent_detection.min_confidence, mux_core::agent_detect::Confidence::High);
     }
 
-    /// Review fix F2: typos in `[[agent_detection]]` keys (e.g.
-    /// `enable = false`, `min-confidences = "high"`) must be rejected,
-    /// not silently ignored — a user who thinks they disabled detection
-    /// silently keeps it on otherwise. This matches the discipline of
-    /// every sibling sub-table (`deny_unknown_fields`) documented in
-    /// `RawOverlay`/`RawConfig`.
+    /// Issue #140 AC4: a config carrying *foreign* keys inside
+    /// `[[agent_detection]]` must still parse — that struct is
+    /// deliberately not `deny_unknown_fields`, because "foreign keys
+    /// preserved" is the contract and a hard parse error is the opposite
+    /// of preserved. Unknown keys are reported (not fatal) by
+    /// `apply_agent_detection`, so a typo is still loud.
     #[test]
-    fn agent_detection_rejects_unknown_keys() {
-        // TOML: `enable` (missing `d`) and `min-confidences` (plural, hyphen).
-        let bad_toml: Result<RawConfig, _> =
-            toml::from_str("[[agent_detection]]\nenable = false\nmin_confidences = \"high\"\n");
-        assert!(bad_toml.is_err(), "unknown keys in [[agent_detection]] must be rejected");
-
-        // JSON: `minConfidence` (camelCase) and `enable` (missing `d`).
-        let bad_json: Result<RawConfig, _> = serde_json::from_str(
-            r##"{"agent_detection":[{"enable":false,"minConfidence":"high"}]}"##,
-        );
-        assert!(bad_json.is_err(), "unknown keys in agent_detection JSON must be rejected");
-
-        // Sanity: well-known keys still parse (this stays valid in both
-        // directions; the negative case above is the lock-down).
-        let good_toml: RawConfig =
-            toml::from_str("[[agent_detection]]\nenabled = false\nmin_confidence = \"high\"\n")
-                .unwrap();
-        assert_eq!(good_toml.agent_detection[0].enabled, Some(false));
-        let good_json: RawConfig = serde_json::from_str(
-            r##"{"agent_detection":[{"enabled":false,"min_confidence":"medium"}]}"##,
+    fn agent_detection_tolerates_foreign_keys_and_keeps_defaults() {
+        let parsed: RawConfig = toml::from_str(
+            "[[agent_detection]]\nfuture_knob = \"kept\"\nmin_confidence = \"high\"\n",
         )
-        .unwrap();
-        assert_eq!(good_json.agent_detection[0].enabled, Some(false));
+        .expect("foreign keys inside [[agent_detection]] must not fail the parse");
+        // The foreign key is captured (so it can be reported), not dropped
+        // into a silent `deny_unknown_fields` error.
+        assert_eq!(
+            parsed.agent_detection[0].unknown.get("future_knob").and_then(Value::as_str),
+            Some("kept")
+        );
+        let mut config = Config::default();
+        apply_agent_detection(&mut config, &parsed.agent_detection);
+        // Known keys still resolve...
+        assert_eq!(config.agent_detection.min_confidence, mux_core::agent_detect::Confidence::High);
+        // ...and unset keys keep their defaults.
+        assert!(config.agent_detection.enabled);
+        assert_eq!(config.agent_detection.poll_interval_ms, 1000);
+        assert!(config.agent_detection.signatures.is_empty());
+
+        // JSON carries unknown keys the same way (camelCase typo included).
+        let parsed: RawConfig = serde_json::from_str(
+            r##"{"agent_detection":[{"enable":false,"minConfidence":"high"}]}"##,
+        )
+        .expect("foreign keys in agent_detection JSON must not fail the parse");
+        let mut config = Config::default();
+        apply_agent_detection(&mut config, &parsed.agent_detection);
+        assert!(config.agent_detection.enabled, "a misspelt key must not silently apply");
+        assert_eq!(config.agent_detection.poll_interval_ms, 1000);
+
+        // `poll_interval_ms = 0` is the "poller off" value and survives
+        // resolution verbatim — interpreting it belongs to the TUI host.
+        let parsed: RawConfig =
+            toml::from_str("[[agent_detection]]\npoll_interval_ms = 0\n").unwrap();
+        let mut config = Config::default();
+        apply_agent_detection(&mut config, &parsed.agent_detection);
+        assert_eq!(config.agent_detection.poll_interval_ms, 0);
+    }
+
+    /// Issue #140 AC4: `[[agent_detection.signatures]]` rows round-trip
+    /// into `Config.agent_detection.signatures`, and an unusable row is
+    /// warned about and skipped instead of failing the whole config
+    /// (same degradation as an unparseable `min_confidence`).
+    #[test]
+    fn agent_detection_signatures_resolve_and_bad_rows_skip() {
+        let parsed: RawConfig = toml::from_str(
+            r##"[[agent_detection]]
+poll_interval_ms = 250
+
+[[agent_detection.signatures]]
+name = "myagent"
+kind = "screen"
+pattern = "MYMARKER>"
+confidence = "high"
+case_insensitive = true
+
+[[agent_detection.signatures]]
+name = "defaulted"
+pattern = "DEFAULTED>"
+
+[[agent_detection.signatures]]
+name = "bogus-confidence"
+pattern = "BOGUS>"
+confidence = "certain"
+
+[[agent_detection.signatures]]
+name = "bogus-kind"
+kind = "regex"
+pattern = "BOGUS>"
+
+[[agent_detection.signatures]]
+name = "unknown"
+pattern = "RESERVED>"
+"##,
+        )
+        .expect("signature rows parse");
+        let mut config = Config::default();
+        apply_agent_detection(&mut config, &parsed.agent_detection);
+
+        assert_eq!(config.agent_detection.poll_interval_ms, 250);
+        let signatures = &config.agent_detection.signatures;
+        assert_eq!(signatures.len(), 2, "unusable rows are skipped, got {signatures:?}");
+        assert_eq!(
+            signatures[0],
+            AgentSignature {
+                name: "myagent".to_string(),
+                kind: "screen".to_string(),
+                pattern: "MYMARKER>".to_string(),
+                confidence: "high".to_string(),
+                case_insensitive: true,
+            }
+        );
+        // Omitted `kind`/`confidence` fall back to the documented
+        // defaults rather than dropping the row.
+        assert_eq!(signatures[1].name, "defaulted");
+        assert_eq!(signatures[1].kind, "screen");
+        assert_eq!(signatures[1].confidence, "medium");
+        assert!(!signatures[1].case_insensitive);
     }
 
     /// Issue #99: `headless.vt_size` parses from TOML and JSON, resolves

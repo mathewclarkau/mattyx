@@ -1037,8 +1037,20 @@ fn shutdown_kills_background_grandchild_sleep() {
 
     mux.shutdown();
 
-    let leftover: Vec<u32> =
-        watched.into_iter().filter(|&pid| mux_core::process::is_alive(pid)).collect();
+    // Grandchild reaping is asynchronous on loaded runners: shutdown's
+    // kill lands before the parent reaps, so an immediate check can see
+    // leftovers that drain a second later (flaked on ubuntu-24.04-arm).
+    // Poll until the deadline; only what is still alive at the deadline
+    // is a real leftover.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let leftover = loop {
+        let leftover: Vec<u32> =
+            watched.iter().copied().filter(|&pid| mux_core::process::is_alive(pid)).collect();
+        if leftover.is_empty() || Instant::now() >= deadline {
+            break leftover;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
     assert!(leftover.is_empty(), "leftover sleep PIDs after mux.shutdown(): {leftover:?}");
 }
 
