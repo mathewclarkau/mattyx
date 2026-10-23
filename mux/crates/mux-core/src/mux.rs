@@ -3630,6 +3630,29 @@ mod tests {
         (base.join("proj.feat-auth"), base.join("proj.feat-auth2"))
     }
 
+    /// Windows: a just-closed worktree child can hold the fixture dir open
+    /// for a few hundred ms after `close_workspace_reported` (os error 32,
+    /// ERROR_SHARING_VIOLATION), so a single `remove_dir_all` races the
+    /// child's last handle. Retry briefly; if it still will not go, leave
+    /// the dir under `std::env::temp_dir()` rather than failing the test's
+    /// actual assertions — this is cleanup, not semantics.
+    fn remove_dir_all_retrying(path: &std::path::Path) {
+        let mut last_err = None;
+        for _ in 0..20 {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => return,
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+        eprintln!(
+            "test cleanup: fixture dir {} left behind: {last_err:?}",
+            path.display()
+        );
+    }
+
     #[test]
     fn close_workspace_reports_surviving_worktree_children() {
         let (worktree, sibling) = worktree_dir_fixture("report");
@@ -3712,7 +3735,7 @@ mod tests {
         // Unknown workspace: no report, `close_workspace` behaviour.
         assert!(mux.close_workspace_reported(9999, false).is_none());
 
-        std::fs::remove_dir_all(std::path::Path::new(&worktree).parent().unwrap()).unwrap();
+        remove_dir_all_retrying(std::path::Path::new(&worktree).parent().unwrap());
     }
 
     #[test]
@@ -3752,7 +3775,7 @@ mod tests {
         assert!(report.survivors.is_empty());
         mux.with_state(|s| assert!(s.workspaces.is_empty()));
 
-        std::fs::remove_dir_all(&base).unwrap();
+        remove_dir_all_retrying(&base);
     }
 
     #[test]
