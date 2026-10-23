@@ -43,7 +43,7 @@ for _ in $(seq 1 30); do
   fi
   sleep 0.1
 done
-mtyx --session "$SESSION" wait-ready --surface 1 --timeout-ms 5000
+mtyx --session "$SESSION" wait-ready --surface 1 --timeout 5000
 ```
 
 At any point a human can watch the headless fleet live with:
@@ -204,7 +204,7 @@ mtyx update --check
 | Goal | Command |
 | :--- | :--- |
 | Start headless session | `mtyx --headless --session <name> &` |
-| Wait for shell prompt ready | `mtyx wait-ready --surface <id> --timeout-ms 5000` |
+| Wait for shell prompt ready | `mtyx wait-ready --surface <id> --timeout 5000` |
 | Spawn + register named agent | `mtyx agent start <name> --cwd <dir> -- <argv...>` |
 | Send prompt + Enter (blocked-gated) | `mtyx agent prompt <name> "<prompt>"` |
 | Wait on state transition | `mtyx agent wait <name> --status <blocked\|done\|idle\|working> --timeout <ms>` |
