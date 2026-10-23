@@ -299,6 +299,7 @@ alongside the rest:
 | [`configuration.md`](./mux/docs/configuration.md) | Full `mux.json` reference with defaults and a worked example |
 | [`protocol.md`](./mux/docs/protocol.md) | Control-socket JSON-lines framing, attach streams, events, agent state, remote workspaces |
 | [`browser-panes.md`](./mux/docs/browser-panes.md) | CDP-backed browser tabs, rendering, input, profiles, current limitations |
+| [`1.0-gate.md`](./mux/docs/1.0-gate.md) | **1.0 Stability Contract:** semver surface, 0.x→1.x migration guarantees, upgrade/rollback, no-leak promise, Windows graduation criteria, and security posture |
 
 For the formal wire-protocol contract (exact request/response schemas, error tables, CLI mappings — the source
 generated clients would target), see [`mux/spec/`](./mux/spec/), starting with

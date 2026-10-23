@@ -580,4 +580,108 @@ mod tests {
         assert!(backups.join("work.1.json").exists(), "other session untouched");
         assert!(backups.join("notes.txt").exists(), "unrelated file untouched");
     }
+
+    /// Issue #144: historical session snapshot fixtures from shipped 0.x
+    /// releases (including early pre-color/pre-icon/pre-remote snapshots and
+    /// later remote-workspace snapshots) must load cleanly on 1.x without
+    /// triggering the corrupt-snapshot backup path.
+    #[test]
+    fn historical_0x_session_snapshots_load_and_migrate_cleanly() {
+        let dir = scratch_dir("migration_snapshots");
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        // v0.5.0-era snapshot: no `color`, `icon`, or `remote` keys in JSON
+        let v05_json = r#"{
+            "workspaces": [
+                {
+                    "name": "main",
+                    "active_screen": 0,
+                    "screens": [
+                        {
+                            "active_pane_index": 0,
+                            "layout": { "Leaf": 0 },
+                            "panes": [
+                                {
+                                    "active_tab_index": 0,
+                                    "tabs": [
+                                        { "cwd": "/home/dev/repo" }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ],
+            "active_workspace": 0
+        }"#;
+        let v05_path = sessions.join("v05.json");
+        std::fs::write(&v05_path, v05_json).unwrap();
+        let snap05 = SessionSnapshot::load(&v05_path).expect("v0.5 snapshot must load");
+        let (ws05, active05) = self::workspaces(&snap05);
+        assert_eq!(active05, 0);
+        assert_eq!(ws05.len(), 1);
+        assert_eq!(ws05[0].name, "main");
+        assert_eq!(ws05[0].screens[0].panes[0].tabs[0].cwd, Some("/home/dev/repo"));
+
+        // v0.17.0-era snapshot: workspace color/icon + remote SSH tab + split tree
+        let v17_json = r##"{
+            "workspaces": [
+                {
+                    "name": "remote-prod",
+                    "active_screen": 0,
+                    "color": "#7aa2f7",
+                    "icon": "robot",
+                    "screens": [
+                        {
+                            "name": "primary",
+                            "active_pane_index": 1,
+                            "layout": {
+                                "Split": {
+                                    "dir": "Right",
+                                    "ratio": 0.6,
+                                    "a": { "Leaf": 0 },
+                                    "b": { "Leaf": 1 }
+                                }
+                            },
+                            "panes": [
+                                {
+                                    "name": "ssh-pane",
+                                    "active_tab_index": 0,
+                                    "tabs": [
+                                        {
+                                            "name": "prod-box",
+                                            "cwd": "/srv/app",
+                                            "remote": {
+                                                "host": "ops@prod.example.com",
+                                                "slot": "mtyx",
+                                                "session_id": "mtyx-1700000000",
+                                                "local_binary_path": "/home/ops/.cache/mattyx/mtyxd-remote-linux-amd64"
+                                            }
+                                        }
+                                    ]
+                                },
+                                {
+                                    "name": "local-logs",
+                                    "active_tab_index": 0,
+                                    "tabs": [
+                                        { "name": "tail", "cwd": "/var/log" }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ],
+            "active_workspace": 0
+        }"##;
+        let v17_path = sessions.join("v17.json");
+        std::fs::write(&v17_path, v17_json).unwrap();
+        let snap17 = SessionSnapshot::load(&v17_path).expect("v0.17 snapshot must load");
+        let (ws17, _) = self::workspaces(&snap17);
+        assert_eq!(ws17[0].name, "remote-prod");
+        assert!(ws17[0].icon.is_some());
+        assert!(ws17[0].screens[0].panes[0].tabs[0].remote.is_some());
+        assert!(!dir.join("session-backups").exists(), "no backups should be created for valid 0.x snapshots");
+    }
 }
