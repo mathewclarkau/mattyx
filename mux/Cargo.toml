@@ -17,6 +17,7 @@ members = [
 version = "0.17.2"
 edition = "2021"
 license = "GPL-3.0-or-later"
+repository = "https://github.com/mathewclarkau/mattyx"
 publish = false
 
 [workspace.dependencies]

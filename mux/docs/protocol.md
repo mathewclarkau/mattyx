@@ -98,6 +98,10 @@ Notes on the mapping between CLI verbs and socket commands:
   directory / render locally) — they issue no dedicated socket command of
   the same name. `kill-stale --dry-run` is a read-only preview of the same
   reap: it reports the stale `.sock`/`.pid` pairs and unlinks nothing.
+  Human-readable `list-sessions` lazily reaps stale `.sock`/`.pid` pairs on
+  enumerate by default (`--no-gc` opts out); `list-sessions --json` stays
+  read-only by default unless `--gc` is passed, in which case stale pairs are
+  swept and `"swept": <n>` is included in the JSON envelope (issue #138).
 - `mtyx agent <start|prompt|wait|read|list>` is a CLI-only noun rewritten
   onto flat verbs before dispatch (the `agent-pattern` pattern): `agent
   start` composes `new-tab` + `agent-register` in one CLI flow, `agent
