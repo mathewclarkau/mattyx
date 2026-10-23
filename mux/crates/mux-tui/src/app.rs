@@ -1662,10 +1662,13 @@ impl App {
     }
 
     /// Open the session manager overlay (issue #63 L3, `leader S`).
-    /// Discovery is a fast `read_dir`+`stat` of the runtime dir (no socket
-    /// connects), safe on the UI thread; the current session's right column
-    /// is seeded for free from the live `App::tree`, and every other
-    /// session's preview is lazy-fetched on a worker thread once focused.
+    /// Discovery is a `read_dir`+`stat` of the runtime dir plus one connect
+    /// probe per row; stale `.sock`/`.pid` pairs in the guarded runtime
+    /// roots are reaped on the way through (issue #138 F4), so the overlay
+    /// exercises the same lazy GC as `mtyx list-sessions`. The current
+    /// session's right column is seeded for free from the live `App::tree`,
+    /// and every other session's preview is lazy-fetched on a worker thread
+    /// once focused.
     fn open_session_manager(&mut self) {
         use crate::session_manager::WorkspaceColumn;
         let own_socket = self.session.socket_path().unwrap_or_default();
@@ -1677,7 +1680,7 @@ impl App {
             json: false,
             machine: None,
         };
-        let mut sessions = crate::cli::discover_sessions(&global);
+        let (mut sessions, _swept) = crate::cli::discover_sessions_with_gc(&global, true);
         // Newest-first, matching the pre-attach picker ordering.
         sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
         let mut state =
@@ -1776,8 +1779,9 @@ impl App {
     }
 
     /// Re-run discovery and reset the overlay's right column (issue #63 L3,
-    /// `R`). Keeps the current session's seeded tree so the user's own
-    /// workspaces stay visible without a socket round trip.
+    /// `R`). Reaps stale pairs in the guarded runtime roots like the initial
+    /// open (issue #138 F4). Keeps the current session's seeded tree so the
+    /// user's own workspaces stay visible without a socket round trip.
     fn refresh_session_manager(&mut self) {
         use crate::session_manager::WorkspaceColumn;
         let Some(state) = self.session_manager.as_mut() else { return };
@@ -1789,7 +1793,7 @@ impl App {
             json: false,
             machine: None,
         };
-        let mut sessions = crate::cli::discover_sessions(&global);
+        let (mut sessions, _swept) = crate::cli::discover_sessions_with_gc(&global, true);
         sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
         state.sessions = sessions;
         state.workspaces.clear();
