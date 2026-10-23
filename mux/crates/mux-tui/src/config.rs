@@ -2930,6 +2930,47 @@ pattern = "../{repo}-wt-{branch}"
 
         std::env::remove_var("MTYX_MUX_CONFIG");
         let _ = std::fs::remove_dir_all(&dir);
+
+        // Extracted per-tag fixtures (scripts/extract-migration-fixtures.sh,
+        // issue #144 review F1): every era config shape dropped into
+        // tests/fixtures/ must still parse on current main. `RawConfig` is
+        // the 1.x parse surface and is `deny_unknown_fields`, so a
+        // successful parse IS the every-era schema check. The committed
+        // set covers the representative eras pinned above
+        // (v0.5/v0.10/v0.17/v0.22/v0.27); the extractor produces the
+        // remaining tags mechanically (deferred operator work). Only
+        // `*-mux.json` / `*-mux.toml` files are ours, so other fixtures
+        // that may come to live in the dir are ignored.
+        let fixtures_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        if fixtures_dir.is_dir() {
+            let mut entries: Vec<_> = std::fs::read_dir(&fixtures_dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                    p.is_file() && (name.ends_with("-mux.json") || name.ends_with("-mux.toml"))
+                })
+                .collect();
+            entries.sort();
+            assert!(
+                !entries.is_empty(),
+                "no *-mux.json/*-mux.toml fixtures found; run scripts/extract-migration-fixtures.sh"
+            );
+            for path in entries {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("{name}: fixture must be readable: {e}"));
+                if name.ends_with(".toml") {
+                    toml::from_str::<RawConfig>(&text)
+                        .unwrap_or_else(|e| panic!("{name}: must parse on current main: {e}"));
+                } else {
+                    serde_json::from_str::<RawConfig>(&text)
+                        .unwrap_or_else(|e| panic!("{name}: must parse on current main: {e}"));
+                }
+            }
+        }
     }
 
     /// Issue #144 (review F4): `schema_version` accepts `None | Some(1)`;

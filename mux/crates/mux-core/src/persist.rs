@@ -682,6 +682,45 @@ mod tests {
         assert_eq!(ws17[0].name, "remote-prod");
         assert!(ws17[0].icon.is_some());
         assert!(ws17[0].screens[0].panes[0].tabs[0].remote.is_some());
+
+        // Extracted per-tag fixtures (scripts/extract-migration-fixtures.sh,
+        // issue #144 review F1): every era snapshot shape dropped into
+        // tests/fixtures/ must load and migrate cleanly on current main.
+        // The committed set covers the representative eras pinned above
+        // (v0.5/v0.10/v0.17/v0.22/v0.27); the extractor produces the
+        // remaining tags mechanically (deferred operator work). Only
+        // `*-session.json` files are ours -- the fixtures dir is shared
+        // with the agent-state screen captures. Fixtures are staged into
+        // the scratch dir first so `SessionSnapshot::load`'s
+        // directory-tightening side effect never touches the repo tree.
+        let fixtures_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        if fixtures_dir.is_dir() {
+            let mut entries: Vec<_> = std::fs::read_dir(&fixtures_dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_file()
+                        && p.file_name().unwrap().to_string_lossy().ends_with("-session.json")
+                })
+                .collect();
+            entries.sort();
+            assert!(
+                !entries.is_empty(),
+                "no *-session.json fixtures found; run scripts/extract-migration-fixtures.sh"
+            );
+            for path in entries {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                let staged = sessions.join(&name);
+                std::fs::copy(&path, &staged).unwrap();
+                let snapshot = SessionSnapshot::load(&staged).unwrap_or_else(|| {
+                    panic!("{name}: extracted snapshot must load on current main")
+                });
+                let (ws, _) = self::workspaces(&snapshot);
+                assert!(!ws.is_empty(), "{name}: workspaces must survive migration");
+            }
+        }
         assert!(!dir.join("session-backups").exists(), "no backups should be created for valid 0.x snapshots");
     }
 }
