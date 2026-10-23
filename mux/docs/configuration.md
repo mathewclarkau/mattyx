@@ -6,6 +6,16 @@ A TOML config file is also supported: `~/.config/mattyx/mux.toml` (or `$XDG_CONF
 
 Colors accept `#rrggbb`, `#rgb`, an xterm-256 number, or a numeric string. Workspace colours additionally accept the named presets `red`, `orange`, `yellow`, `green`, `blue`, `purple`, `pink`, `cyan`, and `grey`/`gray`.
 
+## Schema version
+
+`mux.json` / `mux.toml` may carry an optional `schema_version` integer. This build accepts `1` (or the field being absent, which every `0.x` config is); any other value makes the config invalid — the TUI logs the parse error and falls back to defaults, same as any other invalid config:
+
+```
+unsupported schema_version 99: this mtyx supports schema_version 1 only; remove the field or set it to 1
+```
+
+The policy (issue #144, the 1.0 stability contract): a *higher* `schema_version` means the file was written by a newer `mtyx` for a schema this build cannot fully understand, so it must fail loudly rather than load silently under `1.x` semantics. Schema changes within `1.x` are additive only — a `1` config keeps working across every `1.x` release.
+
 ## Workspaces
 
 Define named workspaces that mtyx creates or updates when the server starts. Each entry requires `name`; `color` and `icon` are optional. Icons accept `folder`, `robot`, `eye`, `gear`, `search`, `magnifier`, `lock`, `check`, one Unicode character, or a `\\u{HEX}` escape.

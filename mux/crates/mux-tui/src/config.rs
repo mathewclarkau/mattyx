@@ -100,12 +100,41 @@ fn default_true() -> bool {
     true
 }
 
+/// Issue #144: the only config schema version this build understands.
+/// `None` (field absent) and `1` are accepted; any other value is a
+/// configuration error naming the supported version (policy documented
+/// in `mux/docs/configuration.md` and the 1.0 gate doc §1.3).
+const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
+/// Field deserializer for `RawConfig::schema_version`: accepts an absent
+/// field or `1`, and rejects anything else with an error that names the
+/// supported version, so a config written for a future schema fails
+/// loudly at parse time (surfaced by `load_raw_config`'s "ignoring
+/// invalid config" stderr path) instead of loading silently under 1.x
+/// semantics.
+fn deserialize_schema_version<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<u32>::deserialize(deserializer)?;
+    match raw {
+        None | Some(SUPPORTED_SCHEMA_VERSION) => Ok(raw),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "unsupported schema_version {other}: this mtyx supports schema_version \
+             {SUPPORTED_SCHEMA_VERSION} only; remove the field or set it to \
+             {SUPPORTED_SCHEMA_VERSION}"
+        ))),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     /// Issue #144: optional schema version field (`schema_version = 1`) for
     /// forward/backward config migration guarantees across 0.x and 1.x.
-    #[serde(default)]
+    /// Accepted values: absent or `1`; anything else fails with an error
+    /// naming the supported version (see `deserialize_schema_version`).
+    #[serde(default, deserialize_with = "deserialize_schema_version")]
     #[allow(dead_code)]
     schema_version: Option<u32>,
     #[serde(default)]
@@ -2901,5 +2930,38 @@ pattern = "../{repo}-wt-{branch}"
 
         std::env::remove_var("MTYX_MUX_CONFIG");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #144 (review F4): `schema_version` accepts `None | Some(1)`;
+    /// anything else fails with the documented error naming the supported
+    /// version (message quoted in `mux/docs/configuration.md`).
+    #[test]
+    fn schema_version_accepts_absent_or_one_and_rejects_other_values() {
+        // Absent field (all 0.x configs) and explicit 1 both load.
+        let absent: RawConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.schema_version, None);
+        let v1: RawConfig = serde_json::from_str(r#"{"schema_version": 1}"#).unwrap();
+        assert_eq!(v1.schema_version, Some(1));
+        let v1_toml: RawConfig = toml::from_str("schema_version = 1").unwrap();
+        assert_eq!(v1_toml.schema_version, Some(1));
+
+        // Anything else fails with the documented message, in both formats.
+        let err = serde_json::from_str::<RawConfig>(r#"{"schema_version": 99}"#)
+            .expect_err("schema_version 99 must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported schema_version 99"),
+            "error must name the offending value: {msg}"
+        );
+        assert!(
+            msg.contains("supports schema_version 1 only"),
+            "error must name the supported version: {msg}"
+        );
+        let toml_err = toml::from_str::<RawConfig>("schema_version = 99")
+            .expect_err("schema_version 99 must be rejected in TOML too");
+        assert!(
+            toml_err.to_string().contains("unsupported schema_version 99"),
+            "TOML error must name the offending value: {toml_err}"
+        );
     }
 }
