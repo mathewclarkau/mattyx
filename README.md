@@ -47,10 +47,24 @@ mtyx read-screen --surface 1
 ```
 
 Panes report semantic state (`working` / `blocked` / `done`) through agent
-hooks (`mtyx agents install --only claude`); everything above is also exposed
+hooks (`mtyx agents install --all --global`); everything above is also exposed
 on the socket — see [`mux/docs/protocol.md`](./mux/docs/protocol.md) for the
 versioned wire contract every verb obeys. Attach the TUI any time with
 `mtyx attach` to watch the fleet live.
+
+### Packaged Agent Skill & Dogfood Demo
+
+Give any coding agent (`claude`, `codex`, `pi`, `antigravity`, `opencode`, `grok`, etc.) autonomous `mtyx` orchestration recipes (`agent start/prompt/wait/read/list`, `subscribe`, `detect-agents`, `pane worktree`, `gc`) in one command:
+
+```bash
+npx skills add mathewclarkau/mattyx --skill mtyx
+```
+
+See [`SKILL.md`](./SKILL.md) ([`skills/mtyx/SKILL.md`](./skills/mtyx/SKILL.md)) for the full scenario-driven recipes, or run the self-contained dogfood factory demo (spawns 3 named worker panes in an isolated runtime dir, waits on `blocked` approval, answers, verifies `done`, and cleans up with zero leaked processes):
+
+```bash
+./scripts/demo-factory.sh
+```
 
 ## Installation
 
