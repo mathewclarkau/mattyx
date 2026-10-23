@@ -2169,13 +2169,44 @@ pub(crate) fn discover_sessions(global: &GlobalArgs) -> Vec<DiscoveredSession> {
 /// Issue #138: enumerate sessions and optionally reap stale `.sock`/`.pid`
 /// pairs in-place via the single [`reap_stale_discovered`] sweep path.
 /// Returns `(surviving_sessions, swept_count)`.
+///
+/// The reap is scoped to the guarded runtime roots (canonical `mtyx-<uid>`
+/// and pre-rename `cmux-<uid>`) even when an explicit `--socket` pinned
+/// discovery to another directory: out-of-root pairs are reported but left
+/// untouched (review finding F1; the same scope [`sweep_stale_sessions`]
+/// has always honoured for the #137 startup sweep).
 pub(crate) fn discover_sessions_with_gc(
     global: &GlobalArgs,
     gc: bool,
 ) -> (Vec<DiscoveredSession>, usize) {
     let mut sessions = discover_sessions(global);
-    let swept = if gc { reap_stale_discovered(&mut sessions, None) } else { 0 };
+    let swept = if gc {
+        let before = sessions.len();
+        sessions.retain_mut(|s| {
+            if !is_in_guarded_runtime_root(&s.socket_path) {
+                return true;
+            }
+            reap_stale_row(s, None)
+        });
+        before - sessions.len()
+    } else {
+        0
+    };
     (sessions, swept)
+}
+
+/// True when `socket_path` lives directly in one of the guarded runtime
+/// roots. The enumerate-time GC ([`discover_sessions_with_gc`]) refuses to
+/// unlink anything outside them, so a `--socket`-scoped `list-sessions`
+/// cannot delete mtyx-named files in a directory mtyx does not own.
+fn is_in_guarded_runtime_root(socket_path: &std::path::Path) -> bool {
+    match socket_path.parent() {
+        Some(parent) => {
+            parent == mux_core::platform::runtime_dir().as_path()
+                || parent == mux_core::platform::legacy_runtime_dir().as_path()
+        }
+        None => false,
+    }
 }
 
 /// [`discover_sessions`] with an explicit, ordered root list. Roots are
@@ -2265,6 +2296,12 @@ fn run_list_sessions(global: &GlobalArgs, flags: &FlagMap) -> i32 {
             3
         }
     } else {
+        // Issue #138 AC5/F6: the default-on human path is mutating, so say
+        // what it removed. stderr leaves stdout's shape stable for existing
+        // consumers (a status bar or a `watch` loop scraping the rows).
+        if swept > 0 {
+            eprintln!("mtyx: swept {swept} stale session(s)");
+        }
         // Optional issue-#83 affordance: badge rows whose socket lives in
         // the legacy `cmux-<uid>` root so the origin is visible in human
         // output too (--json carries socket_path per entry already).
@@ -2587,24 +2624,30 @@ pub(crate) fn reap_stale_discovered(
     sessions: &mut Vec<DiscoveredSession>,
     skip_socket: Option<&std::path::Path>,
 ) -> usize {
-    let mut swept = 0;
-    sessions.retain_mut(|s| {
-        if s.live {
-            return true;
-        }
-        if skip_socket == Some(s.socket_path.as_path()) {
-            return true;
-        }
-        if mux_core::server::is_session_socket_live(&s.socket_path) {
-            s.live = true;
-            return true;
-        }
-        let _ = std::fs::remove_file(&s.socket_path);
-        let _ = std::fs::remove_file(mux_core::server::pid_path(&s.socket_path));
-        swept += 1;
-        false
-    });
-    swept
+    let before = sessions.len();
+    sessions.retain_mut(|s| reap_stale_row(s, skip_socket));
+    before - sessions.len()
+}
+
+/// The single-row reap step shared by every caller of
+/// [`reap_stale_discovered`] (and by the root-guarded enumerate path).
+/// Returns whether the row survives: `true` keeps it (already live, the
+/// session being started, or upgraded to live by the R5 re-probe), `false`
+/// drops it after unlinking its `.sock`/`.pid` pair.
+fn reap_stale_row(s: &mut DiscoveredSession, skip_socket: Option<&std::path::Path>) -> bool {
+    if s.live {
+        return true;
+    }
+    if skip_socket == Some(s.socket_path.as_path()) {
+        return true;
+    }
+    if mux_core::server::is_session_socket_live(&s.socket_path) {
+        s.live = true;
+        return true;
+    }
+    let _ = std::fs::remove_file(&s.socket_path);
+    let _ = std::fs::remove_file(mux_core::server::pid_path(&s.socket_path));
+    false
 }
 
 /// Kill every stale (socket-not-connectable) session in the runtime dir
