@@ -289,6 +289,8 @@ mtyx grok install-hooks --uninstall
 
 ## Documentation
 
+The public docs site (quickstart, agent integrations, protocol & configuration reference, honest comparison) lives at **<https://mathewclarkau.github.io/mattyx/>**.
+
 The full multiplexer docs live in [`mux/docs/`](./mux/docs/) — still accurate here since `mux/` was vendored
 verbatim and this fork's additions (hooks, notifications, persistence, remote workspaces) are documented inline
 alongside the rest:
