@@ -4,3 +4,5 @@
 /.agents/teamwork/
 /daemon/remote/bin/
 /dist/
+._*
+.DS_Store
