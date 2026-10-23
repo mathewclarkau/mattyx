@@ -13,7 +13,7 @@ Zero-JS static documentation site published to GitHub Pages on release tags via 
 
 ## Building & Syncing
 
- whenever [`mux/docs/protocol.md`](../mux/docs/protocol.md) or [`mux/docs/configuration.md`](../mux/docs/configuration.md) changes, re-sync the site sources before committing:
+Whenever [`mux/docs/protocol.md`](../mux/docs/protocol.md) or [`mux/docs/configuration.md`](../mux/docs/configuration.md) changes, re-sync the site sources before committing:
 
 ```bash
 ./scripts/sync-docs-site.sh
