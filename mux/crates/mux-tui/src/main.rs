@@ -324,14 +324,20 @@ AGENT DETECTION
       Ambiently detect which AI agent is running in a pane (issue #78):
       walks the pane PTY's process tree (/proc comm/cmdline) and scrapes
       the visible screen against the pattern registry. Prints
-      `<surface> <agent> <confidence> <evidence>` (agent is one of
-      claude, codex, pi, opencode, cursor, aider, unknown — plus any
-      user-added names; confidence is high/medium/low or none). The
+      `<surface> <agent> <confidence> <evidence>` (agent is one of 16
+      bundled names — claude, codex, pi, opencode, cursor, aider, grok,
+      devin, droid, amp, copilot, kilo, qoder, kiro, gemini, cline (see
+      `mtyx agent-pattern list`) — unknown, or any user-added name;
+      confidence is high/medium/low or none). The
       result is cached and surfaces in `list-workspaces` as agent_name.
   mtyx detect-agents
       Detection on every pane in one call: `<surface> <agent>` rows
       (the issue's `agent detect-batch`; --json prints
       {\"agents\":{\"<surface>\":\"<agent>\"}} — keys are surface ids).
+      Issue #140: --json also carries an additive {\"detections\":{...}}
+      map (state/source/confidence/evidence per surface), and the human
+      rows grow to `<surface> <agent> <state> <source>` when it is
+      present.
   mtyx agent-pattern <add|list|remove>
       Manage the live detection registry. add: `mtyx agent-pattern add
       <name> --pattern <marker> [--kind process|screen] [--confidence
@@ -1372,6 +1378,55 @@ fn run_server(args: Args) -> anyhow::Result<()> {
         enabled: config.agent_detection.enabled,
         min_confidence: config.agent_detection.min_confidence,
     });
+    // Issue #140: user signatures from `[[agent_detection]]` extend the
+    // live detection registry. Each is validated (warn + skip on error,
+    // matching the config file's degradation style) and pushed with
+    // `agent-pattern-add` semantics (duplicates rejected).
+    for signature in &config.agent_detection.signatures {
+        let kind = match signature.kind.as_str() {
+            "process" => mux_core::agent_detect::PatternKind::Process,
+            "screen" => mux_core::agent_detect::PatternKind::Screen,
+            other => {
+                eprintln!(
+                    "mtyx: ignoring agent_detection signature {:?}; bad kind {other:?} (expected \"process\" or \"screen\")",
+                    signature.name
+                );
+                continue;
+            }
+        };
+        let confidence = match mux_core::agent_detect::Confidence::parse(&signature.confidence) {
+            Some(confidence) => confidence,
+            None => {
+                eprintln!(
+                    "mtyx: ignoring agent_detection signature {:?}; bad confidence {:?} (expected \"high\", \"medium\", or \"low\")",
+                    signature.name, signature.confidence
+                );
+                continue;
+            }
+        };
+        let pattern = mux_core::agent_detect::AgentPattern {
+            name: signature.name.clone(),
+            kind,
+            pattern: signature.pattern.clone(),
+            confidence,
+            case_insensitive: signature.case_insensitive,
+        };
+        match mux.agent_pattern_add(pattern) {
+            Ok(()) => {}
+            Err(err) => eprintln!(
+                "mtyx: ignoring agent_detection signature {:?}: {err}",
+                signature.name
+            ),
+        }
+    }
+    // Issue #140 AC1: the zero-config heuristic poller. Default interval
+    // is 1000ms (worst-case freshness ~2s, inside the 5s budget);
+    // `poll_interval_ms = 0` keeps it off.
+    if config.agent_detection.poll_interval_ms > 0 {
+        mux.enable_heuristic_polling(std::time::Duration::from_millis(
+            config.agent_detection.poll_interval_ms,
+        ));
+    }
     // Issue #77 AC6: the operator's [[worktree_pattern]] override, or
     // None for the default `<repo>/../<repo>.<branch>/`.
     mux.set_worktree_pattern(config.worktree_pattern.clone());

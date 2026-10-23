@@ -116,13 +116,15 @@ use crate::{
     SplitDir, SurfaceId, SurfaceKind, WorkspaceId,
 };
 
-/// Control-socket protocol version. 7 adds the `input-ack` capability
-/// (confirmed/receipted `send`, issue #88); see the module docs. Bumped
-/// from 6 (rename-session, attach `resized` replay events). Older
-/// clients keep working against this daemon: their requests deserialize
-/// unchanged (all new `send` fields are serde-defaulted) and unconfirmed
-/// send behaves exactly as before.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// Control-socket protocol version. 8 adds the `heuristic` agent-state
+/// source (issue #140's zero-config screen heuristics) to
+/// `agent-state-changed`, `report-agent`, and the pane snapshot; the
+/// remote client's event parser REQUIRES a parseable `source` and
+/// silently drops the whole `agent-state-changed` event otherwise, so a
+/// bump makes mismatched peers fail loudly at attach instead of losing
+/// state updates. 7 added the `input-ack` capability (confirmed/receipted
+/// `send`, issue #88); see the module docs.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Issue #88: hard cap on a CONFIRMED send payload (bytes of `text` plus
 /// decoded `bytes`, before the optional CR / shell-sanitisation prefix).
@@ -1317,6 +1319,11 @@ fn pane_json(state: &State, id: PaneId, short_ids: &HashMap<u64, String>) -> Val
                 "title": surface.map(|s| s.title()).unwrap_or_default(),
                 "cwd": surface.and_then(|s| s.cwd()),
                 "agent_state": surface.and_then(|s| s.agent_report()).map(|r| r.state.as_str()),
+                // Issue #140 AC6: the applied report's source tier
+                // ("heuristic"/"detected"/"socket"/"hook"), nullable like
+                // `agent_state` so consumers can render hook-grade and
+                // heuristic-grade state distinctly.
+                "agent_source": surface.and_then(|s| s.agent_report()).map(|r| r.source.as_str()),
                 "agent_session": surface.and_then(|s| s.agent_report()).and_then(|r| r.session.clone()),
                 // Issue #78: the last ambient detection result (name +
                 // confidence), cached by `detect-agent`/`detect-agents`. A
@@ -1782,8 +1789,9 @@ fn agent_report_json(surface: SurfaceId, report: &crate::AgentReport) -> Value {
 
 /// Issue #78 AC1 response: agent name + confidence + the evidence line
 /// that triggered the match. Issue #96 adds `state`: the screen-derived
-/// lifecycle classification (informational; the `Detected`-tier report
-/// it may publish is what actually changes `agent_status`).
+/// lifecycle classification. Issue #140 adds `source`: the tier the
+/// classification publishes at — always "heuristic", the screen
+/// classifier being the heuristic layer (see `AgentStateSource`).
 fn detection_json(surface: SurfaceId, detection: &crate::agent_detect::Detection) -> Value {
     json!({
         "surface": surface,
@@ -1791,6 +1799,7 @@ fn detection_json(surface: SurfaceId, detection: &crate::agent_detect::Detection
         "confidence": detection.confidence.map(|c| c.as_str()),
         "evidence": detection.evidence,
         "state": detection.screen_state.as_str(),
+        "source": crate::AgentStateSource::Heuristic.as_str(),
     })
 }
 
@@ -2676,10 +2685,19 @@ fn handle_command(
         Command::DetectAgents => {
             let detections = mux.detect_all_agents()?;
             let agents: serde_json::Map<String, Value> = detections
-                .into_iter()
-                .map(|(id, detection)| (id.to_string(), Value::String(detection.agent)))
+                .iter()
+                .map(|(id, detection)| (id.to_string(), Value::String(detection.agent.clone())))
                 .collect();
-            Ok(json!({ "agents": agents }))
+            // Issue #140 AC3: the additive per-surface detection records
+            // (name/state/source/confidence/evidence). The legacy
+            // `agents` name-map above is kept verbatim so existing
+            // consumers (and `cli.rs`'s human printer) see an unchanged
+            // shape.
+            let records: serde_json::Map<String, Value> = detections
+                .into_iter()
+                .map(|(id, detection)| (id.to_string(), detection_json(id, &detection)))
+                .collect();
+            Ok(json!({ "agents": agents, "detections": records }))
         }
         Command::AgentPatternAdd { name, pattern, kind, confidence, case_insensitive } => {
             let kind = match kind.as_deref() {

@@ -3289,17 +3289,31 @@ fn print_notify_ack(data: &Value, out: &mut dyn Write) -> io::Result<()> {
 }
 
 /// Issue #78 AC2 human output: `<surface> <agent>` rows, id-ordered.
+///
+/// Issue #140 AC3: when the reply also carries the `detections` map, each
+/// row gains `<state> <source>` (`13 pi idle heuristic`). The map is
+/// additive on the wire, so a daemon that predates it keeps printing the
+/// original two columns.
 fn print_detect_agents(data: &Value, out: &mut dyn Write) -> io::Result<()> {
     let Some(agents) = data.get("agents").and_then(Value::as_object) else {
         return Ok(());
     };
+    let detections = data.get("detections").and_then(Value::as_object);
     let mut rows: Vec<(u64, &str)> = agents
         .iter()
         .filter_map(|(id, agent)| Some((id.parse::<u64>().ok()?, agent.as_str()?)))
         .collect();
     rows.sort_unstable();
     for (id, agent) in rows {
-        writeln!(out, "{id} {agent}")?;
+        match detections.and_then(|map| map.get(&id.to_string())) {
+            Some(detection) => writeln!(
+                out,
+                "{id} {agent} {} {}",
+                detection.get("state").and_then(Value::as_str).unwrap_or("unknown"),
+                detection.get("source").and_then(Value::as_str).unwrap_or("none"),
+            )?,
+            None => writeln!(out, "{id} {agent}")?,
+        }
     }
     Ok(())
 }
@@ -4085,5 +4099,38 @@ mod tests {
         let wb = parse_ok(&["write-bytes", "--bytes", "aGVsbG8="]);
         let built = (wb.verb.build)(&wb.flags).unwrap();
         assert_eq!(built["bytes"], json!("aGVsbG8="));
+    }
+
+    /// Issue #140 AC3: without the new `detections` map the
+    /// `detect-agents` human printer is byte-for-byte unchanged, so an
+    /// older daemon still renders exactly the `<surface> <agent>` rows.
+    #[test]
+    fn detect_agents_printer_unchanged_without_detections() {
+        let data = json!({"agents": {"13": "pi", "2": "unknown"}});
+        let mut out: Vec<u8> = Vec::new();
+        print_detect_agents(&data, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "2 unknown\n13 pi\n");
+    }
+
+    /// Issue #140 AC3: when the daemon adds the `detections` map, each row
+    /// gains `<state> <source>` columns (`13 pi idle heuristic`), missing
+    /// fields degrade like the sibling printers (`none`/`unknown`).
+    #[test]
+    fn detect_agents_printer_appends_state_and_source_columns() {
+        let data = json!({
+            "agents": {"13": "pi", "2": "unknown"},
+            "detections": {
+                "13": {"agent": "pi", "state": "idle", "source": "heuristic",
+                       "confidence": "medium", "evidence": "screen marker 'pi> '"},
+                "2": {"agent": "unknown", "state": "unknown", "source": null,
+                      "confidence": null, "evidence": "no agent markers above confidence threshold"}
+            }
+        });
+        let mut out: Vec<u8> = Vec::new();
+        print_detect_agents(&data, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "2 unknown unknown none\n13 pi idle heuristic\n"
+        );
     }
 }

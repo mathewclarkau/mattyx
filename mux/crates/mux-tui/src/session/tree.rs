@@ -2,8 +2,8 @@
 //! plus the JSON parser for the remote `list-workspaces` shape.
 
 use mux_core::{
-    assign_short_ids, AgentState, BrowserSource, Node, PaneId, ScreenId, SplitDir, State,
-    SurfaceId, SurfaceKind, WorkspaceId,
+    assign_short_ids, AgentState, AgentStateSource, BrowserSource, Node, PaneId, ScreenId,
+    SplitDir, State, SurfaceId, SurfaceKind, WorkspaceId,
 };
 use ratatui::style::Color;
 use serde_json::Value;
@@ -73,6 +73,11 @@ pub struct TabView {
     pub title: String,
     pub cwd: Option<String>,
     pub agent_state: Option<AgentState>,
+    /// The applied report's source tier (issue #140 AC6, protocol 8):
+    /// heuristic / detected / socket / hook. `None` when no report or an
+    /// older server omits `agent_source`, so the sidebar can render
+    /// heuristic-grade state distinctly (hollow chip) from hook-grade.
+    pub agent_source: Option<AgentStateSource>,
     /// The agent session id reported on this surface (the same string
     /// `list-agents` reports as `session`), if any. Surfaced here so the
     /// fuzzy finder can index it for type-ahead search.
@@ -192,6 +197,12 @@ impl PaneView {
         self.tabs.get(self.active_tab)?.agent_state
     }
 
+    /// Source tier of the active tab's applied agent report, if any
+    /// (issue #140 AC6).
+    pub fn active_agent_source(&self) -> Option<AgentStateSource> {
+        self.tabs.get(self.active_tab)?.agent_source
+    }
+
     /// Detected agent name of the active tab, if any (issue #78 AC6).
     pub fn active_agent_name(&self) -> Option<&str> {
         self.tabs.get(self.active_tab)?.agent_name.as_deref()
@@ -249,6 +260,11 @@ pub fn tree_from_state(state: &State) -> TreeView {
                         .get(sid)
                         .and_then(|s| s.agent_report())
                         .map(|r| r.state),
+                    agent_source: state
+                        .surfaces
+                        .get(sid)
+                        .and_then(|s| s.agent_report())
+                        .map(|r| r.source),
                     agent_session: state
                         .surfaces
                         .get(sid)
@@ -385,6 +401,10 @@ fn parse_pane(value: &Value) -> Option<PaneView> {
                                 .get("agent_state")
                                 .and_then(|v| v.as_str())
                                 .and_then(AgentState::parse),
+                            agent_source: tab
+                                .get("agent_source")
+                                .and_then(|v| v.as_str())
+                                .and_then(AgentStateSource::parse),
                             agent_session: tab
                                 .get("agent_session")
                                 .and_then(|v| v.as_str())
@@ -506,6 +526,39 @@ mod tests {
         });
         let tree = parse_tree(&data);
         assert_eq!(tree.workspaces[0].color, None);
+    }
+
+    /// Issue #140 AC6: the pane snapshot's `agent_source` (protocol 8)
+    /// round-trips through `parse_tree`, so a remote-attached TUI can
+    /// render heuristic-grade state distinctly from hook-grade. Absent
+    /// on older servers → `None`.
+    #[test]
+    fn parse_tree_reads_tab_agent_source() {
+        let tree = parse_tree(&json!({
+            "workspaces": [{
+                "id": 1, "name": "ag", "active": true,
+                "screens": [{
+                    "id": 2, "name": null, "active": true,
+                    "layout": {"type": "leaf", "pane": 3},
+                    "active_pane": 3,
+                    "panes": [{
+                        "id": 3, "short_id": "3", "name": null, "active_tab": 0,
+                        "tabs": [
+                            {"surface": 4, "title": "pi", "agent_state": "idle",
+                             "agent_source": "heuristic"},
+                            {"surface": 5, "title": "claude", "agent_state": "working",
+                             "agent_source": "hook"},
+                            {"surface": 6, "title": "old", "agent_state": "blocked"},
+                        ],
+                        "worktrees": []
+                    }]
+                }]
+            }]
+        }));
+        let pane = &tree.workspaces[0].screens[0].panes[0];
+        assert_eq!(pane.active_agent_source(), Some(mux_core::AgentStateSource::Heuristic));
+        assert_eq!(pane.tabs[1].agent_source, Some(mux_core::AgentStateSource::Hook));
+        assert_eq!(pane.tabs[2].agent_source, None, "absent key stays None (older server)");
     }
 
     #[test]
