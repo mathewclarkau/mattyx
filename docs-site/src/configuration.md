@@ -150,6 +150,111 @@ Each action override replaces all default chords for that action. Values may be 
 
 Chord strings can be single characters or a key name with optional `ctrl`, `control`, `alt`, `option`, or `shift` modifiers. Examples: `"c"`, `"%"`, `"ctrl+b"`, `"alt+enter"`, `"tab"`, `"backtab"`, `"shift+tab"`, `"pageup"`, `"pagedown"`, `"esc"`, `"space"`, `"left"`, `"right"`, `"up"`, `"down"`, `"home"`, and `"end"`.
 
+## Agent detection
+
+Ambient agent detection runs without any per-agent hook: mtyx walks each
+pane's process tree (`/proc` comm/cmdline), scrapes the visible screen for
+prompt markers, and classifies the result as working, blocked, or idle.
+Matches are published with `source: "heuristic"`, which is the lowest
+authority tier — a hook or an explicit `report-agent` always wins and a
+heuristic poll never downgrades one.
+
+`[[agent_detection]]` is an array of tables in `mux.toml`
+(`"agent_detection": [{...}]` in `mux.json`). Entries apply in order and
+the last value for each key wins.
+
+| Key | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `agent_detection.enabled` | boolean | `true` | Master switch for ambient detection |
+| `agent_detection.min_confidence` | `"high"`, `"medium"`, `"low"` | `"low"` | Lowest confidence that still counts as a match; weaker matches report `unknown` |
+| `agent_detection.poll_interval_ms` | integer | `1000` | Background re-scan interval per pane, in milliseconds; `0` disables the poller |
+| `agent_detection.signatures` | array of tables | `[]` | User signatures, added to the bundled registry |
+
+### Signatures
+
+Each `[[agent_detection.signatures]]` row teaches the detector one more
+marker. Rows are appended to the bundled registry, so the bundled agents
+keep working.
+
+| Field | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `name` | string | required | Agent name `detect-agent` reports; cannot be empty, contain whitespace, or be `unknown` |
+| `pattern` | string | required | Marker to look for: a substring where `*` spans any run of characters; never a regex |
+| `kind` | `"process"` or `"screen"` | `"screen"` | `screen` matches the visible terminal text; `process` matches whole argv tokens, so a bare `pi` never matches `spider` |
+| `confidence` | `"high"`, `"medium"`, `"low"` | `"medium"` | Confidence reported for a match, compared against `min_confidence` |
+| `case_insensitive` | boolean | `false` | Case-fold the comparison |
+
+Matching is deliberately substring/glob rather than regex: no marker needs
+a pattern language, and the whole registry stays one JSON file plus this
+table. Prefer prompt-shaped markers (`"myagent> "`) over bare names —
+`droid` is a substring of `android` and `amp` of `ramp`.
+
+### Degradation, not failure
+
+A config written for a newer mtyx still loads, matching the rest of the
+file:
+
+- an unknown key inside `[[agent_detection]]` is reported on stderr and
+  otherwise ignored (the table is the one place where foreign keys are
+  tolerated, because it is the table users extend by hand);
+- an unusable signature row — unknown `kind`/`confidence`, empty name,
+  reserved `unknown` — is warned about and skipped without discarding the
+  rest of the config;
+- an unparseable `min_confidence` keeps the default for that key.
+
+### Bundled agents
+
+`claude`, `codex`, `pi`, `opencode`, `cursor`, `aider`, `grok`, `devin`,
+`droid`, `amp`, `copilot`, `kilo`, `qoder`, `kiro`, `gemini`, `cline`.
+
+### Example
+
+```toml
+[[agent_detection]]
+enabled = true
+min_confidence = "medium"
+poll_interval_ms = 1000
+
+# A prompt marker no bundled pattern knows about.
+[[agent_detection.signatures]]
+name = "myagent"
+kind = "screen"
+pattern = "myagent> "
+confidence = "medium"
+
+# A wrapper script that shows up in the pane's process tree.
+[[agent_detection.signatures]]
+name = "myagent"
+kind = "process"
+pattern = "myagent-cli"
+confidence = "high"
+```
+
+The same table in `mux.json`:
+
+```json
+{
+  "agent_detection": [
+    {
+      "min_confidence": "medium",
+      "poll_interval_ms": 1000,
+      "signatures": [
+        {
+          "name": "myagent",
+          "kind": "screen",
+          "pattern": "myagent> ",
+          "confidence": "medium"
+        }
+      ]
+    }
+  ]
+}
+```
+
+`mtyx detect-agents` prints one `<surface> <agent> <state> <source>` row
+per pane (for example `13 pi idle heuristic`); `mtyx detect-agents --json`
+carries the same record under the additive `detections` map.
+
 ## Example
 
 ```json
@@ -267,6 +372,21 @@ alt_shortcuts = false
 "focus-right" = ["l", "right", "alt+l", "alt+right"]
 "close-pane" = "none"
 detach = "d"
+
+# Ambient agent detection: scan each pane's process tree and screen for
+# prompt markers, publishing working/idle state with source "heuristic".
+# Must come last here: `[[agent_detection.signatures]]` rows only nest
+# inside the `[[agent_detection]]` entry above them.
+[[agent_detection]]
+enabled = true
+min_confidence = "medium"
+poll_interval_ms = 1000
+
+[[agent_detection.signatures]]
+name = "myagent"
+kind = "screen"
+pattern = "myagent> "
+confidence = "medium"
 ```
 
 ## Local config overlay (attach)
