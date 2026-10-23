@@ -41,8 +41,8 @@ mtyx new-tab --cwd ~/my-repo --exec -- aider
 
 # 3. drive + read them from a script
 mtyx send --surface 1 --text "fix the failing test" --send-cr 1
-mtyx agent-read --surface 1 --source recent-unwrapped
-mtyx wait-agent-status --target 1 --status blocked --require-transition   # blocks until it needs you
+mtyx agent-read --target 1 --source recent-unwrapped
+mtyx wait-agent-status --target 1 --status blocked --require-transition --timeout 60000   # blocks until it needs you
 mtyx read-screen --surface 1
 ```
 
