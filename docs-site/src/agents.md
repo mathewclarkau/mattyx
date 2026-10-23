@@ -43,13 +43,15 @@ mtyx agents install --only codex --uninstall --global
 
 ### Per-Agent State Mapping
 
-| State | Sidebar Badge / Dot | Meaning | Gate Behavior (`send` / `agent prompt` / `agent read`) |
+| State | Sidebar State Dot | Meaning | Gate Behavior (`send` / `agent prompt` / `agent read`) |
 | --- | --- | --- | --- |
-| `working` | `[work]` (Amber) | Agent is actively streaming a turn or running a tool | `agent-read` refuses with `agent_not_idle` unless `--force` |
-| `blocked` | `[WAIT]` (Red) | Agent is waiting on an approval prompt or confirmation modal | `send` and `agent-prompt` refuse with `agent_blocked` unless `--force` |
-| `done` | `[done]` (Green) | Agent completed its turn and returned to its input prompt | Reads and sends allowed |
-| `idle` | `[idle]` (Dim/Gray) | Agent is idle at prompt | Reads and sends allowed |
-| `unknown` | — | Registered or detected, no transition recorded yet | Reads and sends allowed |
+| `working` | `●` yellow | Agent is actively streaming a turn or running a tool | `agent-read` refuses with `agent_not_idle` unless `--force` |
+| `blocked` | `●` red | Agent is waiting on an approval prompt or confirmation modal | `send` and `agent-prompt` refuse with `agent_blocked` unless `--force` |
+| `done` | `●` blue | Agent completed its turn and returned to its input prompt | Reads and sends allowed |
+| `idle` | `●` green | Agent is idle at prompt | Reads and sends allowed |
+| `unknown` | `●` gray | Registered or detected, no transition recorded yet | Reads and sends allowed |
+
+The state dot is **filled** (`●`) for report-grade state (`hook` / `socket` / `detected`) and **hollow** (`○`) for heuristic-grade state (zero-config screen heuristics, which any hook report overwrites); the colour always follows the state itself. A surface with no state report at all shows no dot. Separately, the sidebar appends a bracketed **agent-name badge** ` [name]` (e.g. ` [claude]`) to the workspace title when an agent is registered on the active pane — that badge carries the agent's name, not its state.
 
 ---
 
@@ -69,17 +71,17 @@ mtyx detect-agents --json
 
 ### Extending the Pattern Registry at Runtime
 
-Bundled patterns ship in `mux/crates/mux-core/src/agents.json`. You can register additional process or screen markers for custom internal agents at runtime:
+Bundled patterns ship in `mux/crates/mux-core/src/agent_detect/agents.json`. You can register additional process or screen markers for custom internal agents at runtime:
 
 ```bash
 mtyx agent-pattern add my-agent --pattern "my-agent-bin" --kind process --confidence high
 mtyx agent-pattern add my-agent --pattern "Allow tool execution?" --kind screen --confidence medium
-mtyx agent-pattern list --json
+mtyx --json agent-pattern list   # global flags go before the noun
 mtyx agent-pattern remove my-agent
 ```
 
 ### Passive OSC Desktop Notifications
 
 Any process inside a pane that emits an OSC 9, OSC 777, or kitty notification sequence (for example `printf '\033]9;Approval needed\007'`) automatically:
-1. Sets the pane's `detected` state to `blocked` (unless overridden by a higher-authority `hook` or `socket` report), and
+1. Classifies the pane's `detected` state — usually `blocked`, `idle` for completion-style notifications (unless overridden by a higher-authority `hook` or `socket` report) — and
 2. Broadcasts an `osc-notification` event on the socket and forwards it to the desktop via `notify-send`.
