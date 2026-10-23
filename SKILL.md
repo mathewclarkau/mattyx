@@ -84,7 +84,10 @@ mtyx --session "$SESSION" agent read coder --source recent-unwrapped --lines 50
 # 6. Approve or answer the prompt:
 #    - Use `answer` for single-key dialog choices (y/n/enter/down/up/esc/1..9)
 #    - Or `agent prompt --force` to reply with a line of text while blocked
-mtyx --session "$SESSION" answer --surface 2 --key enter
+#    - `answer` targets a surface id, not an agent name, so resolve the id
+#      that `agent list` reports for `coder` instead of hard-coding one:
+SURFACE_ID=$(mtyx --session "$SESSION" --json agent list | jq -r '.agents[] | select(.name=="coder") | .surface')
+mtyx --session "$SESSION" answer --surface "$SURFACE_ID" --key enter
 # or:
 mtyx --session "$SESSION" agent prompt coder --force "Yes, keep the cap at 30 seconds"
 
