@@ -147,6 +147,9 @@ case "$CARGO_MINOR" in
         ;;
 esac
 if rustup --version >/dev/null 2>&1; then
+    if [ -n "${MTYX_CARGO_TARGET:-}" ]; then
+        rustup target add --toolchain 1.97 "$MTYX_CARGO_TARGET"
+    fi
     ZIG="$ZIG_BIN" "$CARGO_BIN" "+1.97" build --release -p mux-tui "${CARGO_TARGET_ARGS[@]+"${CARGO_TARGET_ARGS[@]}"}"
 else
     echo "    rustup not found; building with $CARGO_BIN directly (no +1.97 pin)"
