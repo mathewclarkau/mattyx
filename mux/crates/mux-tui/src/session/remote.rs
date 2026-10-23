@@ -22,8 +22,12 @@ use super::tree::{parse_tree, TreeView};
 
 /// Issue #88 bumped the protocol to 7 (input-ACK capability for
 /// confirmed `send`); the attach client itself does not use confirmed
-/// input but pins the shipped-together version.
-const SUPPORTED_PROTOCOL_VERSION: u64 = 7;
+/// input but pins the shipped-together version. Issue #140 bumped to 8:
+/// `agent-state-changed` now carries the `heuristic` source tier, and
+/// the event parser below REQUIRES a parseable `source` — an older
+/// client would silently drop every heuristic event, so mismatched
+/// peers fail loudly at attach instead.
+const SUPPORTED_PROTOCOL_VERSION: u64 = 8;
 #[derive(Clone)]
 struct RemoteBrowserFrame {
     frame: BrowserFrame,
@@ -226,7 +230,7 @@ impl RemoteSession {
         let protocol = ident.get("protocol").and_then(|v| v.as_u64()).unwrap_or(0);
         if protocol != SUPPORTED_PROTOCOL_VERSION {
             anyhow::bail!(
-                "unsupported mtyx protocol {protocol}; this client requires protocol 7 because attach-stream resize markers are authoritative; restart the mtyx server"
+                "unsupported mtyx protocol {protocol}; this client requires protocol 8 because heuristic agent-state reports must parse on both ends; restart the mtyx server"
             );
         }
         session.request(json!({"cmd": "subscribe"}))?;

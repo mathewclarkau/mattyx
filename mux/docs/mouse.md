@@ -55,3 +55,22 @@ Rename and browser URL prompts are centered bordered dialogs using the same `Tex
 Enter commits. Esc cancels. Ctrl-C clears. Home and Ctrl-A move to the start. End and Ctrl-E move to the end. Alt-Left and Alt-B move one word left. Alt-Right and Alt-F move one word right. Backspace deletes left, Delete and Ctrl-D delete right, Ctrl-W and Alt-Backspace delete a word left, Alt-D deletes a word right, Ctrl-K deletes to the end, and Ctrl-U deletes to the start.
 
 Click OK to commit, Clear to clear, Cancel or outside the dialog to close, and the input row to move the cursor. Right-clicking while a prompt is open shakes the dialog instead of opening a menu.
+
+## Terminal Mouse Mode Recovery (SSH / Remote Disconnections)
+
+On normal exit or panic, `mtyx` restores the host terminal and explicitly extinguishes all DEC/xterm mouse-reporting private modes (`?1000l`, `?1002l`, `?1003l` any-event tracking, `?1015l`, and `?1006l` SGR coordinates) as well as resetting the OSC 22 pointer shape.
+
+If an SSH connection to a remote host drops abruptly (`Operation timed out` / `Broken pipe`), the remote process cannot deliver its teardown sequence over the dead transport, and OpenSSH does not reset terminal-emulator private modes on disconnect. Reconnecting in the same terminal window can then feed SGR motion sequences (`35;col;rowM`) directly into a remote shell (`bash`/readline) that does not consume mouse input.
+
+- **Immediate recovery:** press `Ctrl-C` and run `printf '\e[?1000l\e[?1002l\e[?1003l\e[?1006l'` (or `reset`), or use Ghostty's **Terminal → Reset** action.
+- **Remote shell guard (`~/.bashrc`):** extinguish mouse reporting whenever the prompt renders:
+  ```bash
+  PS1="\[\e[?1000l\e[?1002l\e[?1003l\e[?1006l\]$PS1"
+  ```
+- **Local SSH wrapper (`~/.config/fish/config.fish`):** reset mouse modes locally whenever `ssh` exits:
+  ```fish
+  function ssh
+      command ssh $argv
+      printf '\e[?1000l\e[?1002l\e[?1003l\e[?1006l'
+  end
+  ```
