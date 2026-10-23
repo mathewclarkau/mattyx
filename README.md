@@ -78,12 +78,11 @@ curl -fsSL https://raw.githubusercontent.com/mathewclarkau/mattyx/v0.27.0/script
 
 ### 2. Homebrew (macOS & Linux)
 
-```bash
-brew tap mathewclarkau/mattyx https://github.com/mathewclarkau/mattyx
-brew install mattyx
-```
+Install directly from the release formula asset (rendered per release by `scripts/render-homebrew-formula.sh` with the real per-platform digests — that script is the single source of the formula):
 
-*(Or install directly from the release formula asset: `brew install https://github.com/mathewclarkau/mattyx/releases/latest/download/mattyx.rb`)*
+```bash
+brew install https://github.com/mathewclarkau/mattyx/releases/latest/download/mattyx.rb
+```
 
 ### 3. Nix flake (`x86_64-linux`, `aarch64-linux`, `aarch64-darwin`, `x86_64-darwin`)
 
