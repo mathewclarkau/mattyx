@@ -140,14 +140,18 @@ fn confirmed_send_receives_receipt_after_child_consumption() {
 
     // Confirmed send: response arrives only after the child printed, and
     // reports the receipt.
-    let started = Instant::now();
     let confirmed = rpc(
         &sock,
         json!({"id": 2, "cmd": "send", "surface": surface.id, "text": "receipt\n", "confirm": true, "timeout_ms": 10_000}),
     );
     assert_eq!(confirmed["ok"], json!(true), "confirmed send failed: {confirmed}");
     assert_eq!(confirmed["data"]["confirmed"], json!(true));
-    assert!(started.elapsed() >= Duration::from_millis(1));
+    // No wall-clock lower bound on the round trip: a confirmed send returning
+    // Ok already proves the VT saw output after the write (the output-epoch
+    // receipt inside `write_bytes_confirmed`), and on a fast or loaded runner
+    // the whole write→echo→receipt dance can legitimately complete in under
+    // 1ms — a `>= 1ms` assert here flaked in CI. The never-consumed timeout
+    // path is covered by `input_ack_timeout_is_structured_error`.
     let echoed = wait_for(
         || {
             let text = surface.with_terminal(|t| t.plain_text()).unwrap().unwrap();
