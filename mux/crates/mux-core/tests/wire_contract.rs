@@ -352,6 +352,11 @@ fn protocol_compat_matrix_in_docs_matches_protocol_version() {
     );
     for required_token in [
         &format!("Protocol {ver} (Current)"),
+        // The legacy-boundary column must move with PROTOCOL_VERSION too:
+        // without this assert, a future bump would fix the heading but
+        // leave a stale `Protocol <= <old-1>` column unnoticed.
+        &format!("Protocol <= {}", ver - 1),
+        &format!("Protocol {ver}+ (1.x Additive)"),
         "legacy_host_receipt_rejected",
         "wire_contract.rs",
         "agent_register_shape",
