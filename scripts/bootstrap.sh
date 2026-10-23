@@ -112,6 +112,10 @@ done
 
 echo "==> building mux-tui (release)"
 cd "$ROOT/mux"
+CARGO_TARGET_ARGS=()
+if [ -n "${MTYX_CARGO_TARGET:-}" ]; then
+  CARGO_TARGET_ARGS=(--target "$MTYX_CARGO_TARGET")
+fi
 # Pin cargo to the Rust 1.97 toolchain via rustup's "+toolchain" syntax
 # when rustup is available. The dtolnay/rust-toolchain action installs Rust
 # 1.97 under ~/.cargo but the CI image's PATH may still surface an older
@@ -143,10 +147,20 @@ case "$CARGO_MINOR" in
         ;;
 esac
 if rustup --version >/dev/null 2>&1; then
-    ZIG="$ZIG_BIN" "$CARGO_BIN" "+1.97" build --release -p mux-tui
+    if [ -n "${MTYX_CARGO_TARGET:-}" ]; then
+        rustup target add --toolchain 1.97 "$MTYX_CARGO_TARGET"
+    fi
+    ZIG="$ZIG_BIN" "$CARGO_BIN" "+1.97" build --release -p mux-tui "${CARGO_TARGET_ARGS[@]+"${CARGO_TARGET_ARGS[@]}"}"
 else
     echo "    rustup not found; building with $CARGO_BIN directly (no +1.97 pin)"
-    ZIG="$ZIG_BIN" "$CARGO_BIN" build --release -p mux-tui
+    ZIG="$ZIG_BIN" "$CARGO_BIN" build --release -p mux-tui "${CARGO_TARGET_ARGS[@]+"${CARGO_TARGET_ARGS[@]}"}"
+fi
+
+if [ -n "${MTYX_CARGO_TARGET:-}" ]; then
+  BUILT_BIN="$ROOT/mux/target/$MTYX_CARGO_TARGET/release/mtyx"
+  [ "$ZIG_OS" = "windows" ] && BUILT_BIN="${BUILT_BIN}.exe"
+  mkdir -p "$ROOT/mux/target/release"
+  cp "$BUILT_BIN" "$ROOT/mux/target/release/"
 fi
 
 if [ "$ZIG_OS" = "windows" ]; then

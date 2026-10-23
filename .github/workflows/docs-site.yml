@@ -1,0 +1,59 @@
+name: Docs Site
+
+on:
+  pull_request:
+    paths:
+      - "docs-site/**"
+      - "mux/docs/**"
+      - "scripts/sync-docs-site.sh"
+      - ".github/workflows/docs-site.yml"
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages-${{ github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Verify synced docs and build static site
+        run: |
+          set -euo pipefail
+          bash scripts/sync-docs-site.sh --check
+          test -f docs-site/dist/index.html
+          test -f docs-site/dist/agents.html
+          test -f docs-site/dist/protocol.html
+          test -f docs-site/dist/configuration.html
+          test -f docs-site/dist/comparison.html
+          test -f docs-site/dist/changelog.html
+
+      - name: Upload Pages artifact
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs-site/dist
+
+  deploy:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

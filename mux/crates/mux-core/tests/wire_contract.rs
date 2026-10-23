@@ -328,3 +328,38 @@ fn agent_prompt_shape_and_blocked_gate() {
     assert_envelope(&forced, 19);
     assert!(forced["data"]["surface"].is_number(), "data.surface must be a number: {forced}");
 }
+
+/// Issue #144: CI drift check that `mux/docs/protocol.md`'s compatibility
+/// matrix stays synchronized with `mux_core::PROTOCOL_VERSION` and names the
+/// golden wire-contract tests that pin it.
+#[test]
+fn protocol_compat_matrix_in_docs_matches_protocol_version() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let protocol_md_path = manifest_dir.join("../../docs/protocol.md");
+    let doc = std::fs::read_to_string(&protocol_md_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", protocol_md_path.display()));
+
+    let ver = mux_core::server::PROTOCOL_VERSION;
+    let expected_heading = format!("### Protocol Compatibility Matrix (`PROTOCOL_VERSION = {ver}`)");
+    assert!(
+        doc.contains(&expected_heading),
+        "mux/docs/protocol.md is out of sync with mux_core::PROTOCOL_VERSION ({ver}); expected heading {expected_heading:?}"
+    );
+    assert!(
+        doc.contains("<!-- PROTOCOL_COMPAT_MATRIX_START -->")
+            && doc.contains("<!-- PROTOCOL_COMPAT_MATRIX_END -->"),
+        "mux/docs/protocol.md must retain the PROTOCOL_COMPAT_MATRIX markers"
+    );
+    for required_token in [
+        &format!("Protocol {ver} (Current)"),
+        "legacy_host_receipt_rejected",
+        "wire_contract.rs",
+        "agent_register_shape",
+        "agent_prompt_shape_and_blocked_gate",
+    ] {
+        assert!(
+            doc.contains(required_token),
+            "protocol compat matrix in mux/docs/protocol.md is missing {required_token:?}"
+        );
+    }
+}
