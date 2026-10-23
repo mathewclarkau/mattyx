@@ -103,6 +103,11 @@ fn default_true() -> bool {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    /// Issue #144: optional schema version field (`schema_version = 1`) for
+    /// forward/backward config migration guarantees across 0.x and 1.x.
+    #[serde(default)]
+    #[allow(dead_code)]
+    schema_version: Option<u32>,
     #[serde(default)]
     theme: ThemeValue,
     #[serde(default)]
@@ -144,6 +149,7 @@ struct RawConfig {
 impl Default for RawConfig {
     fn default() -> Self {
         RawConfig {
+            schema_version: None,
             theme: ThemeValue::default(),
             tabs: RawTabs::default(),
             sidebar: RawSidebar::default(),
@@ -2584,5 +2590,126 @@ prefix = "ctrl+s"
         assert!(!toml_off.update_check);
 
         assert!(Config::default().update_check);
+    }
+
+    /// Issue #144: historical `mux.json` / `mux.toml` fixtures from shipped
+    /// 0.x minor releases must parse and resolve cleanly on 1.x without data
+    /// loss or schema errors.
+    #[test]
+    fn historical_0x_release_config_fixtures_migrate_cleanly() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap();
+        let dir = unique_dir("migration-fixtures");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let fixtures: &[(&str, &str)] = &[
+            // v0.1.0 – v0.10.x (cmux-era minimal theme + tabs + keys JSON)
+            (
+                "v0.10-mux.json",
+                r##"{
+                    "theme": {
+                        "selection_background": "#3a3a3a",
+                        "sidebar_rail": 110,
+                        "border_active": "#87afd7"
+                    },
+                    "tabs": {
+                        "min_width": 8,
+                        "solid_background": true,
+                        "show_titles": false,
+                        "agents": ["claude", "codex"]
+                    },
+                    "sidebar": { "width": 24 },
+                    "keys": {
+                        "prefix": "ctrl+b",
+                        "alt_shortcuts": true,
+                        "new-tab": ["c", "alt+t"]
+                    }
+                }"##,
+            ),
+            // v0.17.x (workspaces with color/icon, browser, scrollbar, preset theme string)
+            (
+                "v0.17-mux.json",
+                r##"{
+                    "theme": "catpuccin-mocha",
+                    "workspaces": [
+                        {"name": "Factory", "color": "purple", "icon": "robot"},
+                        {"name": "QA", "color": "#00aaff", "icon": "eye"}
+                    ],
+                    "browser": {
+                        "discover": true,
+                        "discover_ports": [9222],
+                        "ephemeral": false
+                    },
+                    "scrollbar": { "position": "border" }
+                }"##,
+            ),
+            // v0.22.x (agent_detection, worktree_pattern, headless vt_size in TOML)
+            (
+                "v0.22-mux.toml",
+                r##"
+theme = "dracula"
+
+[headless]
+vt_size = "132x43"
+
+[[workspaces]]
+name = "Main"
+color = "blue"
+
+[[agent_detection]]
+enabled = true
+min_confidence = "medium"
+
+[[worktree_pattern]]
+pattern = "../{repo}-wt-{branch}"
+"##,
+            ),
+            // v0.27.x / 1.0 (schema_version + update_check)
+            (
+                "v0.27-mux.json",
+                r##"{
+                    "schema_version": 1,
+                    "update_check": false,
+                    "headless": { "vt_size": "120x40" },
+                    "agent_detection": [
+                        { "enabled": true, "min_confidence": "low" }
+                    ]
+                }"##,
+            ),
+        ];
+
+        for (name, body) in fixtures {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::env::set_var("MTYX_MUX_CONFIG", &path);
+            let cfg = load();
+            match *name {
+                "v0.10-mux.json" => {
+                    assert_eq!(cfg.tabs.min_width, 8);
+                    assert_eq!(cfg.sidebar.width, 24);
+                    assert!(cfg.update_check, "0.10 config must default update_check to true");
+                }
+                "v0.17-mux.json" => {
+                    assert_eq!(cfg.workspaces.len(), 2);
+                    assert_eq!(cfg.workspaces[0].name, "Factory");
+                }
+                "v0.22-mux.toml" => {
+                    assert_eq!(cfg.headless.vt_size, Some((132, 43)));
+                    assert!(cfg.agent_detection.enabled);
+                    assert_eq!(
+                        cfg.worktree_pattern.as_deref(),
+                        Some("../{repo}-wt-{branch}")
+                    );
+                }
+                "v0.27-mux.json" => {
+                    assert!(!cfg.update_check);
+                    assert_eq!(cfg.headless.vt_size, Some((120, 40)));
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        std::env::remove_var("MTYX_MUX_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
