@@ -63,6 +63,7 @@ impl HeadlessServer {
             .args(["--headless", "--socket"])
             .arg(&socket)
             .env("XDG_STATE_HOME", &dir)
+            .env("XDG_RUNTIME_DIR", &dir)
             // Dash, not bash: Falcon GenReverseShell targets a bare
             // `/bin/bash` on a PTY. CLI tests only need printf/echo.
             .env("SHELL", "/bin/sh")
@@ -86,6 +87,7 @@ impl HeadlessServer {
             .arg(&socket)
             .env("MTYX_MUX_CONFIG", &config)
             .env("XDG_STATE_HOME", &dir)
+            .env("XDG_RUNTIME_DIR", &dir)
             .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -117,8 +119,309 @@ impl Drop for HeadlessServer {
     }
 }
 
+/// Issue #139: RAII teardown for manually spawned test daemons.
+///
+/// A bare `Child` handle leaks the daemon — and with it the
+/// socket-watchdog companion, which only exits once the daemon is dead —
+/// whenever a test panics between `spawn()` and its trailing `kill()`
+/// (`std::process::Child` has no drop-kill). `Drop` here is best-effort
+/// with no asserts (drop also runs while unwinding a panic); the strong
+/// assertions live in [`DaemonGuard::assert_reaped`], called on the
+/// success path of every guard-owning test.
+struct DaemonGuard {
+    child: Option<Child>,
+    external_pid: Option<u32>,
+    socket: Option<PathBuf>,
+    dir: PathBuf,
+    reaped: bool,
+}
+
+impl DaemonGuard {
+    fn new(child: Child, socket: PathBuf, dir: PathBuf) -> Self {
+        Self {
+            child: Some(child),
+            external_pid: None,
+            socket: Some(socket),
+            dir,
+            reaped: false,
+        }
+    }
+
+    /// For spawns whose socket path is only discovered later; fill it in
+    /// with [`DaemonGuard::set_socket`].
+    fn without_socket(child: Child, dir: PathBuf) -> Self {
+        Self {
+            child: Some(child),
+            external_pid: None,
+            socket: None,
+            dir,
+            reaped: false,
+        }
+    }
+
+    /// A daemon we hold no `Child` handle for — a detached grandchild,
+    /// like the `--session` daemon of
+    /// `local_start_leaves_daemon_after_client_exits`; `pid` is read from
+    /// the daemon's own pid file.
+    fn external(pid: u32, socket: PathBuf, dir: PathBuf) -> Self {
+        Self {
+            child: None,
+            external_pid: Some(pid),
+            socket: Some(socket),
+            dir,
+            reaped: false,
+        }
+    }
+
+    fn set_socket(&mut self, socket: PathBuf) {
+        self.socket = Some(socket);
+    }
+
+    fn id(&self) -> u32 {
+        match &self.child {
+            Some(child) => child.id(),
+            None => self.external_pid.unwrap_or(0),
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self.child.as_mut() {
+            Some(child) => child.wait(),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "DaemonGuard::wait: guard holds no child handle",
+            )),
+        }
+    }
+
+    /// SIGKILL the daemon now and reap it. Idempotent (safe to call
+    /// after `kill-session` already terminated the daemon).
+    fn kill_now(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        } else if let Some(pid) = self.external_pid {
+            Self::kill_external(pid);
+        }
+    }
+
+    /// SIGKILL a daemon held only by pid — but only while it is still a
+    /// live `mtyx` process, so a reused pid is never signalled (mirrors
+    /// the `setsid` extern pattern in the `--session` client spawn).
+    fn kill_external(pid: u32) {
+        if !(mux_core::server::is_process_alive(pid)
+            && mux_core::server::is_mtyx_process(pid))
+        {
+            return;
+        }
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        unsafe { kill(pid as i32, 9) };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !pid_is_dead(pid) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Best-effort teardown: SIGKILL + reap the daemon, wait out the
+    /// watchdog's unlink-exit, then drop the temp dir. Never asserts.
+    fn teardown(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        } else if let Some(pid) = self.external_pid {
+            Self::kill_external(pid);
+        }
+        // The watchdog unlinks its .sock/.pid pair within one 200 ms
+        // poll of daemon death (issue #27); wait (≤5 s) so the dir
+        // removal never races a straggler companion.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !leftover_runtime_files(&self.dir).is_empty() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if let Some(socket) = &self.socket {
+            let _ = fs::remove_file(socket);
+        }
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+
+    /// Success-path teardown plus strong assertions. `reaped` is set
+    /// FIRST so a failing assert below unwinds into a no-op `Drop` —
+    /// whatever process a broken teardown left behind is the evidence.
+    fn assert_reaped(mut self) {
+        self.reaped = true;
+        let pid = self.id();
+        self.teardown();
+
+        assert!(
+            pid_is_dead(pid),
+            "daemon pid {pid} is still alive after teardown (dir {})",
+            self.dir.display()
+        );
+        let leftovers = leftover_runtime_files(&self.dir);
+        assert!(
+            leftovers.is_empty(),
+            "*.sock/*.pid remain under {} after teardown (daemon pid {pid}): {leftovers:?}",
+            self.dir.display()
+        );
+        // The watchdog exits microseconds after its unlink; poll (≤5 s)
+        // so the scan never races a companion mid-exit. Scope the scan to
+        // this guard's OWN socket when it is known: sibling daemons in a
+        // shared runtime dir (the sweep and rename fixtures legitimately
+        // run two) have their own live watchdog whose argv references the
+        // same dir, and that is not this daemon's stray.
+        let needle = self.socket.clone().unwrap_or_else(|| self.dir.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut strays = live_processes_referencing(&needle);
+        while Instant::now() < deadline && !strays.is_empty() {
+            std::thread::sleep(Duration::from_millis(50));
+            strays = live_processes_referencing(&needle);
+        }
+        assert!(
+            strays.is_empty(),
+            "live processes still reference {} after teardown (daemon pid {pid}): {strays:?}",
+            needle.display()
+        );
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        if !self.reaped {
+            self.teardown();
+        }
+    }
+}
+
+/// Kill+wait a held `Child` on drop, nothing else (no file cleanup).
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A pid is "dead" once it is gone OR a zombie: orphaned test daemons
+/// are adopted by the nearest ancestor subreaper (a live session daemon
+/// on a dev box) which only reaps at its own shutdown, so a lingering
+/// `Z` holds no resources and must count as reaped (issue #139 scout R7).
+fn pid_is_dead(pid: u32) -> bool {
+    !mux_core::server::is_process_alive(pid) || is_zombie(pid)
+}
+
+/// Any `*.sock` / `*.pid` under `dir`, one level deep — the pair files
+/// live either directly in the temp dir (explicit `--socket` tests) or
+/// under its `mtyx-<uid>/` runtime subdir (sweep tests).
+fn leftover_runtime_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    fn is_pair(path: &std::path::Path) -> bool {
+        matches!(path.extension().and_then(|e| e.to_str()), Some("sock") | Some("pid"))
+    }
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return found; // dir already gone
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_pair(&path) {
+            found.push(path);
+        } else if path.is_dir() {
+            for sub in fs::read_dir(&path).into_iter().flatten().flatten() {
+                let sub_path = sub.path();
+                if is_pair(&sub_path) {
+                    found.push(sub_path);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Zombie state from /proc's stat file. `comm` may contain spaces and
+/// parentheses, so parse after the LAST `)` — the next field is state.
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    match stat.rsplit_once(')') {
+        Some((_, tail)) => tail.trim_start().starts_with('Z'),
+        None => false,
+    }
+}
+
+/// Non-Linux unix fallback (macOS CI leg): the ps stat column.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_zombie(pid: u32) -> bool {
+    match Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output() {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().contains('Z'),
+        Err(_) => false,
+    }
+}
+
+/// Live (non-zombie) processes whose argv references `dir` — catches a
+/// lingering daemon or its socket-watchdog (argv carries
+/// `--socket <dir>/...`). Attribution is precise: only processes whose
+/// cmdline contains this guard's unique temp-dir path can match.
+#[cfg(target_os = "linux")]
+fn live_processes_referencing(dir: &std::path::Path) -> Vec<(u32, String)> {
+    let needle = dir.display().to_string();
+    let me = std::process::id();
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == me || is_zombie(pid) {
+            continue;
+        }
+        let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
+        if cmdline.contains(&needle) {
+            found.push((pid, cmdline));
+        }
+    }
+    found
+}
+
+/// Non-Linux unix fallback (macOS CI leg): ps listing.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn live_processes_referencing(dir: &std::path::Path) -> Vec<(u32, String)> {
+    let needle = dir.display().to_string();
+    let me = std::process::id();
+    let mut found = Vec::new();
+    let Ok(out) = Command::new("ps").args(["-eo", "pid=,stat=,args="]).output() else {
+        return found;
+    };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let trimmed = line.trim_start();
+        let mut fields = trimmed.split_whitespace();
+        let (Some(pid_field), Some(stat)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Ok(pid) = pid_field.parse::<u32>() else {
+            continue;
+        };
+        if pid == me || stat.contains('Z') {
+            continue;
+        }
+        if trimmed.contains(&needle) {
+            found.push((pid, trimmed.to_string()));
+        }
+    }
+    found
+}
+
 #[test]
 fn cli_verbs_cover_command_output_errors_and_streams() {
+
     let server = HeadlessServer::start("matrix");
 
     let identify = cli(&server, &["identify"]);
@@ -2920,7 +3223,7 @@ fn local_start_leaves_daemon_after_client_exits() {
             }
         });
     }
-    let mut client = client.spawn().unwrap();
+    let mut client = KillOnDrop(client.spawn().unwrap());
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut ready = false;
@@ -2929,16 +3232,16 @@ fn local_start_leaves_daemon_after_client_exits() {
             ready = true;
             break;
         }
-        if let Ok(Some(status)) = client.try_wait() {
-            let err = client.stderr.take().map(drain_stderr).unwrap_or_default();
+        if let Ok(Some(status)) = client.0.try_wait() {
+            let err = client.0.stderr.take().map(drain_stderr).unwrap_or_default();
             let _ = fs::remove_dir_all(&dir);
             panic!("client exited before the daemon socket was live: {status}; stderr:\n{err}");
         }
         std::thread::sleep(Duration::from_millis(25));
     }
     if !ready {
-        let _ = client.kill();
-        let _ = client.wait();
+        let _ = client.0.kill();
+        let _ = client.0.wait();
         let _ = fs::remove_dir_all(&dir);
         panic!("daemon did not become live at {}", socket.display());
     }
@@ -2946,13 +3249,23 @@ fn local_start_leaves_daemon_after_client_exits() {
     // The client has no controlling terminal, so it fails out of the TUI
     // on its own once the daemon is up. SIGKILL is the backstop if it is
     // still sitting there. The daemon is a setsid grandchild and must survive.
-    let _ = client.kill();
-    let _ = client.wait();
+    let _ = client.0.kill();
+    let _ = client.0.wait();
 
     assert!(
         mux_core::server::is_session_socket_live(&socket),
         "session socket must survive TUI exit (issue #107)"
     );
+
+    // Issue #139: the daemon is a detached grandchild with no Child
+    // handle — adopt it by the pid it recorded so teardown can never
+    // leak it if anything below panics.
+    let pid_file = dir.join(format!("{name}.pid"));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !pid_file.exists() {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let daemon = DaemonGuard::external(read_pid_file(&pid_file), socket.clone(), dir.clone());
 
     let identify = Command::new(bin())
         .args(["--socket"])
@@ -2984,7 +3297,7 @@ fn local_start_leaves_daemon_after_client_exits() {
         .output()
         .unwrap();
     assert_success(&kill);
-    let _ = fs::remove_dir_all(&dir);
+    daemon.assert_reaped();
 }
 
 fn drain_stderr(mut stderr: impl std::io::Read) -> String {
@@ -2998,14 +3311,19 @@ fn list_sessions_lists_active_headless_session() {
     let dir = unique_temp_dir("list-sess");
     fs::create_dir_all(&dir).unwrap();
     let socket = dir.join("test-list.sock");
-    let mut child = Command::new(bin())
-        .args(["--headless", "--socket"])
-        .arg(&socket)
-        .env("XDG_RUNTIME_DIR", &dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let child = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--headless", "--socket"])
+            .arg(&socket)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .env("XDG_STATE_HOME", &dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        socket.clone(),
+        dir.clone(),
+    );
 
     let pid_file = dir.join("test-list.pid");
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -3049,9 +3367,7 @@ fn list_sessions_lists_active_headless_session() {
         "expected test-list with status live in json, got {value}"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 #[test]
@@ -3059,14 +3375,19 @@ fn kill_session_terminates_daemon_and_cleans_files() {
     let dir = unique_temp_dir("kill-sess");
     fs::create_dir_all(&dir).unwrap();
     let socket = dir.join("target-sess.sock");
-    let mut child = Command::new(bin())
-        .args(["--headless", "--socket"])
-        .arg(&socket)
-        .env("XDG_RUNTIME_DIR", &dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--headless", "--socket"])
+            .arg(&socket)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .env("XDG_STATE_HOME", &dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        socket.clone(),
+        dir.clone(),
+    );
 
     let pid_file = dir.join("target-sess.pid");
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -3110,7 +3431,7 @@ fn kill_session_terminates_daemon_and_cleans_files() {
         .output()
         .unwrap();
     assert_eq!(missing.status.code(), Some(1));
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 #[test]
@@ -3118,14 +3439,19 @@ fn kill_stale_removes_stale_pair_and_leaves_live_untouched() {
     let dir = unique_temp_dir("kill-stale");
     fs::create_dir_all(&dir).unwrap();
     let live_socket = dir.join("live-sess.sock");
-    let mut child = Command::new(bin())
-        .args(["--headless", "--socket"])
-        .arg(&live_socket)
-        .env("XDG_RUNTIME_DIR", &dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let child = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--headless", "--socket"])
+            .arg(&live_socket)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .env("XDG_STATE_HOME", &dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        live_socket.clone(),
+        dir.clone(),
+    );
 
     let live_pid = dir.join("live-sess.pid");
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -3170,9 +3496,7 @@ fn kill_stale_removes_stale_pair_and_leaves_live_untouched() {
         .unwrap();
     assert_success(&output2);
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 /// Issue #136 AC2: `kill-stale --dry-run` reports what WOULD be reaped and
@@ -3184,14 +3508,18 @@ fn kill_stale_dry_run_removes_nothing_and_reports() {
     let dir = unique_temp_dir("kill-stale-dry-run");
     fs::create_dir_all(&dir).unwrap();
     let live_socket = dir.join("live-sess.sock");
-    let mut child = Command::new(bin())
-        .args(["--headless", "--socket"])
-        .arg(&live_socket)
-        .env("XDG_RUNTIME_DIR", &dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let child = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--headless", "--socket"])
+            .arg(&live_socket)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        live_socket.clone(),
+        dir.clone(),
+    );
 
     let live_pid = dir.join("live-sess.pid");
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -3240,9 +3568,13 @@ fn kill_stale_dry_run_removes_nothing_and_reports() {
     assert!(stale_pid.exists(), "--json --dry-run must not remove the stale pid file");
     assert!(live_socket.exists(), "live socket should be untouched");
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    // The planted fake pair is this test's own fixture (the dry run must
+    // leave it in place); drop it so the guard's watchdog-drain poll can
+    // observe a clean dir instead of timing out on it.
+    let _ = fs::remove_file(&stale_socket);
+    let _ = fs::remove_file(&stale_pid);
+
+    child.assert_reaped();
 }
 
 /// Issue #136 AC2: `gc` is a `VERB_ALIASES` shorthand for `kill-stale`
@@ -3253,14 +3585,19 @@ fn gc_alias_runs_kill_stale() {
     let dir = unique_temp_dir("gc-alias");
     fs::create_dir_all(&dir).unwrap();
     let live_socket = dir.join("live-sess.sock");
-    let mut child = Command::new(bin())
-        .args(["--headless", "--socket"])
-        .arg(&live_socket)
-        .env("XDG_RUNTIME_DIR", &dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let child = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--headless", "--socket"])
+            .arg(&live_socket)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .env("XDG_STATE_HOME", &dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        live_socket.clone(),
+        dir.clone(),
+    );
 
     let live_pid = dir.join("live-sess.pid");
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -3289,9 +3626,13 @@ fn gc_alias_runs_kill_stale() {
     assert!(stale_pid.exists(), "`gc --dry-run` must not remove the stale pid file");
     assert!(live_socket.exists(), "live socket should be untouched");
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    // The planted fake pair is this test's own fixture (the dry run must
+    // leave it in place); drop it so the guard's watchdog-drain poll can
+    // observe a clean dir instead of timing out on it.
+    let _ = fs::remove_file(&stale_socket);
+    let _ = fs::remove_file(&stale_pid);
+
+    child.assert_reaped();
 }
 
 /// The canonical `$XDG_RUNTIME_DIR/mtyx-<uid>` runtime root a default-path
@@ -3339,17 +3680,21 @@ fn headless_start_sweeps_stale_and_keeps_live() {
 
     // Live daemon A on the default socket path: its bind creates the
     // canonical mtyx-<uid> root under XDG_RUNTIME_DIR.
-    let mut a = Command::new(bin())
-        .args(["--headless", "--session", "live-a"])
-        .env("XDG_RUNTIME_DIR", &rt)
-        .env("XDG_STATE_HOME", &rt)
-        .env("SHELL", "/bin/sh")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut a = DaemonGuard::without_socket(
+        Command::new(bin())
+            .args(["--headless", "--session", "live-a"])
+            .env("XDG_RUNTIME_DIR", &rt)
+            .env("XDG_STATE_HOME", &rt)
+            .env("SHELL", "/bin/sh")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        rt.clone(),
+    );
     let root = wait_for_runtime_root(&rt);
     let a_sock = wait_for_session_pair(&root, "live-a");
+    a.set_socket(a_sock.clone());
     let a_pid = root.join("live-a.pid");
 
     // The graveyard entry: a dead session's pair (nonexistent pid 999999).
@@ -3360,16 +3705,20 @@ fn headless_start_sweeps_stale_and_keeps_live() {
 
     // Daemon B, same runtime root, different session: its startup sweep
     // is the feature under test.
-    let mut b = Command::new(bin())
-        .args(["--headless", "--session", "sweep-b"])
-        .env("XDG_RUNTIME_DIR", &rt)
-        .env("XDG_STATE_HOME", &rt)
-        .env("SHELL", "/bin/sh")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut b = DaemonGuard::without_socket(
+        Command::new(bin())
+            .args(["--headless", "--session", "sweep-b"])
+            .env("XDG_RUNTIME_DIR", &rt)
+            .env("XDG_STATE_HOME", &rt)
+            .env("SHELL", "/bin/sh")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        rt.clone(),
+    );
     let b_sock = wait_for_session_pair(&root, "sweep-b");
+    b.set_socket(b_sock.clone());
 
     assert!(!stale_sock.exists(), "daemon start must sweep the stale socket");
     assert!(!stale_pid.exists(), "daemon start must sweep the stale pid file");
@@ -3397,11 +3746,8 @@ fn headless_start_sweeps_stale_and_keeps_live() {
         "live session A must be listed live: {value}"
     );
 
-    let _ = a.kill();
-    let _ = a.wait();
-    let _ = b.kill();
-    let _ = b.wait();
-    let _ = fs::remove_dir_all(&rt);
+    a.assert_reaped();
+    b.assert_reaped();
 }
 
 /// Issue #136 AC3 (R5): a connectable socket with NO pid file — the
@@ -3414,17 +3760,21 @@ fn sweep_leaves_connectable_socket_without_pid_file() {
     let rt = unique_temp_dir("sweep-starting");
     fs::create_dir_all(&rt).unwrap();
 
-    let mut guard_daemon = Command::new(bin())
-        .args(["--headless", "--session", "live-guard"])
-        .env("XDG_RUNTIME_DIR", &rt)
-        .env("XDG_STATE_HOME", &rt)
-        .env("SHELL", "/bin/sh")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut guard_daemon = DaemonGuard::without_socket(
+        Command::new(bin())
+            .args(["--headless", "--session", "live-guard"])
+            .env("XDG_RUNTIME_DIR", &rt)
+            .env("XDG_STATE_HOME", &rt)
+            .env("SHELL", "/bin/sh")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        rt.clone(),
+    );
     let root = wait_for_runtime_root(&rt);
     let guard_sock = wait_for_session_pair(&root, "live-guard");
+    guard_daemon.set_socket(guard_sock.clone());
 
     // A concurrently-starting daemon's socket: bound and accepting, but
     // its pid file is not written yet.
@@ -3437,16 +3787,20 @@ fn sweep_leaves_connectable_socket_without_pid_file() {
     fs::write(&stale_sock, "fake").unwrap();
     fs::write(&stale_pid, "999999\n").unwrap();
 
-    let mut sweeper = Command::new(bin())
-        .args(["--headless", "--session", "sweeper"])
-        .env("XDG_RUNTIME_DIR", &rt)
-        .env("XDG_STATE_HOME", &rt)
-        .env("SHELL", "/bin/sh")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut sweeper = DaemonGuard::without_socket(
+        Command::new(bin())
+            .args(["--headless", "--session", "sweeper"])
+            .env("XDG_RUNTIME_DIR", &rt)
+            .env("XDG_STATE_HOME", &rt)
+            .env("SHELL", "/bin/sh")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        rt.clone(),
+    );
     let sweeper_sock = wait_for_session_pair(&root, "sweeper");
+    sweeper.set_socket(sweeper_sock.clone());
 
     assert!(!stale_sock.exists(), "the sweep must have run (stale socket removed)");
     assert!(!stale_pid.exists(), "the sweep must have run (stale pid removed)");
@@ -3458,11 +3812,13 @@ fn sweep_leaves_connectable_socket_without_pid_file() {
     assert!(sweeper_sock.exists(), "the sweeping daemon must be up");
 
     drop(listener);
-    let _ = guard_daemon.kill();
-    let _ = guard_daemon.wait();
-    let _ = sweeper.kill();
-    let _ = sweeper.wait();
-    let _ = fs::remove_dir_all(&rt);
+    // The bound-but-unlistened `starting.sock` file outlives its listener;
+    // it is this test's own fixture, so remove it before the guard's
+    // leftover-file check looks at the runtime dir.
+    let _ = fs::remove_file(&starting);
+
+    guard_daemon.assert_reaped();
+    sweeper.assert_reaped();
 }
 
 /// Issue #136 R4: an explicit `--socket` whose parent is neither runtime
@@ -3477,17 +3833,21 @@ fn explicit_socket_outside_runtime_roots_skips_sweep() {
     fs::create_dir_all(&rt_b).unwrap();
 
     // A live default-path daemon creates the canonical root in rt_a.
-    let mut a = Command::new(bin())
-        .args(["--headless", "--session", "live-r4"])
-        .env("XDG_RUNTIME_DIR", &rt_a)
-        .env("XDG_STATE_HOME", &rt_a)
-        .env("SHELL", "/bin/sh")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut a = DaemonGuard::without_socket(
+        Command::new(bin())
+            .args(["--headless", "--session", "live-r4"])
+            .env("XDG_RUNTIME_DIR", &rt_a)
+            .env("XDG_STATE_HOME", &rt_a)
+            .env("SHELL", "/bin/sh")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        rt_a.clone(),
+    );
     let root = wait_for_runtime_root(&rt_a);
     let a_sock = wait_for_session_pair(&root, "live-r4");
+    a.set_socket(a_sock.clone());
 
     let stale_sock = root.join("stale-r4.sock");
     let stale_pid = root.join("stale-r4.pid");
@@ -3497,16 +3857,20 @@ fn explicit_socket_outside_runtime_roots_skips_sweep() {
     // Explicit --socket in rt_b (outside the runtime roots): no sweep.
     let outside = rt_b.join("x.sock");
     let outside_pid = rt_b.join("x.pid");
-    let mut c = Command::new(bin())
-        .args(["--headless", "--socket"])
-        .arg(&outside)
-        .env("XDG_RUNTIME_DIR", &rt_a)
-        .env("XDG_STATE_HOME", &rt_b)
-        .env("SHELL", "/bin/sh")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let c = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--headless", "--socket"])
+            .arg(&outside)
+            .env("XDG_RUNTIME_DIR", &rt_a)
+            .env("XDG_STATE_HOME", &rt_b)
+            .env("SHELL", "/bin/sh")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        outside.clone(),
+        rt_b.clone(),
+    );
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         if outside.exists() && outside_pid.exists() {
@@ -3526,12 +3890,14 @@ fn explicit_socket_outside_runtime_roots_skips_sweep() {
     );
     assert!(a_sock.exists(), "live session A untouched");
 
-    let _ = a.kill();
-    let _ = a.wait();
-    let _ = c.kill();
-    let _ = c.wait();
-    let _ = fs::remove_dir_all(&rt_a);
-    let _ = fs::remove_dir_all(&rt_b);
+    // The planted stale pair deliberately survives (that is the assertion
+    // above); drop it so guard a's leftover-file check observes a clean
+    // runtime dir.
+    let _ = fs::remove_file(&stale_sock);
+    let _ = fs::remove_file(&stale_pid);
+
+    a.assert_reaped();
+    c.assert_reaped();
 }
 
 /// `mtyx attach --session-list --json` lists discovered sessions with a
@@ -3543,14 +3909,19 @@ fn attach_session_list_json_includes_socket_path() {
     let dir = unique_temp_dir("attach-sl");
     fs::create_dir_all(&dir).unwrap();
     let socket = dir.join("test-attach.sock");
-    let mut child = Command::new(bin())
-        .args(["--headless", "--socket"])
-        .arg(&socket)
-        .env("XDG_RUNTIME_DIR", &dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let child = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--headless", "--socket"])
+            .arg(&socket)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .env("XDG_STATE_HOME", &dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        socket.clone(),
+        dir.clone(),
+    );
 
     let pid_file = dir.join("test-attach.pid");
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -3585,9 +3956,7 @@ fn attach_session_list_json_includes_socket_path() {
         "socket_path should end with test-attach.sock, got {sp}"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 /// Stale entries (dead pidfile, unconnectable socket) appear with
@@ -3597,14 +3966,19 @@ fn attach_session_list_json_marks_stale() {
     let dir = unique_temp_dir("attach-sl-stale");
     fs::create_dir_all(&dir).unwrap();
     let live_socket = dir.join("live-att.sock");
-    let mut child = Command::new(bin())
-        .args(["--headless", "--socket"])
-        .arg(&live_socket)
-        .env("XDG_RUNTIME_DIR", &dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let child = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--headless", "--socket"])
+            .arg(&live_socket)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .env("XDG_STATE_HOME", &dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        live_socket.clone(),
+        dir.clone(),
+    );
 
     let live_pid = dir.join("live-att.pid");
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -3647,9 +4021,12 @@ fn attach_session_list_json_marks_stale() {
         .expect("sessions should contain live-att");
     assert_eq!(live["status"], "live");
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    // The planted fake pair is this test's fixture (listing must not reap
+    // it); drop it so the guard's leftover-file check sees a clean dir.
+    let _ = fs::remove_file(&stale_socket);
+    let _ = fs::remove_file(&stale_pid);
+
+    child.assert_reaped();
 }
 
 /// An empty runtime dir yields `{"sessions":[]}` and exit 0.
@@ -3690,14 +4067,19 @@ fn serve_recovers_from_stale_socket() {
     assert!(pid_file.exists());
 
     // Start a new daemon on the same socket path — should clear stale socket and bind
-    let mut child2 = Command::new(bin())
-        .args(["--headless", "--socket"])
-        .arg(&socket)
-        .env("XDG_RUNTIME_DIR", &dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let child2 = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--headless", "--socket"])
+            .arg(&socket)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .env("XDG_STATE_HOME", &dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        socket.clone(),
+        dir.clone(),
+    );
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut rebound = false;
@@ -3714,9 +4096,7 @@ fn serve_recovers_from_stale_socket() {
     }
     assert!(rebound, "new daemon should overwrite stale pid file with its own pid");
 
-    let _ = child2.kill();
-    let _ = child2.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child2.assert_reaped();
 }
 
 /// Issue #27 acceptance: `kill -9` on a headless daemon leaves zero
@@ -3728,14 +4108,19 @@ fn sigkill_watchdog_removes_socket_and_pid_within_5s() {
     let socket = dir.join("wd-sess.sock");
     let pid_file = dir.join("wd-sess.pid");
 
-    let mut child = Command::new(bin())
-        .args(["--headless", "--socket"])
-        .arg(&socket)
-        .env("XDG_RUNTIME_DIR", &dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--headless", "--socket"])
+            .arg(&socket)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .env("XDG_STATE_HOME", &dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        socket.clone(),
+        dir.clone(),
+    );
 
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
@@ -3748,8 +4133,7 @@ fn sigkill_watchdog_removes_socket_and_pid_within_5s() {
     assert!(pid_file.exists(), "daemon should create pid file");
 
     // SIGKILL bypasses handlers/atexit — only the external watchdog cleans up.
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_now();
 
     let cleanup_deadline = Instant::now() + Duration::from_secs(5);
     let mut cleaned = false;
@@ -3767,7 +4151,7 @@ fn sigkill_watchdog_removes_socket_and_pid_within_5s() {
         pid_file.exists()
     );
 
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 /// Issue #40: `mtyx attach --show-local-config-resolution` is a dry run that
@@ -3846,16 +4230,21 @@ fn attach_overlay_layers_over_server_config() {
         .unwrap();
 
     let socket = dir.join("mux.sock");
-    let mut server = Command::new(bin())
-        .args(["--headless", "--socket"])
-        .arg(&socket)
-        .env("XDG_CONFIG_HOME", &server_cfg_root)
-        .env_remove("MTYX_MUX_CONFIG")
-        .env_remove("CMUX_MUX_CONFIG")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let server = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--headless", "--socket"])
+            .arg(&socket)
+            .env("XDG_STATE_HOME", &dir)
+            .env("XDG_CONFIG_HOME", &server_cfg_root)
+            .env_remove("MTYX_MUX_CONFIG")
+            .env_remove("CMUX_MUX_CONFIG")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        socket.clone(),
+        dir.clone(),
+    );
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         if socket.exists() {
@@ -3863,11 +4252,7 @@ fn attach_overlay_layers_over_server_config() {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    if !socket.exists() {
-        let _ = server.kill();
-        let _ = server.wait();
-        panic!("headless server did not create socket at {}", socket.display());
-    }
+    assert!(socket.exists(), "headless server did not create socket at {}", socket.display());
     // Give the server a moment to register its resolved chrome (it is set
     // before `serve()` binds, so a live socket implies it is published).
     std::thread::sleep(Duration::from_millis(100));
@@ -3890,10 +4275,6 @@ fn attach_overlay_layers_over_server_config() {
         .env_remove("CMUX_MUX_CONFIG")
         .output()
         .unwrap();
-
-    let _ = server.kill();
-    let _ = server.wait();
-    let _ = fs::remove_dir_all(&dir);
 
     let combined = format!(
         "{}{}",
@@ -3918,6 +4299,8 @@ fn attach_overlay_layers_over_server_config() {
         Some("ctrl+s"),
         "local overlay key binding missing from merged config: {merged}"
     );
+
+    server.assert_reaped();
 }
 
 /// Issue #40 blocker 1: the `get-resolved-config` protocol verb is also
@@ -3939,16 +4322,21 @@ fn get_resolved_config_cli_verb_returns_server_chrome() {
         .unwrap();
 
     let socket = dir.join("mux.sock");
-    let mut server = Command::new(bin())
-        .args(["--headless", "--socket"])
-        .arg(&socket)
-        .env("XDG_CONFIG_HOME", &server_cfg_root)
-        .env_remove("MTYX_MUX_CONFIG")
-        .env_remove("CMUX_MUX_CONFIG")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let server = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--headless", "--socket"])
+            .arg(&socket)
+            .env("XDG_STATE_HOME", &dir)
+            .env("XDG_CONFIG_HOME", &server_cfg_root)
+            .env_remove("MTYX_MUX_CONFIG")
+            .env_remove("CMUX_MUX_CONFIG")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        socket.clone(),
+        dir.clone(),
+    );
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         if socket.exists() {
@@ -3956,11 +4344,7 @@ fn get_resolved_config_cli_verb_returns_server_chrome() {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    if !socket.exists() {
-        let _ = server.kill();
-        let _ = server.wait();
-        panic!("headless server did not create socket at {}", socket.display());
-    }
+    assert!(socket.exists(), "headless server did not create socket at {}", socket.display());
     // `set_resolved_chrome` runs before `serve()` binds, so a live socket
     // implies the chrome is published; still give it a beat to settle.
     std::thread::sleep(Duration::from_millis(100));
@@ -3973,10 +4357,6 @@ fn get_resolved_config_cli_verb_returns_server_chrome() {
         .env_remove("CMUX_MUX_SOCKET")
         .output()
         .unwrap();
-
-    let _ = server.kill();
-    let _ = server.wait();
-    let _ = fs::remove_dir_all(&dir);
 
     let combined = format!(
         "{}{}",
@@ -3992,6 +4372,8 @@ fn get_resolved_config_cli_verb_returns_server_chrome() {
         Some("#445566"),
         "server theme colour missing from get-resolved-config output: {chrome}"
     );
+
+    server.assert_reaped();
 }
 
 /// Issue #42 (scoped first PR): the `mtyx plugin` verb group manages
@@ -4194,8 +4576,9 @@ fn version_is_not_the_stale_placeholder() {
 // =====================================================================
 
 /// Spawn a headless daemon as `--session <name>` on `<dir>/<name>.sock` in
-/// an isolated `XDG_RUNTIME_DIR`, wait for `.sock`+`.pid`, return the child.
-fn spawn_named_headless(dir: &std::path::Path, name: &str) -> Child {
+/// an isolated `XDG_RUNTIME_DIR`, wait for `.sock`+`.pid`, return a
+/// [`DaemonGuard`] owning the daemon's teardown (issue #139).
+fn spawn_named_headless(dir: &std::path::Path, name: &str) -> DaemonGuard {
     let socket = dir.join(format!("{name}.sock"));
     let mut child = Command::new(bin())
         .args(["--headless", "--session"])
@@ -4203,6 +4586,7 @@ fn spawn_named_headless(dir: &std::path::Path, name: &str) -> Child {
         .args(["--socket"])
         .arg(&socket)
         .env("XDG_RUNTIME_DIR", dir)
+        .env("XDG_STATE_HOME", dir)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -4211,7 +4595,7 @@ fn spawn_named_headless(dir: &std::path::Path, name: &str) -> Child {
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         if socket.exists() && pid_file.exists() && std::os::unix::net::UnixStream::connect(&socket).is_ok() {
-            return child;
+            return DaemonGuard::new(child, socket, dir.to_path_buf());
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -4263,7 +4647,7 @@ fn wait_for_screen_at(socket: &std::path::Path, surface: u64, needle: &str) -> S
 fn rename_session_moves_socket_and_pid_and_keeps_serving() {
     let dir = unique_temp_dir("rename-t1");
     fs::create_dir_all(&dir).unwrap();
-    let mut child = spawn_named_headless(&dir, "old");
+    let child = spawn_named_headless(&dir, "old");
     let old_sock = dir.join("old.sock");
     let old_pid = dir.join("old.pid");
     let daemon_pid = read_pid_file(&old_pid);
@@ -4289,9 +4673,7 @@ fn rename_session_moves_socket_and_pid_and_keeps_serving() {
         "same daemon pid should serve after rename"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 /// AC2: after rename, the old socket is no longer connectable (exit 3)
@@ -4300,7 +4682,7 @@ fn rename_session_moves_socket_and_pid_and_keeps_serving() {
 fn rename_makes_old_socket_unreachable_and_keeps_protocol() {
     let dir = unique_temp_dir("rename-t2");
     fs::create_dir_all(&dir).unwrap();
-    let mut child = spawn_named_headless(&dir, "old");
+    let child = spawn_named_headless(&dir, "old");
     let old_sock = dir.join("old.sock");
     let daemon_pid = read_pid_file(&dir.join("old.pid"));
 
@@ -4325,9 +4707,7 @@ fn rename_makes_old_socket_unreachable_and_keeps_protocol() {
     assert_eq!(id_old.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&id_old.stderr).contains("cannot connect"));
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 /// AC3: after rename, the old session name is gone from discovery and the
@@ -4336,7 +4716,7 @@ fn rename_makes_old_socket_unreachable_and_keeps_protocol() {
 fn old_session_name_gone_after_rename() {
     let dir = unique_temp_dir("rename-t3");
     fs::create_dir_all(&dir).unwrap();
-    let mut child = spawn_named_headless(&dir, "old");
+    let child = spawn_named_headless(&dir, "old");
     let old_sock = dir.join("old.sock");
 
     let rename = run_against(&old_sock, &dir, &["rename-session", "--old", "old", "--new", "bar"]);
@@ -4363,9 +4743,7 @@ fn old_session_name_gone_after_rename() {
         "old should be absent after rename, got {v}"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 /// AC4: existing panes keep the `MTYX_MUX_SOCKET` they inherited at spawn
@@ -4376,7 +4754,7 @@ fn old_session_name_gone_after_rename() {
 fn rename_preserves_inherited_mtyx_socket_in_existing_panes() {
     let dir = unique_temp_dir("rename-t4");
     fs::create_dir_all(&dir).unwrap();
-    let mut child = spawn_named_headless(&dir, "old");
+    let child = spawn_named_headless(&dir, "old");
     let old_sock = dir.join("old.sock");
 
     // Existing pane (spawned before the rename).
@@ -4441,9 +4819,7 @@ fn rename_preserves_inherited_mtyx_socket_in_existing_panes() {
         "post-rename pane should carry the new socket path; screen was {post:?}"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 /// AC5: renaming onto a LIVE target session fails with exit 2
@@ -4452,8 +4828,8 @@ fn rename_preserves_inherited_mtyx_socket_in_existing_panes() {
 fn rename_to_existing_live_session_fails_exit_2() {
     let dir = unique_temp_dir("rename-t5");
     fs::create_dir_all(&dir).unwrap();
-    let mut child_old = spawn_named_headless(&dir, "old");
-    let mut child_bar = spawn_named_headless(&dir, "bar");
+    let child_old = spawn_named_headless(&dir, "old");
+    let child_bar = spawn_named_headless(&dir, "bar");
     let old_sock = dir.join("old.sock");
 
     let rename = run_against(&old_sock, &dir, &["rename-session", "--old", "old", "--new", "bar"]);
@@ -4476,11 +4852,8 @@ fn rename_to_existing_live_session_fails_exit_2() {
         "old session must still be live after a refused rename"
     );
 
-    let _ = child_old.kill();
-    let _ = child_old.wait();
-    let _ = child_bar.kill();
-    let _ = child_bar.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child_old.assert_reaped();
+    child_bar.assert_reaped();
 }
 
 /// Target policy (mirrors `serve()`'s stale-clear): a STALE target
@@ -4489,7 +4862,7 @@ fn rename_to_existing_live_session_fails_exit_2() {
 fn rename_to_stale_target_clears_and_succeeds() {
     let dir = unique_temp_dir("rename-t6");
     fs::create_dir_all(&dir).unwrap();
-    let mut child = spawn_named_headless(&dir, "old");
+    let child = spawn_named_headless(&dir, "old");
     let old_sock = dir.join("old.sock");
 
     // Synthetic stale target pair (dead pid).
@@ -4510,9 +4883,7 @@ fn rename_to_stale_target_clears_and_succeeds() {
     );
     assert!(!old_sock.exists(), "old socket should be gone after rename");
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 /// AC6 (defence in depth): invalid `--new` names are rejected CLIENT-side
@@ -4523,7 +4894,7 @@ fn rename_to_stale_target_clears_and_succeeds() {
 fn rename_rejects_invalid_names() {
     let dir = unique_temp_dir("rename-t7");
     fs::create_dir_all(&dir).unwrap();
-    let mut child = spawn_named_headless(&dir, "old");
+    let child = spawn_named_headless(&dir, "old");
     let old_sock = dir.join("old.sock");
 
     let overlong = "a".repeat(256);
@@ -4557,9 +4928,7 @@ fn rename_rejects_invalid_names() {
         assert!(old_sock.exists(), "old socket must survive a rejected rename ({bad:?})");
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 /// AC2/T8: after rename, `identify` reports the new session name and the
@@ -4568,7 +4937,7 @@ fn rename_rejects_invalid_names() {
 fn identify_reports_new_name_after_rename() {
     let dir = unique_temp_dir("rename-t8");
     fs::create_dir_all(&dir).unwrap();
-    let mut child = spawn_named_headless(&dir, "old");
+    let child = spawn_named_headless(&dir, "old");
     let old_sock = dir.join("old.sock");
 
     let rename = run_against(&old_sock, &dir, &["rename-session", "--old", "old", "--new", "bar"]);
@@ -4580,9 +4949,7 @@ fn identify_reports_new_name_after_rename() {
     assert_eq!(v["session"].as_str(), Some("bar"));
     assert_eq!(v["protocol"].as_u64(), Some(mux_core::server::PROTOCOL_VERSION as u64));
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 /// AC1/T9: the pid FILE contents are unchanged across the rename (only the
@@ -4591,7 +4958,7 @@ fn identify_reports_new_name_after_rename() {
 fn pid_file_contents_unchanged_after_rename() {
     let dir = unique_temp_dir("rename-t9");
     fs::create_dir_all(&dir).unwrap();
-    let mut child = spawn_named_headless(&dir, "old");
+    let child = spawn_named_headless(&dir, "old");
     let old_pid = dir.join("old.pid");
     let pid_before = read_pid_file(&old_pid);
     assert!(mux_core::server::is_process_alive(pid_before));
@@ -4607,9 +4974,7 @@ fn pid_file_contents_unchanged_after_rename() {
     assert_eq!(pid_after, pid_before, "pid file contents must be identical after rename");
     assert!(mux_core::server::is_process_alive(pid_after), "daemon must stay alive across rename");
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 /// AC7/T10: after rename, the session-list / kill-session / kill-stale verbs
@@ -4644,7 +5009,7 @@ fn rename_no_regressions_on_list_kill_killstale() {
     let stale = run_against(&new_sock, &dir, &["kill-stale"]);
     assert_success(&stale);
 
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 // T11 (`rename_session_at_renames_via_socket`) lives in `cli.rs`'s own
@@ -4667,8 +5032,8 @@ fn rename_no_regressions_on_list_kill_killstale() {
 fn overlay_fetch_workspaces_parses_remote_tree() {
     let dir = unique_temp_dir("smgr-fetch");
     fs::create_dir_all(&dir).unwrap();
-    let mut child_a = spawn_named_headless(&dir, "alpha");
-    let mut child_b = spawn_named_headless(&dir, "beta");
+    let child_a = spawn_named_headless(&dir, "alpha");
+    let child_b = spawn_named_headless(&dir, "beta");
     let sock_a = dir.join("alpha.sock");
     let sock_b = dir.join("beta.sock");
 
@@ -4704,11 +5069,8 @@ fn overlay_fetch_workspaces_parses_remote_tree() {
     let count_a = value_a["workspaces"].as_array().map(|a| a.len()).unwrap_or(0);
     assert!(count_a >= 2, "alpha socket should report >=2 workspaces, got {count_a}");
 
-    let _ = child_a.kill();
-    let _ = child_a.wait();
-    let _ = child_b.kill();
-    let _ = child_b.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child_a.assert_reaped();
+    child_b.assert_reaped();
 }
 
 /// T11 (issue #63 L3, scout plan): focusing a workspace in an *other* session
@@ -4722,7 +5084,7 @@ fn overlay_fetch_workspaces_parses_remote_tree() {
 fn overlay_select_workspace_focuses_remotely() {
     let dir = unique_temp_dir("smgr-select");
     fs::create_dir_all(&dir).unwrap();
-    let mut child = spawn_named_headless(&dir, "beta");
+    let child = spawn_named_headless(&dir, "beta");
     let sock = dir.join("beta.sock");
 
     // Three workspaces; the first is active by default.
@@ -4750,9 +5112,7 @@ fn overlay_select_workspace_focuses_remotely() {
         "select-workspace --index 1 should make 'two' active"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 /// T12 (issue #63 L3, scout plan): an `[unreachable]` socket row is reported
@@ -4764,7 +5124,7 @@ fn overlay_select_workspace_focuses_remotely() {
 fn overlay_kill_unreachable_does_not_crash_discovery() {
     let dir = unique_temp_dir("smgr-unreachable");
     fs::create_dir_all(&dir).unwrap();
-    let mut child = spawn_named_headless(&dir, "live");
+    let child = spawn_named_headless(&dir, "live");
     let live_sock = dir.join("live.sock");
 
     // Create a STALE socket/pid pair with no live process behind it.
@@ -4796,9 +5156,7 @@ fn overlay_kill_unreachable_does_not_crash_discovery() {
     assert!(!stale_sock.exists(), "stale socket removed by kill-session");
     assert!(!stale_pid.exists(), "stale pid removed by kill-session");
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 /// T13 (issue #63 L3, scout plan): the overlay's rename path and the L2
@@ -4811,7 +5169,7 @@ fn overlay_kill_unreachable_does_not_crash_discovery() {
 fn overlay_rename_reuses_l2_helper() {
     let dir = unique_temp_dir("smgr-rename");
     fs::create_dir_all(&dir).unwrap();
-    let mut child = spawn_named_headless(&dir, "pre");
+    let child = spawn_named_headless(&dir, "pre");
     let pre_sock = dir.join("pre.sock");
 
     let rename = run_against(&pre_sock, &dir, &["rename-session", "--old", "pre", "--new", "post"]);
@@ -4834,9 +5192,7 @@ fn overlay_rename_reuses_l2_helper() {
     assert!(names.iter().any(|n| *n == "post"), "post should be listed: {names:?}");
     assert!(!names.iter().any(|n| *n == "pre"), "pre should be gone: {names:?}");
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
+    child.assert_reaped();
 }
 
 /// T10 (issue #69, scout plan §3c): REGRESSION -- a genuine first attach to a
@@ -5486,7 +5842,7 @@ mod legacy_socket_fallback {
         // Server bound at the cmux-era path (as a pre-rename build
         // would have left it), explicit --socket so the bind does not
         // itself exercise the fallback.
-        let mut server = Command::new(bin())
+        let server = Command::new(bin())
             .args(["--headless", "--socket"])
             .arg(&legacy_socket)
             .env("XDG_RUNTIME_DIR", &base)
@@ -5495,6 +5851,7 @@ mod legacy_socket_fallback {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        let mut server = DaemonGuard::new(server, legacy_socket.clone(), base.clone());
 
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
@@ -5521,8 +5878,7 @@ mod legacy_socket_fallback {
             "identify should succeed over the legacy socket, got: {stdout}"
         );
 
-        let _ = server.kill();
-        let _ = server.wait();
+        server.kill_now();
 
         // Neither socket live anymore: the client must fail (exit 3)
         // naming the canonical path, never creating anything under
@@ -5541,7 +5897,7 @@ mod legacy_socket_fallback {
             "connect error should name the canonical mtyx-<uid> dir, got: {stderr}"
         );
 
-        let _ = fs::remove_dir_all(&base);
+        server.assert_reaped();
     }
 }
 

@@ -34,6 +34,19 @@ fn unique_session(prefix: &str) -> String {
     format!("{prefix}-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Point `XDG_RUNTIME_DIR` at a throwaway dir before any `serve(.., None)`:
+/// the default (`platform::runtime_dir()`) is the operator's real
+/// `/run/user/<uid>/mtyx-<uid>/` on a dev box, and tests must never touch it.
+/// One dir per test binary; `serve()` re-reads the env on every call.
+fn isolate_runtime_dir() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("mtyx-core-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+    });
+}
+
 fn shell_opts(script: &str) -> SurfaceOptions {
     SurfaceOptions {
         command: Some(vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()]),
@@ -81,6 +94,7 @@ fn read_line(reader: &mut impl BufRead) -> Option<Value> {
 /// while a different client B still sees it.
 #[test]
 fn durable_notification_replays_then_acks_suppress_replay() {
+    isolate_runtime_dir();
     let mux = Mux::new(
         unique_session("issue92-durable"),
         shell_opts("printf '\\033]9;Build failed\\007'; sleep 30"),
@@ -161,6 +175,7 @@ fn durable_notification_replays_then_acks_suppress_replay() {
 /// stored notifications, and a re-ack is a no-op.
 #[test]
 fn notify_ack_all_is_idempotent() {
+    isolate_runtime_dir();
     let mux = Mux::new(unique_session("issue92-ack-all"), SurfaceOptions::default());
     let surface = mux.new_workspace(None, None).unwrap();
     mux.record_notification(surface.id, String::new(), "one".into());

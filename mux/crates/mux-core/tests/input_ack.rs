@@ -29,6 +29,19 @@ fn unique_session(prefix: &str) -> String {
     format!("{prefix}-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Point `XDG_RUNTIME_DIR` at a throwaway dir before any `serve(.., None)`:
+/// the default (`platform::runtime_dir()`) is the operator's real
+/// `/run/user/<uid>/mtyx-<uid>/` on a dev box, and tests must never touch it.
+/// One dir per test binary; `serve()` re-reads the env on every call.
+fn isolate_runtime_dir() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("mtyx-core-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+    });
+}
+
 fn connect(path: &Path) -> Box<dyn transport::Stream> {
     transport::connect(path).unwrap()
 }
@@ -68,6 +81,7 @@ fn wait_for_child_argv0(child_pid: u32, argv0: &str) {
 /// and advertises `input-ack`, and the shared client-side gate accepts it.
 #[test]
 fn identify_advertises_input_ack_capability() {
+    isolate_runtime_dir();
     let mux = Mux::new(
         unique_session("issue88-ident"),
         SurfaceOptions { command: Some(vec!["/bin/cat".to_string()]), ..Default::default() },
@@ -96,6 +110,7 @@ fn identify_advertises_input_ack_capability() {
 /// bytes back.
 #[test]
 fn confirmed_send_receives_receipt_after_child_consumption() {
+    isolate_runtime_dir();
     let mux = Mux::new(
         unique_session("issue88-receipt"),
         SurfaceOptions {
@@ -125,14 +140,18 @@ fn confirmed_send_receives_receipt_after_child_consumption() {
 
     // Confirmed send: response arrives only after the child printed, and
     // reports the receipt.
-    let started = Instant::now();
     let confirmed = rpc(
         &sock,
         json!({"id": 2, "cmd": "send", "surface": surface.id, "text": "receipt\n", "confirm": true, "timeout_ms": 10_000}),
     );
     assert_eq!(confirmed["ok"], json!(true), "confirmed send failed: {confirmed}");
     assert_eq!(confirmed["data"]["confirmed"], json!(true));
-    assert!(started.elapsed() >= Duration::from_millis(1));
+    // No wall-clock lower bound on the round trip: a confirmed send returning
+    // Ok already proves the VT saw output after the write (the output-epoch
+    // receipt inside `write_bytes_confirmed`), and on a fast or loaded runner
+    // the whole write→echo→receipt dance can legitimately complete in under
+    // 1ms — a `>= 1ms` assert here flaked in CI. The never-consumed timeout
+    // path is covered by `input_ack_timeout_is_structured_error`.
     let echoed = wait_for(
         || {
             let text = surface.with_terminal(|t| t.plain_text()).unwrap().unwrap();
@@ -155,6 +174,7 @@ fn confirmed_send_receives_receipt_after_child_consumption() {
 /// surface.rs.)
 #[test]
 fn input_ack_ordering() {
+    isolate_runtime_dir();
     let mux = Mux::new(
         unique_session("issue88-order"),
         SurfaceOptions {
@@ -245,6 +265,7 @@ fn input_ack_ordering() {
 /// pre-#88 fire-and-forget path is unchanged and uncapped.
 #[test]
 fn oversized_input_rejected() {
+    isolate_runtime_dir();
     let mux = Mux::new(
         unique_session("issue88-oversize"),
         SurfaceOptions { command: Some(vec!["/bin/cat".to_string()]), ..Default::default() },
@@ -288,6 +309,7 @@ fn oversized_input_rejected() {
 #[test]
 #[cfg(target_os = "linux")] // relies on /proc/<pid>/cmdline for the exec check
 fn input_ack_timeout_is_structured_error() {
+    isolate_runtime_dir();
     let mux = Mux::new(
         unique_session("issue88-timeout"),
         SurfaceOptions {

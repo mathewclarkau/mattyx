@@ -42,6 +42,19 @@ fn unique_session(prefix: &str) -> String {
     format!("{prefix}-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Point `XDG_RUNTIME_DIR` at a throwaway dir before any `serve(.., None)`:
+/// the default (`platform::runtime_dir()`) is the operator's real
+/// `/run/user/<uid>/mtyx-<uid>/` on a dev box, and tests must never touch it.
+/// One dir per test binary; `serve()` re-reads the env on every call.
+fn isolate_runtime_dir() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("mtyx-core-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+    });
+}
+
 fn connect(path: &Path) -> Box<dyn transport::Stream> {
     transport::connect(path).unwrap()
 }
@@ -68,6 +81,7 @@ fn screen_text(surface: &mux_core::Surface) -> String {
 /// written to the PTY (the pane's screen is byte-identical afterwards).
 #[test]
 fn send_to_blocked_agent_returns_agent_blocked_no_input() {
+    isolate_runtime_dir();
     // A read loop that echoes every consumed line as `GOT:<line>`: if the
     // gated send had written anything, `GOT:` would appear.
     let mux = Mux::new(
@@ -123,6 +137,7 @@ fn send_to_blocked_agent_returns_agent_blocked_no_input() {
 /// pre-#93 raw behaviour).
 #[test]
 fn send_with_force_bypasses_gate() {
+    isolate_runtime_dir();
     let mux = Mux::new(
         unique_session("issue93-force"),
         SurfaceOptions {
@@ -171,6 +186,7 @@ fn send_with_force_bypasses_gate() {
 /// dialog is stable) stay readable without force.
 #[test]
 fn agent_read_to_working_agent_returns_agent_not_idle() {
+    isolate_runtime_dir();
     let mux = Mux::new(
         unique_session("d22-read-gate"),
         SurfaceOptions {
@@ -247,6 +263,7 @@ fn agent_read_to_working_agent_returns_agent_not_idle() {
 /// the same payload as an ungated read.
 #[test]
 fn agent_read_with_force_bypasses_gate() {
+    isolate_runtime_dir();
     let mux = Mux::new(
         unique_session("d22-read-force"),
         SurfaceOptions {
@@ -289,6 +306,7 @@ fn agent_read_with_force_bypasses_gate() {
 /// `send` caller working.
 #[test]
 fn send_gates_screen_detected_blocked_but_not_plain_shell() {
+    isolate_runtime_dir();
     // Claude Code footer + a confirmation dialog: detection resolves
     // `claude`, and the #96 classifier makes that unambiguously Blocked.
     let mux = Mux::new(
@@ -365,6 +383,7 @@ fn send_gates_screen_detected_blocked_but_not_plain_shell() {
 /// matches must NOT satisfy it, while a later real transition must.
 #[test]
 fn wait_requires_observed_transition() {
+    isolate_runtime_dir();
     let mux = Mux::new(
         unique_session("issue93-wait"),
         SurfaceOptions { command: Some(vec!["/bin/cat".to_string()]), ..Default::default() },
@@ -431,6 +450,7 @@ fn wait_requires_observed_transition() {
 /// behaviour is unchanged, so existing orchestrators keep working.
 #[test]
 fn wait_immediate_match_still_works_without_require_transition() {
+    isolate_runtime_dir();
     let mux = Mux::new(
         unique_session("issue93-wait-compat"),
         SurfaceOptions { command: Some(vec!["/bin/cat".to_string()]), ..Default::default() },
@@ -464,6 +484,7 @@ fn wait_immediate_match_still_works_without_require_transition() {
 /// succeeding.
 #[test]
 fn send_wait_requires_observed_activity() {
+    isolate_runtime_dir();
     let mux = Mux::new(
         unique_session("issue93-send-wait"),
         SurfaceOptions { command: Some(vec!["/bin/cat".to_string()]), ..Default::default() },
@@ -516,6 +537,7 @@ fn send_wait_requires_observed_activity() {
 
 #[test]
 fn write_bytes_bypasses_blocked_gate() {
+    isolate_runtime_dir();
     let session = unique_session("write-bytes-bypass");
     let mux = Mux::new(session, SurfaceOptions::default());
     let surface = mux.new_workspace(None, None).unwrap();

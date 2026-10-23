@@ -3,10 +3,30 @@
 //! `atexit` never run (issue #27).
 //!
 //! The daemon spawns `mtyx socket-watchdog --pid <daemon> --socket <path>`
-//! as a detached child right after binding. The watchdog polls until the
-//! target PID is gone (or is no longer a mtyx process — PID-reuse guard),
-//! then unlinks both files and exits. On graceful shutdown the daemon
-//! already unlinks; the watchdog's second unlink is a no-op.
+//! as a detached child right after binding. The watchdog polls the daemon
+//! pid every `POLL_MS` (200 ms) and exits within one tick of its death —
+//! SIGKILL included — after unlinking `.sock` then `.pid`. Exiting on
+//! daemon death is by design and was verified live against a SIGKILL'd
+//! daemon (issue #139); it is not a source of leaked watchdogs, whose only
+//! failure mode is a daemon that never dies.
+//!
+//! The watch is unbounded *while the daemon lives*, by design: a bounded
+//! watch would exit early and orphan the files of a long-lived daemon. The
+//! ≤5 s cleanup bound of issue #27 therefore falls out of `POLL_MS`, not a
+//! separate timer — the old `MAX_CLEANUP_SECS` constant was unreferenced and
+//! advertised a guarantee the loop never enforced, so it was deleted rather
+//! than left as dead code.
+//!
+//! On graceful shutdown the daemon itself unlinks the files and SIGKILLs the
+//! watchdog via `kill_remaining_children` (the daemon is a
+//! `PR_SET_CHILD_SUBREAPER`), so the watchdog's own unlink is a no-op there
+//! and only matters for the SIGKILL case.
+//!
+//! Known hole (documented, not fixed): the PID-reuse guard keys on
+//! `/proc/<pid>/cmdline`, so if the dead daemon's pid is immediately reused
+//! by *another* `mtyx` process (a CLI client is `mtyx` too) the watchdog
+//! waits for the wrong process. Negligible in practice, since pids are not
+//! recycled that fast.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -15,10 +35,6 @@ use std::time::Duration;
 use mux_core::server::{is_mtyx_process, is_process_alive, pid_path};
 
 const POLL_MS: u64 = 200;
-/// Upper bound matching issue #27 acceptance (≤5s). Used only in tests /
-/// docs; the loop itself has no timeout while the daemon lives.
-#[allow(dead_code)]
-pub const MAX_CLEANUP_SECS: u64 = 5;
 
 /// Spawn a detached watchdog watching `daemon_pid` + `socket_path`.
 /// Failures are swallowed: a missing watchdog only means SIGKILL leaves

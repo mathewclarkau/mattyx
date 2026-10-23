@@ -35,6 +35,19 @@ fn unique_session(prefix: &str) -> String {
     format!("{prefix}-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Point `XDG_RUNTIME_DIR` at a throwaway dir before any `serve(.., None)`:
+/// the default (`platform::runtime_dir()`) is the operator's real
+/// `/run/user/<uid>/mtyx-<uid>/` on a dev box, and tests must never touch it.
+/// One dir per test binary; `serve()` re-reads the env on every call.
+fn isolate_runtime_dir() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("mtyx-core-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+    });
+}
+
 fn connect(path: &Path) -> Box<dyn transport::Stream> {
     transport::connect(path).unwrap()
 }
@@ -276,6 +289,7 @@ fn surface_exit_reaps_tree_and_emits_event() {
 
 #[test]
 fn control_socket_round_trip() {
+    isolate_runtime_dir();
     let mux =
         Mux::new(unique_session("test-sock"), shell_opts("printf 'socket-check\\n'; sleep 30"));
     let surface = mux.new_workspace(None, None).unwrap();
@@ -463,6 +477,7 @@ fn control_socket_round_trip() {
 
 #[test]
 fn control_socket_set_default_colors_merges_fields() {
+    isolate_runtime_dir();
     let opts = SurfaceOptions { command: Some(vec!["/bin/cat".to_string()]), ..Default::default() };
     let mux = Mux::new(format!("test-colors-{}", std::process::id()), opts);
     let sock_path = mux_core::server::serve(mux.clone(), None).unwrap();
@@ -508,6 +523,7 @@ fn control_socket_set_default_colors_merges_fields() {
 /// exactly the bytes written, and read them back via the terminal.
 #[test]
 fn send_shell_sanitises_text_and_raw_passes_through() {
+    isolate_runtime_dir();
     let mux = Mux::new(
         unique_session("test-send-shell"),
         SurfaceOptions { command: Some(vec!["/bin/cat".to_string()]), ..Default::default() },
@@ -564,6 +580,7 @@ fn send_shell_sanitises_text_and_raw_passes_through() {
 
 #[test]
 fn control_socket_broadcasts_surface_resized_once_per_changed_size() {
+    isolate_runtime_dir();
     let mux = Mux::new(unique_session("test-resize-event"), shell_opts("sleep 30"));
     let surface = mux.new_workspace(None, Some((80, 24))).unwrap();
 
