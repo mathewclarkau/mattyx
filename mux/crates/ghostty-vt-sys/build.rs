@@ -26,6 +26,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ZIG");
     println!("cargo:rerun-if-env-changed=MTYX_GHOSTTY_VT_ZIG_CPU");
     println!("cargo:rerun-if-env-changed=MTYX_GHOSTTY_VT_ZIG_TARGET");
+    println!("cargo:rerun-if-env-changed=MTYX_GHOSTTY_VT_ZIG_SYSTEM");
     println!("cargo:rerun-if-changed={}", ghostty_dir.join("include").display());
     println!("cargo:rerun-if-changed={}", ghostty_dir.join("build.zig").display());
     println!("cargo:rerun-if-changed={}", ghostty_dir.join("src").display());
@@ -45,6 +46,15 @@ fn main() {
         "-Demit-xcframework=false".to_string(),
         "-Doptimize=ReleaseFast".to_string(),
     ];
+    // Offline Nix sandbox builds pass pre-fetched Zig packages via
+    // `--system <dir>` (`MTYX_GHOSTTY_VT_ZIG_SYSTEM`).
+    if let Ok(sys_dir) = env::var("MTYX_GHOSTTY_VT_ZIG_SYSTEM") {
+        let trimmed = sys_dir.trim();
+        if !trimmed.is_empty() {
+            zig_args.push("--system".to_string());
+            zig_args.push(trimmed.to_string());
+        }
+    }
     if let Ok(zig_target) = env::var("MTYX_GHOSTTY_VT_ZIG_TARGET") {
         zig_args.push(format!("-Dtarget={zig_target}"));
     } else if target != host {
@@ -171,6 +181,8 @@ fn zig_target_for_rust_target(target: &str) -> Option<&'static str> {
     match target {
         "x86_64-unknown-linux-gnu" => Some("x86_64-linux-gnu"),
         "aarch64-unknown-linux-gnu" => Some("aarch64-linux-gnu"),
+        "x86_64-apple-darwin" => Some("x86_64-macos"),
+        "aarch64-apple-darwin" => Some("aarch64-macos"),
         "x86_64-pc-windows-gnu" => Some("x86_64-windows-gnu"),
         "x86_64-pc-windows-msvc" => Some("x86_64-windows-msvc"),
         "aarch64-pc-windows-msvc" => Some("aarch64-windows-msvc"),

@@ -39,7 +39,19 @@ Responses have this shape:
 
 ## Compatibility Promise
 
-`PROTOCOL_VERSION` (currently **7**) increments on breaking wire changes; additive changes (new commands, new optional request fields, new reply keys, new event kinds) do not bump it. Consumers pin by checking `identify`'s `protocol` field and gating optional features on the `capabilities` record rather than on version arithmetic. The golden wire-shape tests in `mux-core/tests/wire_contract.rs` pin the reply shape of the read-only command families so a shape cannot silently drift.
+`PROTOCOL_VERSION` (currently **8**) increments on breaking wire changes; additive changes (new commands, new optional request fields, new reply keys, new event kinds) do not bump it. Consumers pin by checking `identify`'s `protocol` field and gating optional features on the `capabilities` record rather than on version arithmetic. The golden wire-shape tests in `mux-core/tests/wire_contract.rs` pin the reply shape of the read-only command families so a shape cannot silently drift.
+
+### Protocol Compatibility Matrix (`PROTOCOL_VERSION = 8`)
+
+<!-- PROTOCOL_COMPAT_MATRIX_START -->
+| Client \ Daemon | Protocol <= 6 (Legacy) | Protocol 7 | Protocol 8 (Current) | Protocol 8+ (1.x Additive) |
+| --- | --- | --- | --- | --- |
+| **TUI Attach (`mtyx attach` / `attach-surface`)** | Refused (requires v6 resize-replay + v7 `identify` capabilities) | Supported (`explicit`/`osc` agent source only) | Supported (`explicit`/`osc`/`heuristic` agent source) | Supported (unknown event/reply fields ignored) |
+| **CLI Read/Layout Verbs (`list-workspaces`, `read-screen`, `agent-read`, `layout-*`)** | Supported for shared verbs | Supported (`wire_contract.rs` pinned) | Supported (`wire_contract.rs` pinned) | Supported (field-additive) |
+| **Confirmed Input (`mtyx send`, default `--confirm`)** | Refused with `legacy_host_receipt_rejected` (`capabilities["input-ack"]` absent) | Supported (`capabilities["input-ack"] == true`) | Supported (`capabilities["input-ack"] == true`) | Supported |
+| **Unconfirmed Input (`mtyx send --no-confirm`, `write-bytes`)** | Supported | Supported | Supported | Supported |
+| **Agent Factory Verbs (`agent-register`, `agent-prompt`, `wait-agent-status`)** | Unsupported on pre-v7 daemons | Supported (`agent_register_shape`, `agent_prompt_shape_and_blocked_gate`) | Supported (`agent_register_shape`, `agent_prompt_shape_and_blocked_gate`) | Supported |
+<!-- PROTOCOL_COMPAT_MATRIX_END -->
 
 ## Command Contract
 
@@ -86,6 +98,10 @@ Notes on the mapping between CLI verbs and socket commands:
   directory / render locally) — they issue no dedicated socket command of
   the same name. `kill-stale --dry-run` is a read-only preview of the same
   reap: it reports the stale `.sock`/`.pid` pairs and unlinks nothing.
+  Human-readable `list-sessions` lazily reaps stale `.sock`/`.pid` pairs on
+  enumerate by default (`--no-gc` opts out); `list-sessions --json` stays
+  read-only by default unless `--gc` is passed, in which case stale pairs are
+  swept and `"swept": <n>` is included in the JSON envelope (issue #138).
 - `mtyx agent <start|prompt|wait|read|list>` is a CLI-only noun rewritten
   onto flat verbs before dispatch (the `agent-pattern` pattern): `agent
   start` composes `new-tab` + `agent-register` in one CLI flow, `agent

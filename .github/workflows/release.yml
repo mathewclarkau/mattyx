@@ -12,6 +12,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           # zig_os names both the zig tarball segment and the release
@@ -21,17 +22,28 @@ jobs:
             arch: x86_64
             zig_os: linux
             exe_suffix: ""
+            cargo_target: ""
           - os: ubuntu-24.04-arm
             arch: aarch64
             zig_os: linux
             exe_suffix: ""
-          # macOS leg: Xcode CLT is preinstalled on GitHub macOS
+            cargo_target: ""
+          # macOS legs: Xcode CLT is preinstalled on GitHub macOS
           # runners (clang + libclang.dylib), so there is no LLVM install
-          # step for this leg. macos-15 is arm64.
+          # step for these legs. macos-15 is arm64; macos-13 was retired
+          # by GitHub Actions (leaving `runs-on: macos-13` permanently
+          # queued), so the x86_64 macOS binary cross-compiles on
+          # macos-15 via `--target x86_64-apple-darwin` + Rosetta 2.
           - os: macos-15
             arch: aarch64
             zig_os: macos
             exe_suffix: ""
+            cargo_target: ""
+          - os: macos-15
+            arch: x86_64
+            zig_os: macos
+            exe_suffix: ""
+            cargo_target: "x86_64-apple-darwin"
           # Windows leg (MSVC): bindgen's libclang comes from the
           # preinstalled LLVM (LIBCLANG_PATH step below); the .exe
           # suffix flows through bootstrap.sh, the packaging step and
@@ -40,6 +52,7 @@ jobs:
             arch: x86_64
             zig_os: windows
             exe_suffix: ".exe"
+            cargo_target: ""
     runs-on: ${{ matrix.os }}
     # bash exists on every runner image (Git Bash on Windows), and the
     # build steps are written in bash (bootstrap.sh, perl -pi,
@@ -149,6 +162,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: ${{ matrix.cargo_target }}
 
       - name: Point bindgen at LLVM (Windows)
         # windows-latest ships LLVM at C:\Program Files\LLVM with clang
@@ -175,6 +190,7 @@ jobs:
           # Empty on workflow_dispatch; mux-core/build.rs treats an empty
           # value as unset and falls back to `git describe`.
           MTYX_VERSION: ${{ steps.version.outputs.version }}
+          MTYX_CARGO_TARGET: ${{ matrix.cargo_target }}
         run: ./scripts/bootstrap.sh
 
       - name: Verify the baked-in version
@@ -184,11 +200,26 @@ jobs:
         # build.rs → mux_core::VERSION → `-V`) is exercised here.
         # Passed via env rather than interpolated into the script, so a
         # tag name can never be spliced into the shell.
+        # Cross-compiled legs (e.g. x86_64-apple-darwin on arm64 macos-15
+        # runners where Rosetta 2 is not preinstalled) verify the binary
+        # architecture via `file` and inspect the baked version string.
         env:
           EXPECTED_VERSION: ${{ steps.version.outputs.version }}
+          CARGO_TARGET: ${{ matrix.cargo_target }}
         run: |
           set -euo pipefail
-          reported="$(mux/target/release/mtyx${{ matrix.exe_suffix }} --version)"
+          bin="mux/target/release/mtyx${{ matrix.exe_suffix }}"
+          if [[ -n "$CARGO_TARGET" ]] && ! "$bin" --version >/dev/null 2>&1; then
+            echo "cross-compiled binary ($CARGO_TARGET): verifying embedded version string"
+            file "$bin"
+            if [[ -n "$EXPECTED_VERSION" ]]; then
+              strings "$bin" | grep -Fx "mtyx $EXPECTED_VERSION" >/dev/null \
+                || grep -aF "$EXPECTED_VERSION" "$bin" >/dev/null \
+                || { echo "::error::expected version '$EXPECTED_VERSION' not found in $bin"; exit 1; }
+            fi
+            exit 0
+          fi
+          reported="$("$bin" --version)"
           echo "mtyx reports: $reported"
           if [[ -n "$EXPECTED_VERSION" && "$reported" != "mtyx $EXPECTED_VERSION" ]]; then
             echo "::error::expected 'mtyx $EXPECTED_VERSION', got '$reported'"
@@ -266,6 +297,16 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/sha256.sh verify dist
+
+      - name: Render Homebrew formula
+        # Issue #141: generate `dist/mattyx.rb` with the exact release
+        # version and verified per-platform SHA-256 digests so
+        # `homebrew-mattyx` (or `brew install --formula`) can consume it.
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          bash scripts/render-homebrew-formula.sh "$RELEASE_VERSION" dist dist/mattyx.rb
 
       - name: Create release
         uses: softprops/action-gh-release@v2

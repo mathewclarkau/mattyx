@@ -26,6 +26,7 @@ pub fn asset_name_for(os: &str, arch: &str) -> Result<&'static str, String> {
         ("linux", "x86_64") => Ok("mtyx-linux-x86_64"),
         ("linux", "aarch64") => Ok("mtyx-linux-aarch64"),
         ("macos", "aarch64") => Ok("mtyx-macos-aarch64"),
+        ("macos", "x86_64") => Ok("mtyx-macos-x86_64"),
         ("windows", "x86_64") => Ok("mtyx-windows-x86_64.exe"),
         _ => Err(format!(
             "no prebuilt release binary for {os}-{arch}; download or build manually from {RELEASES_URL}"
@@ -663,14 +664,15 @@ mod tests {
         assert_eq!(asset_name_for("linux", "x86_64").unwrap(), "mtyx-linux-x86_64");
         assert_eq!(asset_name_for("linux", "aarch64").unwrap(), "mtyx-linux-aarch64");
         assert_eq!(asset_name_for("macos", "aarch64").unwrap(), "mtyx-macos-aarch64");
+        assert_eq!(asset_name_for("macos", "x86_64").unwrap(), "mtyx-macos-x86_64");
         assert_eq!(
             asset_name_for("windows", "x86_64").unwrap(),
             "mtyx-windows-x86_64.exe"
         );
 
-        let intel_mac = asset_name_for("macos", "x86_64").unwrap_err();
-        assert!(intel_mac.contains("macos-x86_64"), "got: {intel_mac}");
-        assert!(intel_mac.contains(RELEASES_URL), "got: {intel_mac}");
+        let intel_mac_legacy = asset_name_for("macos", "i686").unwrap_err();
+        assert!(intel_mac_legacy.contains("macos-i686"), "got: {intel_mac_legacy}");
+        assert!(intel_mac_legacy.contains(RELEASES_URL), "got: {intel_mac_legacy}");
 
         let unknown = asset_name_for("freebsd", "riscv64").unwrap_err();
         assert!(unknown.contains("freebsd-riscv64"), "got: {unknown}");
