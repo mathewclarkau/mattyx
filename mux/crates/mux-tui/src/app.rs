@@ -792,15 +792,24 @@ pub fn run(
     })
 }
 
+/// ANSI sequence to reset the mouse pointer shape (OSC 22) and explicitly
+/// disable all DEC/xterm mouse-tracking private modes, including Mode 1003
+/// (Any-Event mouse tracking, which emits `35;X;YM` motion events when no
+/// button is pressed and is omitted by `crossterm::event::DisableMouseCapture`).
+const TERMINAL_MOUSE_RESET_SEQ: &[u8] =
+    b"\x1b]22;default\x07\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1015l\x1b[?1006l";
+
 fn restore_terminal(stdout_lock: Option<&Arc<Mutex<()>>>) -> anyhow::Result<()> {
     let _guard = stdout_lock.map(|lock| lock.lock().unwrap());
     let mut stdout = std::io::stdout();
-    // Reset the mouse pointer shape in case we left it as a hand.
-    let _ = write!(stdout, "\x1b]22;default\x07");
+    // Reset the mouse pointer shape and explicitly extinguish all mouse
+    // reporting modes (including 1003 any-event tracking).
+    let _ = stdout.write_all(TERMINAL_MOUSE_RESET_SEQ);
     let _ = stdout.execute(DisableBracketedPaste);
     let _ = stdout.execute(DisableFocusChange);
     let _ = stdout.execute(DisableMouseCapture);
     let _ = stdout.execute(LeaveAlternateScreen);
+    let _ = stdout.flush();
     disable_raw_mode()?;
     Ok(())
 }
@@ -3617,5 +3626,16 @@ mod tests {
             hint_emitted: false,
         };
         assert!(!(!watch_seen.hint_emitted && !watch_seen.output_seen && Instant::now() >= watch_seen.deadline));
+    }
+
+    #[test]
+    fn terminal_mouse_reset_sequence_disables_all_tracking_modes_including_1003() {
+        let seq = std::str::from_utf8(super::TERMINAL_MOUSE_RESET_SEQ).unwrap();
+        assert!(seq.contains("\x1b]22;default\x07"), "must reset pointer shape");
+        assert!(seq.contains("\x1b[?1000l"), "must disable normal mouse tracking (1000)");
+        assert!(seq.contains("\x1b[?1002l"), "must disable button-event mouse tracking (1002)");
+        assert!(seq.contains("\x1b[?1003l"), "must disable any-event mouse tracking (1003)");
+        assert!(seq.contains("\x1b[?1015l"), "must disable urxvt mouse mode (1015)");
+        assert!(seq.contains("\x1b[?1006l"), "must disable SGR extended mouse mode (1006)");
     }
 }

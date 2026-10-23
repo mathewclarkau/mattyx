@@ -199,10 +199,18 @@ impl AgentState {
 /// report is rejected while a hook report is the current source; a
 /// detected report (from watching the surface's own output, e.g. an OSC 9
 /// notification) is rejected while either an explicit socket or hook
-/// report is current (see `spec/commands.md`'s `report-agent` authority
-/// rules, which name "detected" as the lowest tier).
+/// report is current; and a heuristic report (issue #140: the zero-config
+/// screen classifier behind `detect-agent` and the background poller) is
+/// rejected while ANY of the above is current (see `spec/commands.md`'s
+/// `report-agent` authority rules, which name the tiers lowest to
+/// highest: "heuristic", "detected", "socket", "hook").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AgentStateSource {
+    /// Issue #140: screen-marker classification (the heuristic layer).
+    /// Declared FIRST so it is strictly the lowest tier — appending it
+    /// last would rank it above `Hook` and silently break the
+    /// "hooks always win" guarantee.
+    Heuristic,
     Detected,
     Socket,
     Hook,
@@ -211,6 +219,7 @@ pub enum AgentStateSource {
 impl AgentStateSource {
     pub fn as_str(self) -> &'static str {
         match self {
+            AgentStateSource::Heuristic => "heuristic",
             AgentStateSource::Detected => "detected",
             AgentStateSource::Socket => "socket",
             AgentStateSource::Hook => "hook",
@@ -219,6 +228,7 @@ impl AgentStateSource {
 
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
+            "heuristic" => AgentStateSource::Heuristic,
             "detected" => AgentStateSource::Detected,
             "socket" => AgentStateSource::Socket,
             "hook" => AgentStateSource::Hook,

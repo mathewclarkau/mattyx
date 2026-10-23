@@ -12,6 +12,26 @@
     { "name": "cursor",   "kind": "process", "pattern": "cursor",       "confidence": "high" },
     { "name": "cursor",   "kind": "screen",  "pattern": "cursor-agent", "confidence": "low", "case_insensitive": true },
     { "name": "aider",    "kind": "process", "pattern": "aider",        "confidence": "high" },
-    { "name": "aider",    "kind": "screen",  "pattern": "Aider",        "confidence": "medium" }
+    { "name": "aider",    "kind": "screen",  "pattern": "Aider",        "confidence": "medium" },
+    { "name": "grok",     "kind": "process", "pattern": "grok",         "confidence": "high" },
+    { "name": "grok",     "kind": "screen",  "pattern": "grok> ",       "confidence": "medium" },
+    { "name": "devin",    "kind": "process", "pattern": "devin",        "confidence": "high" },
+    { "name": "devin",    "kind": "screen",  "pattern": "devin> ",      "confidence": "medium" },
+    { "name": "droid",    "kind": "process", "pattern": "droid",        "confidence": "high" },
+    { "name": "droid",    "kind": "screen",  "pattern": "droid> ",      "confidence": "medium" },
+    { "name": "amp",      "kind": "process", "pattern": "amp",          "confidence": "high" },
+    { "name": "amp",      "kind": "screen",  "pattern": "amp> ",        "confidence": "medium" },
+    { "name": "copilot",  "kind": "process", "pattern": "copilot",      "confidence": "high" },
+    { "name": "copilot",  "kind": "screen",  "pattern": "copilot> ",    "confidence": "medium" },
+    { "name": "kilo",     "kind": "process", "pattern": "kilo",         "confidence": "high" },
+    { "name": "kilo",     "kind": "screen",  "pattern": "kilo> ",       "confidence": "medium" },
+    { "name": "qoder",    "kind": "process", "pattern": "qoder",        "confidence": "high" },
+    { "name": "qoder",    "kind": "screen",  "pattern": "qoder> ",      "confidence": "medium" },
+    { "name": "kiro",     "kind": "process", "pattern": "kiro",         "confidence": "high" },
+    { "name": "kiro",     "kind": "screen",  "pattern": "kiro> ",       "confidence": "medium" },
+    { "name": "gemini",   "kind": "process", "pattern": "gemini",       "confidence": "high" },
+    { "name": "gemini",   "kind": "screen",  "pattern": "Gemini CLI",   "confidence": "medium" },
+    { "name": "cline",    "kind": "process", "pattern": "cline",        "confidence": "high" },
+    { "name": "cline",    "kind": "screen",  "pattern": "cline> ",      "confidence": "medium" }
   ]
 }

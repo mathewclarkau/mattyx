@@ -5,3 +5,5 @@
 /daemon/remote/bin/
 /dist/
 /docs-site/dist/
+._*
+.DS_Store
