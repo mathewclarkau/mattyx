@@ -25,11 +25,15 @@ jobs:
             arch: aarch64
             zig_os: linux
             exe_suffix: ""
-          # macOS leg: Xcode CLT is preinstalled on GitHub macOS
+          # macOS legs: Xcode CLT is preinstalled on GitHub macOS
           # runners (clang + libclang.dylib), so there is no LLVM install
-          # step for this leg. macos-15 is arm64.
+          # step for these legs. macos-15 is arm64; macos-13 is x86_64.
           - os: macos-15
             arch: aarch64
+            zig_os: macos
+            exe_suffix: ""
+          - os: macos-13
+            arch: x86_64
             zig_os: macos
             exe_suffix: ""
           # Windows leg (MSVC): bindgen's libclang comes from the
@@ -266,6 +270,16 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/sha256.sh verify dist
+
+      - name: Render Homebrew formula
+        # Issue #141: generate `dist/mattyx.rb` with the exact release
+        # version and verified per-platform SHA-256 digests so
+        # `homebrew-mattyx` (or `brew install --formula`) can consume it.
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          bash scripts/render-homebrew-formula.sh "$RELEASE_VERSION" dist dist/mattyx.rb
 
       - name: Create release
         uses: softprops/action-gh-release@v2

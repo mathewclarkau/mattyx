@@ -54,7 +54,34 @@ versioned wire contract every verb obeys. Attach the TUI any time with
 
 ## Installation
 
-### Prebuilt Linux binary
+### 1. Install script (Linux & macOS, `x86_64` / `aarch64`)
+
+Downloads the release asset for your OS/arch, verifies its `.sha256` sidecar before installation, and installs to `~/.local/bin/mtyx` (no `sudo`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mathewclarkau/mattyx/main/scripts/install.sh | bash
+```
+
+### 2. Homebrew (macOS & Linux)
+
+```bash
+brew tap mathewclarkau/mattyx https://github.com/mathewclarkau/mattyx
+brew install mattyx
+```
+
+*(Or install directly from the release formula asset: `brew install https://github.com/mathewclarkau/mattyx/releases/latest/download/mattyx.rb`)*
+
+### 3. Nix flake (`x86_64-linux`, `aarch64-linux`, `aarch64-darwin`, `x86_64-darwin`)
+
+```bash
+nix run github:mathewclarkau/mattyx?submodules=1#mtyx
+# or install into your profile:
+nix profile install github:mathewclarkau/mattyx?submodules=1#mtyx
+```
+
+### Direct binary download & in-place updates
+
+Release assets are published for **5 platforms** (`mtyx-linux-x86_64`, `mtyx-linux-aarch64`, `mtyx-macos-aarch64`, `mtyx-macos-x86_64`, `mtyx-windows-x86_64.exe`), each accompanied by a `<asset>.sha256` sidecar:
 
 ```bash
 curl -fsSL -o ~/.local/bin/mtyx \
@@ -62,7 +89,6 @@ curl -fsSL -o ~/.local/bin/mtyx \
 chmod +x ~/.local/bin/mtyx
 ```
 
-Covers `x86_64` and `aarch64`, no Rust/clang toolchain needed — skip straight to [Run it](#run-it) below.
 Built by [`.github/workflows/release.yml`](./.github/workflows/release.yml) from a tagged commit, the same way
 `bootstrap.sh` builds it locally.
 
@@ -73,10 +99,11 @@ mtyx update           # download, sha256-verify, and install the latest release
 mtyx update --check   # check for a newer release without downloading
 ```
 
-### Arch Linux (AUR)
+### Arch Linux (AUR) & Cargo Binstall
 
 ```bash
 paru -S mtyx-bin        # or: yay -S mtyx-bin
+cargo binstall mux-tui  # via cargo-binstall metadata
 ```
 
 
