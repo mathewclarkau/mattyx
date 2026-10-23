@@ -32,7 +32,7 @@ toml = "0.8"
 portable-pty = "0.9"
 wasmtime = { version = "27", default-features = false, features = ["cranelift", "runtime"] }
 wasmtime-wasi = { version = "27", default-features = false, features = ["preview1"] }
-crossterm = "0.28"
+crossterm = "0.29"
 ratatui = "0.29"
 unicode-width = "0.2"
 base64 = "0.22"
