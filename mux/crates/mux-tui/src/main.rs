@@ -399,9 +399,12 @@ KILL-STALE
       socket, pid}]}). Without --dry-run the JSON is {\"ok\":true,
       \"cleaned\":<n>}. Exit 0 in both modes.
       Stale pairs are also swept automatically at daemon startup and lazily
-      on human-readable `mtyx list-sessions` (pass `--no-gc` to keep stale
-      rows without reaping, or `mtyx --json list-sessions --gc` to reap and
-      include `\"swept\": <n>` in the JSON output).
+      on human-readable `mtyx list-sessions` (pass `--no-gc` — or the
+      equivalent `--gc 0` — to keep stale rows without reaping, or
+      `mtyx --json list-sessions --gc` to reap and include `\"swept\": <n>`
+      in the JSON output). The lazy reap only touches pairs inside the
+      canonical/legacy runtime dirs: with an explicit `--socket` pointing
+      elsewhere those rows are reported but never unlinked.
 
 CLAUDE CODE HOOK INTEGRATION
   mtyx claude install-hooks [--uninstall]
