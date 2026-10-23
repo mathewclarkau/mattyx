@@ -297,8 +297,10 @@ def markdown_to_html(md: str) -> str:
             out.append(f"<ul>{''.join(items)}</ul>")
             continue
 
-        # Ordered list
-        if re.match(r"^\s*\d+\.\s+", line):
+        # Ordered list (keeps one <ol> across blank lines and nested bullets)
+        m_ol = re.match(r"^\s*(\d+)\.\s+", line)
+        if m_ol:
+            start_num = int(m_ol.group(1))
             items = []
             while i < n and re.match(r"^\s*\d+\.\s+", lines[i]):
                 item_text = re.sub(r"^\s*\d+\.\s+", "", lines[i])
@@ -306,8 +308,27 @@ def markdown_to_html(md: str) -> str:
                 while i < n and lines[i].startswith("   ") and not re.match(r"^\s*[-*0-9]", lines[i]):
                     item_text += " " + lines[i].strip()
                     i += 1
-                items.append(f"<li>{render_inline(item_text)}</li>")
-            out.append(f"<ol>{''.join(items)}</ol>")
+                item_html = render_inline(item_text)
+                # Absorb nested bullet blocks into this list item
+                while i < n and re.match(r"^\s+[-*]\s+", lines[i]):
+                    sub_items: list[str] = []
+                    while i < n and re.match(r"^\s+[-*]\s+", lines[i]):
+                        sub_text = re.sub(r"^\s*[-*]\s+", "", lines[i])
+                        i += 1
+                        while i < n and lines[i].startswith("  ") and not re.match(r"^\s*[-*0-9]", lines[i]):
+                            sub_text += " " + lines[i].strip()
+                            i += 1
+                        sub_items.append(f"<li>{render_inline(sub_text)}</li>")
+                    item_html += f"<ul>{''.join(sub_items)}</ul>"
+                items.append(f"<li>{item_html}</li>")
+                # Skip blank lines; if another ordered item follows, continue the same list
+                j = i
+                while j < n and lines[j].strip() == "":
+                    j += 1
+                if j < n and re.match(r"^\s*\d+\.\s+", lines[j]):
+                    i = j
+            start_attr = f' start="{start_num}"' if start_num != 1 else ""
+            out.append(f"<ol{start_attr}>{''.join(items)}</ol>")
             continue
 
         # Blank line
