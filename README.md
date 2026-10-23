@@ -86,11 +86,16 @@ brew install https://github.com/mathewclarkau/mattyx/releases/latest/download/ma
 
 ### 3. Nix flake (`x86_64-linux`, `aarch64-linux`, `aarch64-darwin`, `x86_64-darwin`)
 
+The flake takes the version from `MTYX_VERSION` — never from the stale `Cargo.toml` floor, since the pushed `v*` tag is the only version source (#71) — so tell it the release being built, typically the output of `git describe --tags --match 'v*'`:
+
 ```bash
-nix run github:mathewclarkau/mattyx?submodules=1#mtyx
-# or install into your profile:
-nix profile install github:mathewclarkau/mattyx?submodules=1#mtyx
+# from a checkout:
+MTYX_VERSION="$(git describe --tags --match 'v*')" nix build --impure .#mtyx
+# or run a specific release tag:
+MTYX_VERSION=0.27.0 nix run --impure github:mathewclarkau/mattyx/v0.27.0?submodules=1#mtyx
 ```
+
+`--impure` is required because flakes evaluate purely by default (environment variables are invisible to them); without `MTYX_VERSION` the flake fails loudly instead of building a mislabeled binary. The nixpkgs input and the Rust toolchain (1.97) are pinned in `flake.nix`. Note: the ghostty zig-dependency prefetch needs network access, which the Nix sandbox denies — add `--option sandbox false` until it is converted to fixed-output derivations (see the note in `flake.nix`).
 
 ### Direct binary download & in-place updates
 

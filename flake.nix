@@ -2,7 +2,14 @@
   description = "mattyx (mtyx): agent-aware terminal multiplexer backed by libghostty-vt";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Pinned to a specific nixos-unstable commit (2026-09-10) whose default
+    # Rust is 1.97 (`rust = rust_1_97`, matching the AGENTS.md toolchain law
+    # and the dtolnay/rust-toolchain@1.97.0 pin in release.yml). nixpkgs
+    # keeps only one numbered Rust attribute at a time, so when bumping this
+    # rev, re-check which `rust_1_XX` it ships and update the rustPlatform
+    # pin in mkMattyx accordingly. A generated flake.lock is still to be
+    # committed on a machine with nix available (deferred — see fix-notes).
+    nixpkgs.url = "github:NixOS/nixpkgs/317f4cac2bc14319572ce85ca7016317758c695a";
   };
 
   outputs = { self, nixpkgs }:
@@ -60,23 +67,72 @@
       mkMattyx = pkgs:
         let
           zig_0_15 = mkZig_0_15_2 pkgs;
+          # NOTE (sandbox limitation, issue #141 review F5): upstream
+          # ghostty/build.zig.zon.nix fetches the zig packages with
+          # `zig fetch` inside a non-fixed-output derivation
+          # (runCommandLocal), so a stock sandboxed `nix build` denies it
+          # network and the fetch fails. Until the dependencies are
+          # pre-fetched as fixed-output derivations (deferred: that needs
+          # FOD hashes for every entry in ghostty/build.zig.zon, and the
+          # pinned ghostty submodule must not be edited), build with
+          #   nix build --option sandbox false .#mtyx
+          # (documented in README.md next to the nix instructions).
           ghosttyZigDeps = pkgs.callPackage ./ghostty/build.zig.zon.nix {
             inherit zig_0_15;
             name = "mattyx-ghostty-zig-deps";
           };
-          cargoToml = builtins.fromTOML (builtins.readFile ./mux/Cargo.toml);
-          revSuffix =
-            if (self ? shortRev) then "-g${self.shortRev}"
-            else if (self ? dirtyShortRev) then "-g${self.dirtyShortRev}"
-            else "";
-          version = "${cargoToml.workspace.package.version}${revSuffix}";
+          # Version comes from the release tag only (AGENTS.md / issue
+          # #71) — never from the stale Cargo.toml manifest floor, and
+          # never synthesized. The intended source of this value is a
+          # real `git describe --tags --match 'v*'` of the tree being
+          # built (whose output may legitimately carry a `-g<sha>`
+          # suffix; this file never invents one). Flakes evaluate purely
+          # by default, where environment variables are invisible and
+          # the flake source carries no .git, so the tag cannot be
+          # discovered from inside the flake: pass --impure and set
+          # MTYX_VERSION. Anything else fails loudly rather than
+          # building a mislabeled binary (e.g. a v0.27.0 tree reporting
+          # 0.17.2-g<sha>).
+          mtyxVersion =
+            let
+              raw = builtins.getEnv "MTYX_VERSION";
+              stripped = if lib.hasPrefix "v" raw then builtins.substring 1 (-1) raw else raw;
+            in
+            if raw == "" then
+              builtins.abort ''
+                mattyx flake: cannot determine the mtyx version.
+                The version must come from the release tag (issue #71), never
+                from the Cargo.toml manifest floor, and the flake cannot
+                discover the tag on its own under pure evaluation. Set
+                MTYX_VERSION to the version being built — typically from a
+                real describe of the tree:
+                    MTYX_VERSION="$(git describe --tags --match 'v*')" nix build --impure .#mtyx
+                (a leading "v" is stripped; --impure is required so the
+                flake can read the environment).''
+            else if builtins.match "[0-9]+\\.[0-9]+\\.[0-9]+.*" stripped == null then
+              builtins.abort ''
+                mattyx flake: MTYX_VERSION '${raw}' does not look like a
+                release version (expected X.Y.Z, optionally with a real
+                git-describe suffix such as X.Y.Z-3-g1a2b3c4).''
+            else stripped;
+          # Rust 1.97 per AGENTS.md — explicit instead of floating with
+          # whatever rust the nixpkgs rev happens to ship; matches the
+          # dtolnay/rust-toolchain@1.97.0 pin in release.yml. The
+          # nixpkgs input above is pinned to a rev whose default rust is
+          # 1.97; rustPackages_1_97 keeps the pin visible and survives an
+          # input bump (update it together with the rev).
+          rustPlatform = pkgs.rustPackages_1_97.rustPlatform;
         in
-        pkgs.rustPlatform.buildRustPackage {
+        rustPlatform.buildRustPackage {
           pname = "mtyx";
-          inherit version;
+          version = mtyxVersion;
 
-          src = self;
-          sourceRoot = "${self.narHash or "source"}/mux";
+          # Standard idiom: name the copied source tree so sourceRoot can
+          # point inside it. (The previous sourceRoot derived from
+          # self.narHash — a content digest, not a directory name — so
+          # unpackPhase looked for a directory that never exists.)
+          src = builtins.path { path = ./.; name = "source"; };
+          sourceRoot = "source/mux";
 
           cargoLock = {
             lockFile = ./mux/Cargo.lock;
@@ -95,7 +151,7 @@
           ZIG = "${zig_0_15}/bin/zig";
           MTYX_GHOSTTY_VT_ZIG_CPU = "baseline";
           MTYX_GHOSTTY_VT_ZIG_SYSTEM = "${ghosttyZigDeps}";
-          MTYX_VERSION = version;
+          MTYX_VERSION = mtyxVersion;
 
           preBuild = ''
             export HOME="$TMPDIR"
