@@ -2590,9 +2590,11 @@ fn run_kill_stale(global: &GlobalArgs, flags: &FlagMap) -> i32 {
 }
 
 /// The stale (socket-not-connectable) sessions in the runtime roots
-/// honoured by `global`, sorted by session name. Shared by [`kill_stale`]
-/// (what it removes) and the `kill-stale --dry-run` preview (what it
-/// reports) so the two can never disagree about the set (issue #136).
+/// honoured by `global`, sorted by session name. Used by the
+/// `kill-stale --dry-run` preview to report what a reap would remove; it is
+/// a snapshot only — the reap itself ([`reap_stale_discovered`]) re-probes
+/// liveness before each unlink (R5), so a session that starts between
+/// preview and reap survives (issue #136, review finding F5).
 pub(crate) fn stale_sessions(global: &GlobalArgs) -> Vec<DiscoveredSession> {
     let mut sessions = discover_sessions(global);
     sessions.sort_by(|a, b| a.session.cmp(&b.session));
