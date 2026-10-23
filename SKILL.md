@@ -180,7 +180,7 @@ mtyx --session "$SESSION" pane worktree remove --pane 2 --branch fix/racer-1
 
 ## Scenario 6: Session hygiene (`list-sessions`, `kill-stale` / `gc`) and `update`
 
- Always leave the host with **zero leaked daemons or stale sockets**:
+Always leave the host with **zero leaked daemons or stale sockets**:
 
 ```bash
 # Enumerate live sessions (human output automatically reaps dead .sock/.pid pairs;
