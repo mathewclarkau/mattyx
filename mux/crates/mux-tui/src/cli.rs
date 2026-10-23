@@ -571,7 +571,7 @@ pub(crate) const VERBS: &[VerbSpec] = &[
     VerbSpec {
         name: "list-sessions",
         allowed: &["gc", "no-gc"],
-        build: build_list_sessions,
+        build: build_no_args,
         print: print_empty,
         stream: false,
     },
@@ -2010,25 +2010,11 @@ fn build_kill_session(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(value)
 }
 
-/// Issue #138: `list-sessions [--gc|--no-gc]`. Human-readable output lazily
-/// GCs stale `.sock`/`.pid` pairs by default (`--no-gc` opts out); `--json`
-/// stays read-only by default so existing scripts/dashboards are unaffected
-/// unless they opt in with `--gc` (which reaps and adds `"swept": N`).
-fn build_list_sessions(flags: &FlagMap) -> Result<Value, UsageError> {
-    let gc = flags.optional_bool("gc");
-    let no_gc = flags.optional_bool("no-gc");
-    if gc == Some(true) && no_gc == Some(true) {
-        return Err(UsageError("use only one of --gc or --no-gc".into()));
-    }
-    let mut value = json!({});
-    if let Some(gc) = gc {
-        value["gc"] = json!(gc);
-    }
-    if let Some(no_gc) = no_gc {
-        value["no_gc"] = json!(no_gc);
-    }
-    Ok(value)
-}
+/// Issue #138: `list-sessions [--gc|--no-gc]` needs no `build` payload: the
+/// verb is special-cased in `run_command` before the generic `build` hook
+/// runs, so it keeps [`build_no_args`] like the other client-side verbs and
+/// the `--gc`/`--no-gc` conflict is validated once, in `run_list_sessions`
+/// (review finding F3).
 
 /// Issue #136: `kill-stale --dry-run`. The verb is client-side (it never
 /// issues a socket request), so this payload is inert — it exists only so
