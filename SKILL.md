@@ -167,7 +167,7 @@ When running parallel agents that edit files concurrently, isolate each pane in 
 
 ```bash
 # Create and attach a dedicated git worktree for pane 2 on branch `fix/racer-1`
-mtyx --session "$SESSION" pane worktree create --pane 2 --repo "$PWD" --branch fix/racer-1
+mtyx --session "$SESSION" pane worktree create --pane 2 --branch fix/racer-1
 
 # List active pane worktrees
 mtyx --session "$SESSION" pane worktree list --pane 2
