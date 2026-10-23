@@ -3,12 +3,46 @@ name = "mux-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 publish.workspace = true
 description = "mattyx: tmux-like terminal multiplexer TUI backed by libghostty-vt"
 
 [[bin]]
 name = "mtyx"
 path = "src/main.rs"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/mtyx-{ target }{ binary-ext }"
+bin-dir = "mtyx-{ target }{ binary-ext }"
+pkg-fmt = "bin"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/mtyx-linux-x86_64"
+bin-dir = "mtyx-linux-x86_64"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/mtyx-linux-x86_64"
+bin-dir = "mtyx-linux-x86_64"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/mtyx-linux-aarch64"
+bin-dir = "mtyx-linux-aarch64"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/mtyx-linux-aarch64"
+bin-dir = "mtyx-linux-aarch64"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/mtyx-macos-aarch64"
+bin-dir = "mtyx-macos-aarch64"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/mtyx-macos-x86_64"
+bin-dir = "mtyx-macos-x86_64"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/mtyx-windows-x86_64.exe"
+bin-dir = "mtyx-windows-x86_64.exe"
 
 [dependencies]
 ghostty-vt.workspace = true
