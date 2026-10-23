@@ -14,8 +14,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: "pages-${{ github.ref }}"
@@ -40,6 +38,8 @@ jobs:
           test -f docs-site/dist/comparison.html
           test -f docs-site/dist/changelog.html
 
+      - uses: actions/configure-pages@v5
+
       - name: Upload Pages artifact
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-pages-artifact@v3
@@ -48,7 +48,10 @@ jobs:
 
   deploy:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    permissions:
+      pages: write
+      id-token: write
     runs-on: ubuntu-latest
     environment:
       name: github-pages
