@@ -433,9 +433,10 @@ fn destructive_select(state: &mut ListState, sessions: &[DiscoveredSession], was
 }
 
 /// Re-run discovery, newest-first (mtime DESC; `None` sorts last), for the
-/// picker's "most recent session on top" ordering.
+/// picker's "most recent session on top" ordering. Lazily reaps stale
+/// `.sock`/`.pid` pairs on enumerate (issue #138) using the shared #137 sweep.
 fn refresh(global: &GlobalArgs) -> Vec<DiscoveredSession> {
-    let mut sessions = cli::discover_sessions(global);
+    let (mut sessions, _swept) = cli::discover_sessions_with_gc(global, true);
     sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
     sessions
 }

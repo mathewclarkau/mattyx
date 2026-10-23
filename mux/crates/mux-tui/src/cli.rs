@@ -51,6 +51,8 @@ const BARE_BOOL_FLAGS: &[&str] = &[
     "new-workspace",
     "check",
     "dry-run",
+    "gc",
+    "no-gc",
 ];
 
 /// Verbs that accept one bare positional argument alongside their flags
@@ -568,8 +570,8 @@ pub(crate) const VERBS: &[VerbSpec] = &[
     },
     VerbSpec {
         name: "list-sessions",
-        allowed: &[],
-        build: build_no_args,
+        allowed: &["gc", "no-gc"],
+        build: build_list_sessions,
         print: print_empty,
         stream: false,
     },
@@ -2008,6 +2010,26 @@ fn build_kill_session(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(value)
 }
 
+/// Issue #138: `list-sessions [--gc|--no-gc]`. Human-readable output lazily
+/// GCs stale `.sock`/`.pid` pairs by default (`--no-gc` opts out); `--json`
+/// stays read-only by default so existing scripts/dashboards are unaffected
+/// unless they opt in with `--gc` (which reaps and adds `"swept": N`).
+fn build_list_sessions(flags: &FlagMap) -> Result<Value, UsageError> {
+    let gc = flags.optional_bool("gc");
+    let no_gc = flags.optional_bool("no-gc");
+    if gc == Some(true) && no_gc == Some(true) {
+        return Err(UsageError("use only one of --gc or --no-gc".into()));
+    }
+    let mut value = json!({});
+    if let Some(gc) = gc {
+        value["gc"] = json!(gc);
+    }
+    if let Some(no_gc) = no_gc {
+        value["no_gc"] = json!(no_gc);
+    }
+    Ok(value)
+}
+
 /// Issue #136: `kill-stale --dry-run`. The verb is client-side (it never
 /// issues a socket request), so this payload is inert — it exists only so
 /// the flag passes parsing and reaches `run_kill_stale`.
@@ -2144,6 +2166,18 @@ pub(crate) fn discover_sessions(global: &GlobalArgs) -> Vec<DiscoveredSession> {
     discover_sessions_in_roots(&discovery_roots(global))
 }
 
+/// Issue #138: enumerate sessions and optionally reap stale `.sock`/`.pid`
+/// pairs in-place via the single [`reap_stale_discovered`] sweep path.
+/// Returns `(surviving_sessions, swept_count)`.
+pub(crate) fn discover_sessions_with_gc(
+    global: &GlobalArgs,
+    gc: bool,
+) -> (Vec<DiscoveredSession>, usize) {
+    let mut sessions = discover_sessions(global);
+    let swept = if gc { reap_stale_discovered(&mut sessions, None) } else { 0 };
+    (sessions, swept)
+}
+
 /// [`discover_sessions`] with an explicit, ordered root list. Roots are
 /// scanned in order and a session name already seen in an earlier root is
 /// skipped, so on a same-named collision the canonical root (scanned
@@ -2186,8 +2220,23 @@ fn discover_sessions_in_roots(roots: &[PathBuf]) -> Vec<DiscoveredSession> {
     out
 }
 
-fn run_list_sessions(global: &GlobalArgs, _flags: &FlagMap) -> i32 {
-    let mut sessions = discover_sessions(global);
+fn run_list_sessions(global: &GlobalArgs, flags: &FlagMap) -> i32 {
+    let gc_flag = flags.optional_bool("gc");
+    let no_gc_flag = flags.optional_bool("no-gc");
+    if gc_flag == Some(true) && no_gc_flag == Some(true) {
+        return cli_error(global.json, 2, "mtyx: use only one of --gc or --no-gc");
+    }
+    // Issue #138: human-readable `list-sessions` lazily reaps stale pairs by
+    // default (`--no-gc` or `--gc 0` opts out); `--json` stays read-only by
+    // default so existing scripts/dashboards are never surprised by mutation
+    // unless they opt in with `--gc` (which adds `"swept": N` to the envelope).
+    let should_gc = if global.json {
+        gc_flag == Some(true) && no_gc_flag != Some(true)
+    } else {
+        no_gc_flag != Some(true) && gc_flag != Some(false)
+    };
+
+    let (mut sessions, swept) = discover_sessions_with_gc(global, should_gc);
     // Preserve the historical alphabetical order: the old impl built the
     // name set from a BTreeSet, and read_dir order is filesystem-dependent.
     sessions.sort_by(|a, b| a.session.cmp(&b.session));
@@ -2204,7 +2253,11 @@ fn run_list_sessions(global: &GlobalArgs, _flags: &FlagMap) -> i32 {
                 })
             })
             .collect();
-        let payload = json!({ "sessions": json_list });
+        let payload = if should_gc {
+            json!({ "sessions": json_list, "swept": swept })
+        } else {
+            json!({ "sessions": json_list })
+        };
         if serde_json::to_writer(io::stdout(), &payload).is_ok() {
             println!();
             0
@@ -2524,6 +2577,36 @@ pub(crate) fn stale_sessions(global: &GlobalArgs) -> Vec<DiscoveredSession> {
     sessions
 }
 
+/// Single source of truth for reaping stale `.sock`/`.pid` pairs (issues
+/// #136, #137, #138). Re-verifies liveness via [`mux_core::server::is_session_socket_live`]
+/// immediately before unlinking each `!live` row (R5 double-signal check):
+/// if a daemon came up concurrently between discovery and reap, the row is
+/// upgraded to `live = true` and left untouched. Otherwise its `.sock` and
+/// `.pid` files are removed and the row is dropped from `sessions`.
+pub(crate) fn reap_stale_discovered(
+    sessions: &mut Vec<DiscoveredSession>,
+    skip_socket: Option<&std::path::Path>,
+) -> usize {
+    let mut swept = 0;
+    sessions.retain_mut(|s| {
+        if s.live {
+            return true;
+        }
+        if skip_socket == Some(s.socket_path.as_path()) {
+            return true;
+        }
+        if mux_core::server::is_session_socket_live(&s.socket_path) {
+            s.live = true;
+            return true;
+        }
+        let _ = std::fs::remove_file(&s.socket_path);
+        let _ = std::fs::remove_file(mux_core::server::pid_path(&s.socket_path));
+        swept += 1;
+        false
+    });
+    swept
+}
+
 /// Kill every stale (socket-not-connectable) session in the runtime dir
 /// honoured by `global` and return how many were cleaned. Mirrors the
 /// historical `run_kill_stale` semantics (remove `.sock` + `.pid` for each
@@ -2531,22 +2614,9 @@ pub(crate) fn stale_sessions(global: &GlobalArgs) -> Vec<DiscoveredSession> {
 /// pre-attach picker (L1), and the in-TUI session manager (L3) so all three
 /// exercise one code path.
 pub(crate) fn kill_stale(global: &GlobalArgs) -> usize {
-    let sessions = stale_sessions(global);
-    let mut cleaned = 0;
-    for s in &sessions {
-        if !s.live {
-            // Issue #136 R5: the discovery verdict can be stale by the
-            // time we unlink — re-verify liveness immediately before each
-            // reap so a session that came up in between is never removed.
-            if mux_core::server::is_session_socket_live(&s.socket_path) {
-                continue;
-            }
-            let _ = std::fs::remove_file(&s.socket_path);
-            let _ = std::fs::remove_file(mux_core::server::pid_path(&s.socket_path));
-            cleaned += 1;
-        }
-    }
-    cleaned
+    let mut sessions = discover_sessions(global);
+    sessions.sort_by(|a, b| a.session.cmp(&b.session));
+    reap_stale_discovered(&mut sessions, None)
 }
 
 /// Issue #136 AC1: the daemon-startup reap. Enumerates the canonical and
@@ -2562,20 +2632,7 @@ pub(crate) fn sweep_stale_sessions(skip_socket: &std::path::Path) -> usize {
         mux_core::platform::legacy_runtime_dir(),
     ]);
     sessions.sort_by(|a, b| a.session.cmp(&b.session));
-    sessions.retain(|s| !s.live && s.socket_path.as_path() != skip_socket);
-    let mut swept = 0;
-    for s in &sessions {
-        // R5: re-verify immediately before the unlink — the classifier's
-        // verdict is stale by now; a socket that accepts a connection (or
-        // has gained a pid file naming a live mtyx) is never reaped.
-        if mux_core::server::is_session_socket_live(&s.socket_path) {
-            continue;
-        }
-        let _ = std::fs::remove_file(&s.socket_path);
-        let _ = std::fs::remove_file(mux_core::server::pid_path(&s.socket_path));
-        swept += 1;
-    }
-    swept
+    reap_stale_discovered(&mut sessions, Some(skip_socket))
 }
 
 /// `mtyx rename-session --old <name> --new <name>` (issue #63). Resolves
