@@ -183,12 +183,11 @@ mtyx --session "$SESSION" pane worktree remove --pane 2 --branch fix/racer-1
 Always leave the host with **zero leaked daemons or stale sockets**:
 
 ```bash
-# Enumerate live sessions (human output automatically reaps dead .sock/.pid pairs;
-# pass `--json --gc` in scripts to reap and report `"swept": N`)
-mtyx list-sessions --json --gc
+# List sessions (stale ones are reported, not removed):
+mtyx list-sessions --json
 
-# Explicitly sweep any leftover stale socket/pid pairs across runtime directories
-mtyx gc
+# Reap stale sockets/pids across the runtime dirs:
+mtyx gc            # or: mtyx kill-stale --json  → {"ok":true,"cleaned":N}
 
 # Tear down your headless factory session cleanly when finished
 mtyx kill-session --session "$SESSION"
