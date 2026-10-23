@@ -398,8 +398,10 @@ KILL-STALE
       --json: {\"ok\":true,\"dry_run\":true,\"cleaned\":0,\"stale\":[{session,
       socket, pid}]}). Without --dry-run the JSON is {\"ok\":true,
       \"cleaned\":<n>}. Exit 0 in both modes.
-      Stale pairs are also swept automatically at daemon startup, so the
-      verb is only needed to clean up without starting/restarting a session.
+      Stale pairs are also swept automatically at daemon startup and lazily
+      on human-readable `mtyx list-sessions` (pass `--no-gc` to keep stale
+      rows without reaping, or `mtyx --json list-sessions --gc` to reap and
+      include `\"swept\": <n>` in the JSON output).
 
 CLAUDE CODE HOOK INTEGRATION
   mtyx claude install-hooks [--uninstall]

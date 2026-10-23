@@ -4017,6 +4017,114 @@ fn explicit_socket_outside_runtime_roots_skips_sweep() {
     c.assert_reaped();
 }
 
+/// Issue #138 AC1/AC2/AC3: human-readable `mtyx list-sessions` lazily reaps
+/// stale `.sock`/`.pid` pairs on enumerate by default (`--no-gc` opts out),
+/// while preserving live sessions and R5 bind-before-pidfile sockets.
+#[test]
+fn list_sessions_lazy_gc_reaps_stale_and_preserves_live_session() {
+    let dir = unique_temp_dir("list-lazy-gc");
+    fs::create_dir_all(&dir).unwrap();
+    let live_sock = dir.join("live-gc.sock");
+    let child = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--headless", "--socket"])
+            .arg(&live_sock)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .env("XDG_STATE_HOME", &dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        live_sock.clone(),
+        dir.clone(),
+    );
+    let live_pid = dir.join("live-gc.pid");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if live_sock.exists() && live_pid.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(live_sock.exists());
+
+    // Plant a dead pair and a concurrently-starting (bound listener, no pidfile) socket.
+    let stale_sock = dir.join("dead-gc.sock");
+    let stale_pid = dir.join("dead-gc.pid");
+    fs::write(&stale_sock, "fake").unwrap();
+    fs::write(&stale_pid, "999999\n").unwrap();
+
+    let starting_sock = dir.join("starting-gc.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&starting_sock).unwrap();
+
+    // `--no-gc` opts out of reaping on the human-readable path.
+    let no_gc_out = run_against(&live_sock, &dir, &["list-sessions", "--no-gc"]);
+    assert_success(&no_gc_out);
+    let no_gc_stdout = String::from_utf8_lossy(&no_gc_out.stdout);
+    assert!(no_gc_stdout.contains("dead-gc"), "--no-gc must still report dead-gc: {no_gc_stdout}");
+    assert!(stale_sock.exists(), "--no-gc must not unlink stale socket");
+    assert!(stale_pid.exists(), "--no-gc must not unlink stale pid");
+
+    // Default human-readable `list-sessions` reaps `dead-gc` in one invocation.
+    let gc_out = run_against(&live_sock, &dir, &["list-sessions"]);
+    assert_success(&gc_out);
+    let gc_stdout = String::from_utf8_lossy(&gc_out.stdout);
+    assert!(
+        !gc_stdout.contains("dead-gc"),
+        "reaped stale session must not appear in output: {gc_stdout}"
+    );
+    assert!(gc_stdout.contains("live-gc"), "live session must appear: {gc_stdout}");
+    assert!(!stale_sock.exists(), "dead-gc.sock must be reaped by list-sessions");
+    assert!(!stale_pid.exists(), "dead-gc.pid must be reaped by list-sessions");
+    assert!(live_sock.exists(), "live-gc.sock must survive list-sessions");
+    assert!(live_pid.exists(), "live-gc.pid must survive list-sessions");
+    assert!(starting_sock.exists(), "connectable starting-gc.sock must survive list-sessions");
+
+    drop(listener);
+    let _ = fs::remove_file(&starting_sock);
+    child.assert_reaped();
+}
+
+/// Issue #138 AC4/AC5: offline enumerate (zero live daemons on the box) and
+/// `--json` opt-in (`--gc`). Plain `--json list-sessions` stays read-only;
+/// `--json list-sessions --gc` sweeps dead pairs and reports `"swept": N`.
+#[test]
+fn list_sessions_json_gc_flag_reaps_and_reports_swept_count_offline() {
+    let dir = unique_temp_dir("list-json-gc-offline");
+    fs::create_dir_all(&dir).unwrap();
+    let anchor = dir.join("anchor.sock");
+
+    let s1_sock = dir.join("offline-a.sock");
+    let s1_pid = dir.join("offline-a.pid");
+    let s2_sock = dir.join("offline-b.sock");
+    let s2_pid = dir.join("offline-b.pid");
+    fs::write(&s1_sock, "fake").unwrap();
+    fs::write(&s1_pid, "999998\n").unwrap();
+    fs::write(&s2_sock, "fake").unwrap();
+    fs::write(&s2_pid, "999999\n").unwrap();
+
+    // Default `--json list-sessions` does not mutate and omits `swept`.
+    let ro = run_against(&anchor, &dir, &["--json", "list-sessions"]);
+    assert_success(&ro);
+    let ro_val: serde_json::Value = serde_json::from_slice(&ro.stdout).unwrap();
+    assert!(ro_val.get("swept").is_none(), "read-only --json must not add swept key: {ro_val}");
+    assert_eq!(ro_val["sessions"].as_array().unwrap().len(), 2);
+    assert!(s1_sock.exists() && s2_sock.exists(), "read-only --json must not unlink");
+
+    // Opt-in `--json list-sessions --gc` reaps both dead pairs offline and reports `"swept": 2`.
+    let gc = run_against(&anchor, &dir, &["--json", "list-sessions", "--gc"]);
+    assert_success(&gc);
+    let gc_val: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(gc_val["swept"], 2, "expected swept=2: {gc_val}");
+    assert_eq!(gc_val["sessions"].as_array().unwrap().len(), 0);
+    assert!(!s1_sock.exists() && !s1_pid.exists(), "offline-a pair must be reaped");
+    assert!(!s2_sock.exists() && !s2_pid.exists(), "offline-b pair must be reaped");
+
+    // Conflicting `--gc --no-gc` exits 2.
+    let bad = run_against(&anchor, &dir, &["list-sessions", "--gc", "--no-gc"]);
+    assert_eq!(bad.status.code(), Some(2), "--gc --no-gc must exit 2");
+}
+
 /// `mtyx attach --session-list --json` lists discovered sessions with a
 /// `socket_path` per entry (issue #63, layer L1). Same shape as
 /// `list-sessions --json` plus `socket_path`; exit 0. Modelled on

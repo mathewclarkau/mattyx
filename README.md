@@ -47,14 +47,55 @@ mtyx read-screen --surface 1
 ```
 
 Panes report semantic state (`working` / `blocked` / `done`) through agent
-hooks (`mtyx agents install --only claude`); everything above is also exposed
+hooks (`mtyx agents install --all --global`); everything above is also exposed
 on the socket — see [`mux/docs/protocol.md`](./mux/docs/protocol.md) for the
 versioned wire contract every verb obeys. Attach the TUI any time with
 `mtyx attach` to watch the fleet live.
 
+### Packaged Agent Skill & Dogfood Demo
+
+Give any coding agent (`claude`, `codex`, `pi`, `antigravity`, `opencode`, `grok`, etc.) autonomous `mtyx` orchestration recipes (`agent start/prompt/wait/read/list`, `subscribe`, `detect-agents`, `pane worktree`, `gc`) in one command:
+
+```bash
+npx skills add mathewclarkau/mattyx --skill mtyx
+```
+
+See [`SKILL.md`](./SKILL.md) ([`skills/mtyx/SKILL.md`](./skills/mtyx/SKILL.md)) for the full scenario-driven recipes, or run the self-contained dogfood factory demo (spawns 3 named worker panes in an isolated runtime dir, waits on `blocked` approval, answers, verifies `done`, and cleans up with zero leaked processes):
+
+```bash
+./scripts/demo-factory.sh
+```
+
 ## Installation
 
-### Prebuilt Linux binary
+### 1. Install script (Linux & macOS, `x86_64` / `aarch64`)
+
+Downloads the release asset for your OS/arch, verifies its `.sha256` sidecar before installation, and installs to `~/.local/bin/mtyx` (no `sudo`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mathewclarkau/mattyx/main/scripts/install.sh | bash
+```
+
+### 2. Homebrew (macOS & Linux)
+
+```bash
+brew tap mathewclarkau/mattyx https://github.com/mathewclarkau/mattyx
+brew install mattyx
+```
+
+*(Or install directly from the release formula asset: `brew install https://github.com/mathewclarkau/mattyx/releases/latest/download/mattyx.rb`)*
+
+### 3. Nix flake (`x86_64-linux`, `aarch64-linux`, `aarch64-darwin`, `x86_64-darwin`)
+
+```bash
+nix run github:mathewclarkau/mattyx?submodules=1#mtyx
+# or install into your profile:
+nix profile install github:mathewclarkau/mattyx?submodules=1#mtyx
+```
+
+### Direct binary download & in-place updates
+
+Release assets are published for **5 platforms** (`mtyx-linux-x86_64`, `mtyx-linux-aarch64`, `mtyx-macos-aarch64`, `mtyx-macos-x86_64`, `mtyx-windows-x86_64.exe`), each accompanied by a `<asset>.sha256` sidecar:
 
 ```bash
 curl -fsSL -o ~/.local/bin/mtyx \
@@ -62,7 +103,6 @@ curl -fsSL -o ~/.local/bin/mtyx \
 chmod +x ~/.local/bin/mtyx
 ```
 
-Covers `x86_64` and `aarch64`, no Rust/clang toolchain needed — skip straight to [Run it](#run-it) below.
 Built by [`.github/workflows/release.yml`](./.github/workflows/release.yml) from a tagged commit, the same way
 `bootstrap.sh` builds it locally.
 
@@ -73,10 +113,11 @@ mtyx update           # download, sha256-verify, and install the latest release
 mtyx update --check   # check for a newer release without downloading
 ```
 
-### Arch Linux (AUR)
+### Arch Linux (AUR) & Cargo Binstall
 
 ```bash
 paru -S mtyx-bin        # or: yay -S mtyx-bin
+cargo binstall mux-tui  # via cargo-binstall metadata
 ```
 
 
