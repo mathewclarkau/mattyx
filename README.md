@@ -117,11 +117,10 @@ mtyx update           # download, sha256-verify, and install the latest release
 mtyx update --check   # check for a newer release without downloading
 ```
 
-### Arch Linux (AUR) & Cargo Binstall
+### Arch Linux (AUR)
 
 ```bash
 paru -S mtyx-bin        # or: yay -S mtyx-bin
-cargo binstall mux-tui  # via cargo-binstall metadata
 ```
 
 
