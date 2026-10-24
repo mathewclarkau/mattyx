@@ -1,0 +1,44 @@
+{
+  "theme": {
+    "selection_background": "#3a3a3a",
+    "selection_foreground": null,
+    "sidebar_rail": "#87afd7",
+    "sidebar_active_bg": 236,
+    "tab_rail": "#87afd7",
+    "tab_bg": 236,
+    "tab_active_bg": null,
+    "border_active": "#87afd7",
+    "border_inactive": "#444444"
+  },
+  "tabs": {
+    "min_width": 7,
+    "solid_background": true,
+    "show_titles": false,
+    "agents": ["claude", "codex", "opencode", "pi"]
+  },
+  "sidebar": {
+    "width": 22,
+    "max_width": 0
+  },
+  "browser": {
+    "chrome_binary": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "cdp_url": "http://127.0.0.1:9222",
+    "discover": false,
+    "discover_ports": [9222],
+    "user_data_dir": "/Users/me/Library/Application Support/cmux-mux/chrome-profile",
+    "ephemeral": false,
+    "max_capture_megapixels": 2.0,
+    "capture_scale": null
+  },
+  "scrollbar": {
+    "position": "column"
+  },
+  "keys": {
+    "prefix": "ctrl+b",
+    "alt_shortcuts": true,
+    "new-tab": ["t", "alt+t"],
+    "next-tab": "tab",
+    "prev-tab": "backtab",
+    "browser-edit-url": "u"
+  }
+}
