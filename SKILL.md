@@ -43,7 +43,7 @@ for _ in $(seq 1 30); do
   fi
   sleep 0.1
 done
-mtyx --session "$SESSION" wait-ready --surface 1 --timeout-ms 5000
+mtyx --session "$SESSION" wait-ready --surface 1 --timeout 5000
 ```
 
 At any point a human can watch the headless fleet live with:
@@ -84,7 +84,10 @@ mtyx --session "$SESSION" agent read coder --source recent-unwrapped --lines 50
 # 6. Approve or answer the prompt:
 #    - Use `answer` for single-key dialog choices (y/n/enter/down/up/esc/1..9)
 #    - Or `agent prompt --force` to reply with a line of text while blocked
-mtyx --session "$SESSION" answer --surface 2 --key enter
+#    - `answer` targets a surface id, not an agent name, so resolve the id
+#      that `agent list` reports for `coder` instead of hard-coding one:
+SURFACE_ID=$(mtyx --session "$SESSION" --json agent list | jq -r '.agents[] | select(.name=="coder") | .surface')
+mtyx --session "$SESSION" answer --surface "$SURFACE_ID" --key enter
 # or:
 mtyx --session "$SESSION" agent prompt coder --force "Yes, keep the cap at 30 seconds"
 
@@ -167,7 +170,7 @@ When running parallel agents that edit files concurrently, isolate each pane in 
 
 ```bash
 # Create and attach a dedicated git worktree for pane 2 on branch `fix/racer-1`
-mtyx --session "$SESSION" pane worktree create --pane 2 --repo "$PWD" --branch fix/racer-1
+mtyx --session "$SESSION" pane worktree create --pane 2 --branch fix/racer-1
 
 # List active pane worktrees
 mtyx --session "$SESSION" pane worktree list --pane 2
@@ -180,15 +183,14 @@ mtyx --session "$SESSION" pane worktree remove --pane 2 --branch fix/racer-1
 
 ## Scenario 6: Session hygiene (`list-sessions`, `kill-stale` / `gc`) and `update`
 
- Always leave the host with **zero leaked daemons or stale sockets**:
+Always leave the host with **zero leaked daemons or stale sockets**:
 
 ```bash
-# Enumerate live sessions (human output automatically reaps dead .sock/.pid pairs;
-# pass `--json --gc` in scripts to reap and report `"swept": N`)
-mtyx list-sessions --json --gc
+# List sessions (stale ones are reported, not removed):
+mtyx list-sessions --json
 
-# Explicitly sweep any leftover stale socket/pid pairs across runtime directories
-mtyx gc
+# Reap stale sockets/pids across the runtime dirs:
+mtyx gc            # or: mtyx kill-stale --json  → {"ok":true,"cleaned":N}
 
 # Tear down your headless factory session cleanly when finished
 mtyx kill-session --session "$SESSION"
@@ -204,7 +206,7 @@ mtyx update --check
 | Goal | Command |
 | :--- | :--- |
 | Start headless session | `mtyx --headless --session <name> &` |
-| Wait for shell prompt ready | `mtyx wait-ready --surface <id> --timeout-ms 5000` |
+| Wait for shell prompt ready | `mtyx wait-ready --surface <id> --timeout 5000` |
 | Spawn + register named agent | `mtyx agent start <name> --cwd <dir> -- <argv...>` |
 | Send prompt + Enter (blocked-gated) | `mtyx agent prompt <name> "<prompt>"` |
 | Wait on state transition | `mtyx agent wait <name> --status <blocked\|done\|idle\|working> --timeout <ms>` |

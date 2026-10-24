@@ -48,7 +48,7 @@ DAEMON_PID=""
 export XDG_RUNTIME_DIR="$RUNTIME_ROOT/xdg"
 export TMPDIR="$RUNTIME_ROOT/tmp"
 export HOME="$RUNTIME_ROOT/home"
-export MTYX_DISABLE_UPDATE_CHECK=1
+export MTYX_NO_UPDATE_CHECK=1
 unset MTYX_MUX_SOCKET MTYX_MUX_SURFACE CMUX_MUX_SOCKET CMUX_MUX_SURFACE
 mkdir -p "$XDG_RUNTIME_DIR" "$TMPDIR" "$HOME"
 
@@ -162,6 +162,23 @@ SESSIONS_JSON="$("$MTYX" list-sessions --json)"
 echo "==> mtyx list-sessions --json: $SESSIONS_JSON"
 if ! printf '%s' "$SESSIONS_JSON" | grep -Eq '"sessions":[[:space:]]*\[\]'; then
   echo "error: expected empty sessions list after cleanup, got: $SESSIONS_JSON" >&2
+  exit 1
+fi
+
+# AC3 also promises zero leaked *processes*: every fixture worker script
+# invocation must be gone too. This runs before the cleanup trap removes
+# $RUNTIME_ROOT so a survivor is still observable; fail loudly rather than
+# print an unsubstantiated claim.
+LEAKED_PIDS=""
+for _ in $(seq 1 50); do
+  LEAKED_PIDS="$(pgrep -f "$WORKER_SCRIPT" || true)"
+  if [ -z "$LEAKED_PIDS" ]; then
+    break
+  fi
+  sleep 0.1
+done
+if [ -n "$LEAKED_PIDS" ]; then
+  echo "error: fixture worker process(es) survived teardown (pids: $LEAKED_PIDS)" >&2
   exit 1
 fi
 echo "==> Demo complete — zero leaked sessions or processes."

@@ -4221,4 +4221,254 @@ mod tests {
             "2 unknown unknown none\n13 pi idle heuristic\n"
         );
     }
+
+    // --- issue #143 AC2 / PR #152 review finding F8: SKILL.md examples ---
+
+    /// The documented `mtyx ...` command lines in `SKILL.md` — fenced bash
+    /// blocks plus the backticked cells of the quick-verb table. Prose
+    /// mentions and shell scaffolding (`if mtyx ...; then`, `$(...)`
+    /// assignments) are deliberately out of scope: this is a representative
+    /// checker, not a full shell parser.
+    fn skill_command_lines(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut fenced = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("```") {
+                fenced = !fenced;
+                continue;
+            }
+            if fenced {
+                if trimmed.starts_with("mtyx ") {
+                    out.push(trimmed.to_string());
+                }
+            } else if trimmed.starts_with('|') {
+                let mut rest = trimmed;
+                while let Some(open) = rest.find('`') {
+                    let after = &rest[open + 1..];
+                    let Some(close) = after.find('`') else { break };
+                    let span = after[..close].trim();
+                    if span.starts_with("mtyx ") {
+                        out.push(span.to_string());
+                    }
+                    rest = &after[close + 1..];
+                }
+            }
+        }
+        out
+    }
+
+    /// Split one documented command line into shell words, stopping at the
+    /// first unquoted command separator (`|`, `;`, `&`, `>`) and tolerating
+    /// the doc conventions: `[--flag]` optional brackets, `<placeholder>`
+    /// values, and quoted strings containing spaces.
+    fn skill_argv(line: &str) -> Vec<String> {
+        let chars: Vec<char> = line.chars().collect();
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut quote: Option<char> = None;
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                } else if c == '\\' && q == '"' && i + 1 < chars.len() {
+                    i += 1;
+                    cur.push(chars[i]);
+                } else {
+                    cur.push(c);
+                }
+            } else {
+                match c {
+                    '\'' | '"' => quote = Some(c),
+                    '\\' if i + 1 < chars.len() => {
+                        i += 1;
+                        cur.push(chars[i]);
+                    }
+                    // Unquoted `#` starts a shell comment (the hygiene
+                    // example carries an inline alternative after `gc`).
+                    '|' | ';' | '&' | '#' => break,
+                    // A redirect ends the command, but `>` closing a
+                    // `<placeholder>` is documentation syntax.
+                    '>' if !cur.starts_with('<') => break,
+                    '[' | ']' => {}
+                    c if c.is_whitespace() => {
+                        if !cur.is_empty() {
+                            out.push(std::mem::take(&mut cur));
+                        }
+                    }
+                    _ => cur.push(c),
+                }
+            }
+            i += 1;
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+
+    /// Index of the first token that is not a global flag (the same scan
+    /// `resolve_verb_alias` performs).
+    fn skill_first_verb(argv: &[String]) -> Option<usize> {
+        let mut i = 0;
+        while i < argv.len() {
+            match argv[i].as_str() {
+                "--socket" | "--session" | "--machine" => i += 2,
+                a if a.starts_with("--socket=")
+                    || a.starts_with("--session=")
+                    || a.starts_with("--machine=") =>
+                {
+                    i += 1
+                }
+                "--json" => i += 1,
+                _ => return Some(i),
+            }
+        }
+        None
+    }
+
+    /// Rewrite the documented noun forms onto their flat verbs the way
+    /// `main.rs` does: `agent <start|prompt|wait|read|list>` (via
+    /// `rewrite_agent_verb`) and `agent-pattern <add|list|remove>`.
+    fn skill_rewrite_nouns(argv: &mut Vec<String>) {
+        let Some(idx) = skill_first_verb(argv) else { return };
+        let head = argv[..idx].to_vec();
+        let rest = &argv[idx..];
+        let rewritten: Vec<String> = match rest[0].as_str() {
+            "agent" => match rest.get(1).map(String::as_str) {
+                Some("start") => {
+                    let name = rest.get(2).cloned().expect("agent start needs a name");
+                    let tail = &rest[3..];
+                    let sep = tail
+                        .iter()
+                        .position(|t| t == "--")
+                        .expect("agent start needs `-- <argv>`");
+                    let mut out = vec!["agent-start".to_string(), "--name".into(), name];
+                    out.extend(tail[..sep].iter().cloned());
+                    out.push("--exec".into());
+                    out.push("--".into());
+                    out.extend(tail[sep + 1..].iter().cloned());
+                    out
+                }
+                Some("prompt") => {
+                    let name = rest.get(2).cloned().expect("agent prompt needs a name");
+                    let mut out = vec!["agent-prompt".to_string(), "--target".into(), name];
+                    let mut text: Vec<String> = Vec::new();
+                    for tok in &rest[3..] {
+                        if tok == "--force" {
+                            out.push(tok.clone());
+                        } else {
+                            text.push(tok.clone());
+                        }
+                    }
+                    out.push("--text".into());
+                    out.push(text.join(" "));
+                    out
+                }
+                Some(sub @ ("wait" | "read")) => {
+                    let name = rest.get(2).cloned().expect("agent wait/read needs a name");
+                    let verb = if sub == "wait" { "wait-agent-status" } else { "agent-read" };
+                    let mut out = vec![verb.to_string(), "--target".into(), name];
+                    out.extend(rest[3..].iter().cloned());
+                    out
+                }
+                Some("list") => {
+                    let mut out = vec!["agent-list".to_string()];
+                    out.extend(rest[2..].iter().cloned());
+                    out
+                }
+                _ => rest.to_vec(),
+            },
+            "agent-pattern" => match rest.get(1).map(String::as_str) {
+                Some("add") => {
+                    let name = rest.get(2).cloned().expect("agent-pattern add needs a name");
+                    let mut out =
+                        vec!["agent-pattern-add".to_string(), "--name".into(), name];
+                    out.extend(rest[3..].iter().cloned());
+                    out
+                }
+                Some("remove") => {
+                    let name = rest.get(2).cloned().expect("agent-pattern remove needs a name");
+                    vec!["agent-pattern-remove".to_string(), "--name".into(), name]
+                }
+                Some("list") => vec!["agent-pattern-list".to_string()],
+                _ => rest.to_vec(),
+            },
+            _ => rest.to_vec(),
+        };
+        let mut out = head;
+        out.extend(rewritten);
+        *argv = out;
+    }
+
+    /// Issue #143 AC2 (PR #152 review finding F8): every `mtyx ...` example
+    /// in the shipped `SKILL.md` must name a real verb and only that verb's
+    /// allowed flags — the check the AC asked for, using the verb table as
+    /// the source of truth rather than a hard-coded list. Verb aliases and
+    /// the documented noun forms are rewritten exactly like `main.rs` before
+    /// the CLI parser runs. Commands dispatched outside the VerbSpec table
+    /// (`attach`, `agents`, …) and the daemon bootstrap (`mtyx --headless`)
+    /// are skipped by design.
+    #[test]
+    fn skill_md_examples_parse_against_verb_specs() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let path = repo_root.join("SKILL.md");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+
+        // CLI-only commands handled before/outside the VerbSpec table.
+        const MAIN_ONLY: &[&str] = &[
+            "attach",
+            "agents",
+            "agent-pattern",
+            "ssh",
+            "machine",
+            "theme",
+            "completions",
+            "plugin",
+            "socket-watchdog",
+        ];
+
+        let lines = skill_command_lines(&text);
+        assert!(
+            lines.len() >= 20,
+            "expected to extract SKILL.md examples, got {}",
+            lines.len()
+        );
+
+        let mut checked = 0usize;
+        for line in &lines {
+            let argv = skill_argv(line);
+            assert_eq!(argv.first().map(String::as_str), Some("mtyx"), "line: {line}");
+            let mut argv: Vec<String> = argv.into_iter().skip(1).collect();
+            // `--headless` is consumed by main.rs before `cli::parse`.
+            argv.retain(|arg| arg != "--headless");
+            resolve_verb_alias(&mut argv);
+            rewrite_pane_worktree_alias(&mut argv);
+            skill_rewrite_nouns(&mut argv);
+            let Some(idx) = skill_first_verb(&argv) else {
+                // `mtyx --headless --session <name>`: daemon bootstrap.
+                continue;
+            };
+            let verb = argv[idx].as_str();
+            if verb_by_name(verb).is_none() {
+                assert!(
+                    MAIN_ONLY.contains(&verb),
+                    "SKILL.md documents an unknown verb `{verb}` in: {line}"
+                );
+                continue;
+            }
+            match parse(&argv) {
+                Ok(Parsed::Command(_)) => checked += 1,
+                Ok(Parsed::Help) => {}
+                Err(err) => {
+                    panic!("SKILL.md example does not parse: `{line}`\n  mtyx: {}", err.0)
+                }
+            }
+        }
+        assert!(checked >= 20, "only {checked} SKILL.md examples were validated");
+    }
+
 }
