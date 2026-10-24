@@ -571,7 +571,7 @@ pub(crate) const VERBS: &[VerbSpec] = &[
     VerbSpec {
         name: "list-sessions",
         allowed: &["gc", "no-gc"],
-        build: build_list_sessions,
+        build: build_no_args,
         print: print_empty,
         stream: false,
     },
@@ -2010,25 +2010,11 @@ fn build_kill_session(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(value)
 }
 
-/// Issue #138: `list-sessions [--gc|--no-gc]`. Human-readable output lazily
-/// GCs stale `.sock`/`.pid` pairs by default (`--no-gc` opts out); `--json`
-/// stays read-only by default so existing scripts/dashboards are unaffected
-/// unless they opt in with `--gc` (which reaps and adds `"swept": N`).
-fn build_list_sessions(flags: &FlagMap) -> Result<Value, UsageError> {
-    let gc = flags.optional_bool("gc");
-    let no_gc = flags.optional_bool("no-gc");
-    if gc == Some(true) && no_gc == Some(true) {
-        return Err(UsageError("use only one of --gc or --no-gc".into()));
-    }
-    let mut value = json!({});
-    if let Some(gc) = gc {
-        value["gc"] = json!(gc);
-    }
-    if let Some(no_gc) = no_gc {
-        value["no_gc"] = json!(no_gc);
-    }
-    Ok(value)
-}
+/// Issue #138: `list-sessions [--gc|--no-gc]` needs no `build` payload: the
+/// verb is special-cased in `run_command` before the generic `build` hook
+/// runs, so it keeps [`build_no_args`] like the other client-side verbs and
+/// the `--gc`/`--no-gc` conflict is validated once, in `run_list_sessions`
+/// (review finding F3).
 
 /// Issue #136: `kill-stale --dry-run`. The verb is client-side (it never
 /// issues a socket request), so this payload is inert — it exists only so
@@ -2169,13 +2155,44 @@ pub(crate) fn discover_sessions(global: &GlobalArgs) -> Vec<DiscoveredSession> {
 /// Issue #138: enumerate sessions and optionally reap stale `.sock`/`.pid`
 /// pairs in-place via the single [`reap_stale_discovered`] sweep path.
 /// Returns `(surviving_sessions, swept_count)`.
+///
+/// The reap is scoped to the guarded runtime roots (canonical `mtyx-<uid>`
+/// and pre-rename `cmux-<uid>`) even when an explicit `--socket` pinned
+/// discovery to another directory: out-of-root pairs are reported but left
+/// untouched (review finding F1; the same scope [`sweep_stale_sessions`]
+/// has always honoured for the #137 startup sweep).
 pub(crate) fn discover_sessions_with_gc(
     global: &GlobalArgs,
     gc: bool,
 ) -> (Vec<DiscoveredSession>, usize) {
     let mut sessions = discover_sessions(global);
-    let swept = if gc { reap_stale_discovered(&mut sessions, None) } else { 0 };
+    let swept = if gc {
+        let before = sessions.len();
+        sessions.retain_mut(|s| {
+            if !is_in_guarded_runtime_root(&s.socket_path) {
+                return true;
+            }
+            reap_stale_row(s, None)
+        });
+        before - sessions.len()
+    } else {
+        0
+    };
     (sessions, swept)
+}
+
+/// True when `socket_path` lives directly in one of the guarded runtime
+/// roots. The enumerate-time GC ([`discover_sessions_with_gc`]) refuses to
+/// unlink anything outside them, so a `--socket`-scoped `list-sessions`
+/// cannot delete mtyx-named files in a directory mtyx does not own.
+fn is_in_guarded_runtime_root(socket_path: &std::path::Path) -> bool {
+    match socket_path.parent() {
+        Some(parent) => {
+            parent == mux_core::platform::runtime_dir().as_path()
+                || parent == mux_core::platform::legacy_runtime_dir().as_path()
+        }
+        None => false,
+    }
 }
 
 /// [`discover_sessions`] with an explicit, ordered root list. Roots are
@@ -2265,6 +2282,12 @@ fn run_list_sessions(global: &GlobalArgs, flags: &FlagMap) -> i32 {
             3
         }
     } else {
+        // Issue #138 AC5/F6: the default-on human path is mutating, so say
+        // what it removed. stderr leaves stdout's shape stable for existing
+        // consumers (a status bar or a `watch` loop scraping the rows).
+        if swept > 0 {
+            eprintln!("mtyx: swept {swept} stale session(s)");
+        }
         // Optional issue-#83 affordance: badge rows whose socket lives in
         // the legacy `cmux-<uid>` root so the origin is visible in human
         // output too (--json carries socket_path per entry already).
@@ -2567,9 +2590,11 @@ fn run_kill_stale(global: &GlobalArgs, flags: &FlagMap) -> i32 {
 }
 
 /// The stale (socket-not-connectable) sessions in the runtime roots
-/// honoured by `global`, sorted by session name. Shared by [`kill_stale`]
-/// (what it removes) and the `kill-stale --dry-run` preview (what it
-/// reports) so the two can never disagree about the set (issue #136).
+/// honoured by `global`, sorted by session name. Used by the
+/// `kill-stale --dry-run` preview to report what a reap would remove; it is
+/// a snapshot only — the reap itself ([`reap_stale_discovered`]) re-probes
+/// liveness before each unlink (R5), so a session that starts between
+/// preview and reap survives (issue #136, review finding F5).
 pub(crate) fn stale_sessions(global: &GlobalArgs) -> Vec<DiscoveredSession> {
     let mut sessions = discover_sessions(global);
     sessions.sort_by(|a, b| a.session.cmp(&b.session));
@@ -2587,24 +2612,30 @@ pub(crate) fn reap_stale_discovered(
     sessions: &mut Vec<DiscoveredSession>,
     skip_socket: Option<&std::path::Path>,
 ) -> usize {
-    let mut swept = 0;
-    sessions.retain_mut(|s| {
-        if s.live {
-            return true;
-        }
-        if skip_socket == Some(s.socket_path.as_path()) {
-            return true;
-        }
-        if mux_core::server::is_session_socket_live(&s.socket_path) {
-            s.live = true;
-            return true;
-        }
-        let _ = std::fs::remove_file(&s.socket_path);
-        let _ = std::fs::remove_file(mux_core::server::pid_path(&s.socket_path));
-        swept += 1;
-        false
-    });
-    swept
+    let before = sessions.len();
+    sessions.retain_mut(|s| reap_stale_row(s, skip_socket));
+    before - sessions.len()
+}
+
+/// The single-row reap step shared by every caller of
+/// [`reap_stale_discovered`] (and by the root-guarded enumerate path).
+/// Returns whether the row survives: `true` keeps it (already live, the
+/// session being started, or upgraded to live by the R5 re-probe), `false`
+/// drops it after unlinking its `.sock`/`.pid` pair.
+fn reap_stale_row(s: &mut DiscoveredSession, skip_socket: Option<&std::path::Path>) -> bool {
+    if s.live {
+        return true;
+    }
+    if skip_socket == Some(s.socket_path.as_path()) {
+        return true;
+    }
+    if mux_core::server::is_session_socket_live(&s.socket_path) {
+        s.live = true;
+        return true;
+    }
+    let _ = std::fs::remove_file(&s.socket_path);
+    let _ = std::fs::remove_file(mux_core::server::pid_path(&s.socket_path));
+    false
 }
 
 /// Kill every stale (socket-not-connectable) session in the runtime dir

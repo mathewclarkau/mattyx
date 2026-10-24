@@ -101,9 +101,13 @@ Notes on the mapping between CLI verbs and socket commands:
   the same name. `kill-stale --dry-run` is a read-only preview of the same
   reap: it reports the stale `.sock`/`.pid` pairs and unlinks nothing.
   Human-readable `list-sessions` lazily reaps stale `.sock`/`.pid` pairs on
-  enumerate by default (`--no-gc` opts out); `list-sessions --json` stays
-  read-only by default unless `--gc` is passed, in which case stale pairs are
-  swept and `"swept": <n>` is included in the JSON envelope (issue #138).
+  enumerate by default (`--no-gc`, or the equivalent `--gc 0`, opts out);
+  `list-sessions --json` stays read-only by default unless `--gc` is passed,
+  in which case stale pairs are swept and `"swept": <n>` is included in the
+  JSON envelope (issue #138). The lazy reap is scoped to the canonical
+  `mtyx-<uid>` and legacy `cmux-<uid>` runtime dirs — matching the daemon
+  startup sweep: a `--socket` that pins discovery to some other directory
+  still reports those pairs but never unlinks them.
 - `mtyx agent <start|prompt|wait|read|list>` is a CLI-only noun rewritten
   onto flat verbs before dispatch (the `agent-pattern` pattern): `agent
   start` composes `new-tab` + `agent-register` in one CLI flow, `agent

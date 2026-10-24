@@ -276,24 +276,29 @@ pub fn is_cmux_process(pid: u32) -> bool {
 }
 
 /// Check if a session socket path is live (connectable AND process is alive if pidfile present).
+///
+/// Staleness requires **both** signals to fail (issue #137): the socket
+/// must refuse a connection *and* the pidfile must name a dead/non-mtyx
+/// process. A connectable socket is therefore an unconditional veto against
+/// removal (issue #138 AC2, PID-reuse shape): a stale or reused pidfile
+/// must never cause a demonstrably-serving listener to be unlinked.
 pub fn is_session_socket_live(socket_path: &Path) -> bool {
     if !socket_path.exists() {
         return false;
     }
-    if transport::connect(socket_path).is_err() {
-        return false;
+    // Signal 1: accepts a connection -> live, regardless of the pidfile.
+    if transport::connect(socket_path).is_ok() {
+        return true;
     }
-    let pid_p = pid_path(socket_path);
-    if pid_p.exists() {
-        if let Ok(content) = std::fs::read_to_string(&pid_p) {
-            if let Ok(pid) = content.trim().parse::<u32>() {
-                if !is_mtyx_process(pid) {
-                    return false;
-                }
-            }
+    // Signal 2: connect refused, so consult the pidfile. A live mtyx pid
+    // vetoes removal (concurrently-starting daemon, or PID reuse landing
+    // on us); a dead/non-mtyx or missing pid agrees with the refusal.
+    if let Ok(content) = std::fs::read_to_string(pid_path(socket_path)) {
+        if let Ok(pid) = content.trim().parse::<u32>() {
+            return is_mtyx_process(pid);
         }
     }
-    true
+    false
 }
 
 /// Client-side socket resolution for a session (rename compat).

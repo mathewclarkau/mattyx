@@ -4017,11 +4017,14 @@ fn explicit_socket_outside_runtime_roots_skips_sweep() {
     c.assert_reaped();
 }
 
-/// Issue #138 AC1/AC2/AC3: human-readable `mtyx list-sessions` lazily reaps
-/// stale `.sock`/`.pid` pairs on enumerate by default (`--no-gc` opts out),
-/// while preserving live sessions and R5 bind-before-pidfile sockets.
+/// Issue #138 AC1/AC2/AC3 + review finding F1: human-readable
+/// `mtyx list-sessions` lazily reaps stale `.sock`/`.pid` pairs inside the
+/// guarded runtime roots, while pairs reachable only through an explicit
+/// `--socket` outside those roots are reported-but-untouched (the same
+/// scope the #137 daemon-startup sweep honours). Live sessions and R5
+/// bind-before-pidfile sockets always survive.
 #[test]
-fn list_sessions_lazy_gc_reaps_stale_and_preserves_live_session() {
+fn list_sessions_lazy_gc_reports_out_of_root_pairs_without_reaping() {
     let dir = unique_temp_dir("list-lazy-gc");
     fs::create_dir_all(&dir).unwrap();
     let live_sock = dir.join("live-gc.sock");
@@ -4048,7 +4051,9 @@ fn list_sessions_lazy_gc_reaps_stale_and_preserves_live_session() {
     }
     assert!(live_sock.exists());
 
-    // Plant a dead pair and a concurrently-starting (bound listener, no pidfile) socket.
+    // Plant a dead pair and a concurrently-starting (bound listener, no
+    // pidfile) socket. `dir` is NOT `$XDG_RUNTIME_DIR/mtyx-<uid>`, so the
+    // enumerate-time reap must leave the dead pair alone (review finding F1).
     let stale_sock = dir.join("dead-gc.sock");
     let stale_pid = dir.join("dead-gc.pid");
     fs::write(&stale_sock, "fake").unwrap();
@@ -4065,39 +4070,136 @@ fn list_sessions_lazy_gc_reaps_stale_and_preserves_live_session() {
     assert!(stale_sock.exists(), "--no-gc must not unlink stale socket");
     assert!(stale_pid.exists(), "--no-gc must not unlink stale pid");
 
-    // Default human-readable `list-sessions` reaps `dead-gc` in one invocation.
+    // Default human-readable `list-sessions` reports `dead-gc` but leaves the
+    // out-of-root pair untouched (F1: guarded scope, not just discovery scope).
     let gc_out = run_against(&live_sock, &dir, &["list-sessions"]);
     assert_success(&gc_out);
     let gc_stdout = String::from_utf8_lossy(&gc_out.stdout);
+    let gc_stderr = String::from_utf8_lossy(&gc_out.stderr);
     assert!(
-        !gc_stdout.contains("dead-gc"),
-        "reaped stale session must not appear in output: {gc_stdout}"
+        gc_stdout.contains("dead-gc"),
+        "out-of-root stale session must still be reported: {gc_stdout}"
     );
     assert!(gc_stdout.contains("live-gc"), "live session must appear: {gc_stdout}");
-    assert!(!stale_sock.exists(), "dead-gc.sock must be reaped by list-sessions");
-    assert!(!stale_pid.exists(), "dead-gc.pid must be reaped by list-sessions");
+    assert!(stale_sock.exists(), "out-of-root dead-gc.sock must SURVIVE list-sessions");
+    assert!(stale_pid.exists(), "out-of-root dead-gc.pid must SURVIVE list-sessions");
     assert!(live_sock.exists(), "live-gc.sock must survive list-sessions");
     assert!(live_pid.exists(), "live-gc.pid must survive list-sessions");
     assert!(starting_sock.exists(), "connectable starting-gc.sock must survive list-sessions");
+    assert!(
+        !gc_stderr.contains("swept"),
+        "nothing was swept, so the human path must stay silent on stderr: {gc_stderr}"
+    );
 
+    // The planted pair deliberately survives (that is the F1 assertion
+    // above); drop it so the guard's leftover-file scan sees a clean dir.
+    let _ = fs::remove_file(&stale_sock);
+    let _ = fs::remove_file(&stale_pid);
     drop(listener);
     let _ = fs::remove_file(&starting_sock);
     child.assert_reaped();
 }
 
+/// The canonical `$XDG_RUNTIME_DIR/mtyx-<uid>` root for a child whose
+/// `XDG_RUNTIME_DIR` is `xdg` (derived, since the child resolves its own uid
+/// from the environment — CI runners are not always uid 1000).
+fn runtime_root_under(xdg: &std::path::Path) -> PathBuf {
+    xdg.join(format!("mtyx-{}", unsafe { libc::getuid() }))
+}
+
+/// Issue #138 AC3 + AC5/F6: an in-root stale pair is reaped by one
+/// human-readable `list-sessions` invocation and the sweep is announced on
+/// stderr (stdout rows keep their shape); a concurrently-bound socket with
+/// no pidfile survives the R5 re-probe.
+#[test]
+fn list_sessions_lazy_gc_reaps_in_runtime_root_and_reports_on_stderr() {
+    let dir = unique_temp_dir("list-lazy-gc-root");
+    fs::create_dir_all(&dir).unwrap();
+    let root = runtime_root_under(&dir);
+    fs::create_dir_all(&root).unwrap();
+
+    let dead_sock = root.join("dead-root.sock");
+    let dead_pid = root.join("dead-root.pid");
+    fs::write(&dead_sock, "fake").unwrap();
+    fs::write(&dead_pid, "999999\n").unwrap();
+
+    // R5 canary: bound listener, no pidfile yet — connectable sockets are
+    // never reaped.
+    let starting_sock = root.join("starting-root.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&starting_sock).unwrap();
+
+    // `--socket` inside the canonical root pins discovery there, so the
+    // in-root pair is discovered AND (unlike the out-of-root case above)
+    // reaped.
+    let anchor = root.join("anchor-root.sock");
+    let out = run_against(&anchor, &dir, &["list-sessions"]);
+    assert_success(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stdout.contains("dead-root"), "reaped row must leave stdout: {stdout}");
+    assert!(
+        stderr.contains("swept 1 stale session(s)"),
+        "human path must announce the sweep on stderr: {stderr}"
+    );
+    assert!(!dead_sock.exists(), "in-root dead pair must be reaped");
+    assert!(!dead_pid.exists(), "in-root dead pid must be reaped");
+    assert!(starting_sock.exists(), "connectable starting-root.sock must survive");
+
+    drop(listener);
+    let _ = fs::remove_file(&starting_sock);
+}
+
+/// Issue #138 AC2 (PID-reuse shape) + review finding F2: a socket that still
+/// accepts connections is live even when its pidfile names a dead (or
+/// reused) pid. The connect veto must win, so `list-sessions` leaves it
+/// alone. It lives inside the canonical root so F1's root guard cannot be
+/// what saves it — this is the classifier's rule under test.
+#[test]
+fn list_sessions_lazy_gc_pid_reuse_canary_survives() {
+    let dir = unique_temp_dir("list-pid-reuse");
+    fs::create_dir_all(&dir).unwrap();
+    let root = runtime_root_under(&dir);
+    fs::create_dir_all(&root).unwrap();
+
+    let reused_sock = root.join("reused.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&reused_sock).unwrap();
+    let reused_pid = root.join("reused.pid");
+    // 999999 is not a live process: a stale (or PID-reused) pidfile next to
+    // a demonstrably-serving listener.
+    fs::write(&reused_pid, "999999\n").unwrap();
+
+    let out = run_against(&reused_sock, &dir, &["list-sessions"]);
+    assert_success(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        reused_sock.exists(),
+        "connectable socket must survive a stale pidfile (AC2 PID-reuse shape)"
+    );
+    assert!(reused_pid.exists(), "its pidfile must survive too");
+    assert!(!stderr.contains("swept"), "nothing may be swept: {stderr}");
+
+    drop(listener);
+    let _ = fs::remove_file(&reused_sock);
+    let _ = fs::remove_file(&reused_pid);
+}
+
 /// Issue #138 AC4/AC5: offline enumerate (zero live daemons on the box) and
 /// `--json` opt-in (`--gc`). Plain `--json list-sessions` stays read-only;
 /// `--json list-sessions --gc` sweeps dead pairs and reports `"swept": N`.
+/// The fixtures live in the canonical runtime root so they are reapable
+/// under the guarded scope (review finding F1).
 #[test]
 fn list_sessions_json_gc_flag_reaps_and_reports_swept_count_offline() {
     let dir = unique_temp_dir("list-json-gc-offline");
     fs::create_dir_all(&dir).unwrap();
-    let anchor = dir.join("anchor.sock");
+    let root = runtime_root_under(&dir);
+    fs::create_dir_all(&root).unwrap();
+    let anchor = root.join("anchor.sock");
 
-    let s1_sock = dir.join("offline-a.sock");
-    let s1_pid = dir.join("offline-a.pid");
-    let s2_sock = dir.join("offline-b.sock");
-    let s2_pid = dir.join("offline-b.pid");
+    let s1_sock = root.join("offline-a.sock");
+    let s1_pid = root.join("offline-a.pid");
+    let s2_sock = root.join("offline-b.sock");
+    let s2_pid = root.join("offline-b.pid");
     fs::write(&s1_sock, "fake").unwrap();
     fs::write(&s1_pid, "999998\n").unwrap();
     fs::write(&s2_sock, "fake").unwrap();
