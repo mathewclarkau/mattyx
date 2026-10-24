@@ -1,14 +1,22 @@
 # Quickstart
 
-**`mtyx`** (`mattyx`) is an agent-aware terminal multiplexer backed by `libghostty-vt`. It runs on Linux, macOS (`aarch64` and `x86_64`), and Windows (ConPTY), and exposes every workspace, pane, and coding agent over a versioned JSON-Lines control socket (protocol v7).
+**`mtyx`** (`mattyx`) is an agent-aware terminal multiplexer backed by `libghostty-vt`. It runs on Linux, macOS (`aarch64` and `x86_64`), and Windows (ConPTY), and exposes every workspace, pane, and coding agent over a versioned JSON-Lines control socket (protocol v8).
 
 ## 1. Install `mtyx`
 
-### Prebuilt binary (`Linux` & `macOS`, `x86_64` / `aarch64`)
+### Prebuilt Linux binary (`x86_64` / `aarch64`)
 
 ```bash
 curl -fsSL -o ~/.local/bin/mtyx \
   "https://github.com/mathewclarkau/mattyx/releases/latest/download/mtyx-linux-$(uname -m)"
+chmod +x ~/.local/bin/mtyx
+```
+
+### Prebuilt macOS binary (`arm64` / `x86_64`)
+
+```bash
+curl -fsSL -o ~/.local/bin/mtyx \
+  "https://github.com/mathewclarkau/mattyx/releases/latest/download/mtyx-macos-$(uname -m | sed 's/arm64/aarch64/')"
 chmod +x ~/.local/bin/mtyx
 ```
 
@@ -46,7 +54,8 @@ mtyx attach --session agents  # attach a second TUI client to the same session
 
 Inside the TUI (`Ctrl-b` prefix, or `Alt+` modeless bindings):
 
-- `Ctrl-b c` — new shell tab in the focused pane
+- `Ctrl-b t` — new shell tab in the focused pane
+- `Ctrl-b c` — new screen in the active workspace
 - `Ctrl-b %` / `Ctrl-b "` — split pane right / down
 - `Ctrl-b w` / `Ctrl-b W` — next workspace / new workspace
 - `Ctrl-b S` — interactive session manager (switch, rename, or kill sessions)

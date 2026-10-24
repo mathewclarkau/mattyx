@@ -8,9 +8,9 @@ Full release assets (`linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `macos-x8
 
 ---
 
-## Recent Highlights (0.17.x – 0.27.x → 1.0)
+## Recent Highlights (0.17.x – 0.28.x → 1.0)
 
-### Multi-Agent Factory & Control Protocol v7
+### Multi-Agent Factory & Control Protocol v8
 - **First-class `mtyx agent` noun (`start`, `prompt`, `wait`, `read`, `list`):** Spawn named agents (`agent-register` at `hook` authority), send prompts with blocked-send gating (`agent-prompt`), block on state transitions (`wait-agent-status --require-transition`), and read unwrapped output (`agent-read --source recent-unwrapped`) guarded against mid-turn reads (`agent_not_idle`).
 - **Receipted input (`input-ack`) by default (`mtyx send`):** `send` blocks until the daemon observes PTY output consumption or process exit (`capabilities["input-ack"] == true` in `identify`).
 - **Durable notifications & `notify-ack` (Issue #92):** Per-client high-water mark tracking on `subscribe --client <id>` replays unread notifications before live events.

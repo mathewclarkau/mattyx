@@ -27,13 +27,13 @@ Every multiplexer makes trade-offs. This page compares **`mtyx`** (`mattyx`) aga
 1. **Programmatic multi-agent orchestration (the "agent factory" loop):**
    In `tmux`, driving an AI coding agent from a supervisor script means `tmux send-keys` (fire-and-forget) followed by `sleep` loops and regex scraping `tmux capture-pane`. If the agent pops a permission modal right before your script sends a prompt, `send-keys` types blindly into the modal.
    In `mtyx`:
-   - `mtyx send` is **receipted by default** (`input-ack` in protocol v7).
+   - `mtyx send` is **receipted by default** (`input-ack` in protocol v8).
    - `mtyx agent prompt <name> "..."` refuses with `agent_blocked` if the agent is waiting on an approval dialog.
    - `mtyx agent read <name> --source recent-unwrapped` refuses with `agent_not_idle` while the agent is mid-turn, and rejoins soft-wrapped terminal lines cleanly.
    - `mtyx agent wait <name> --status blocked --require-transition` blocks on the exact state sequence transition without polling.
 
 2. **Headless-first & TUI-optional:**
-   Every session daemon (`mtyx --headless --session <name>`) speaks the exact same protocol v7 JSON-Lines contract whether a TUI is attached or not. CI pipelines and background supervisor agents can run an entire fleet headlessly while a human attaches (`mtyx attach`) and detaches (`Ctrl-b d`) on demand.
+   Every session daemon (`mtyx --headless --session <name>`) speaks the exact same protocol v8 JSON-Lines contract whether a TUI is attached or not. CI pipelines and background supervisor agents can run an entire fleet headlessly while a human attaches (`mtyx attach`) and detaches (`Ctrl-b d`) on demand.
 
 3. **Persistent remote SSH workspaces without remote root/packages:**
    `mtyx ssh user@host` cross-compiles and caches a tiny single-file `mtyxd-remote` binary locally, uploads it to the remote user's home directory, and streams the remote PTY over an NDJSON SSH pipe. If your laptop sleeps or SSH drops, re-opening `mtyx` reattaches to the still-running remote shell and replays scrollback.
