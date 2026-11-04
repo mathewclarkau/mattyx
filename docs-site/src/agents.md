@@ -41,6 +41,8 @@ mtyx agents install --only codex --uninstall --global
 | **Grok CLI** | `mtyx grok install-hooks` | `.grok/hooks/mtyx-agent-state.json` | `~/.grok/hooks/mtyx-agent-state.json` | Grok Build hook schema |
 | **Aider** | `mtyx aider install-hooks` | `.bin/aider` | `~/.local/bin/aider` | Exec wrapper reporting `working` on start and `done` on exit |
 
+Hook scripts locate their pane's control socket and surface id through `MTYX_MUX_SOCKET` / `MTYX_MUX_SURFACE`. The pre-rename `CMUX_*` spellings (`CMUX_MUX_SOCKET`, `CMUX_MUX_SURFACE`, `CMUX_PANEL_ID`, `CMUX_SOCKET_PATH`) are still exported beside the canonical `MTYX_*` names at pane spawn — intentionally, so Grok Build's multiplexer detector and legacy cmux-era hook scripts keep working without modification.
+
 ### Per-Agent State Mapping
 
 | State | Sidebar State Dot | Meaning | Gate Behavior (`send` / `agent prompt` / `agent read`) |

@@ -168,6 +168,12 @@ mtyx attach --session agents  # attach a second TUI to an already-running sessio
 See [`mux/docs/getting-started.md`](./mux/docs/getting-started.md) for headless mode, socket paths, and session
 persistence/restore semantics.
 
+Every pane exports `MTYX_MUX_SOCKET` / `MTYX_MUX_SURFACE` (plus `MTYX_PANEL_ID` and `MTYX_SOCKET_PATH`) so hook
+scripts can call back into the control socket. The pre-rename `CMUX_*` spellings of those variables
+(`CMUX_MUX_SOCKET`, `CMUX_MUX_SURFACE`, `CMUX_PANEL_ID`, `CMUX_SOCKET_PATH`) are dual-written beside the canonical
+names on purpose — Grok Build's multiplexer detector and legacy cmux-era scripts still read them (see
+`Surface::spawn` in `mux/crates/mux-core/src/surface.rs`).
+
 ## Status
 
 The vendored `mux-tui` builds and runs as-is on Linux (verified on this machine).
@@ -286,6 +292,12 @@ mtyx grok install-hooks            # workspace hooks in .grok/hooks/mtyx-agent-s
 mtyx grok install-hooks --global   # global hooks in ~/.grok/hooks/mtyx-agent-state.json
 mtyx grok install-hooks --uninstall
 ```
+
+All installed hooks locate their pane via `MTYX_MUX_SOCKET` / `MTYX_MUX_SURFACE`, exported into every pane at
+spawn. The legacy `CMUX_*` env-var names (`CMUX_MUX_SOCKET`, `CMUX_MUX_SURFACE`, `CMUX_PANEL_ID`,
+`CMUX_SOCKET_PATH`) are retained intentionally — dual-written beside the canonical `MTYX_*` names — so the Grok
+multiplexer detector and pre-rename cmux-era scripts keep working unchanged
+(`mux/crates/mux-core/src/surface.rs`).
 
 ## Documentation
 

@@ -372,6 +372,10 @@ fn run_resume(session_id: Option<&str>) -> i32 {
 //   "hooks": { "Stop": [ { "hooks": [ { "type": "command", "command": "..." } ] } ] }
 // Installing merges our command into every event we care about without
 // touching any other hooks the user already configured for those events.
+// Legacy cmux-era hook commands are swept from EVERY event key — tracked
+// or not — on both install and uninstall (issue #165), so a stale
+// `cmux claude hook` can never survive under an event we don't install
+// into.
 
 const HOOK_EVENTS: &[&str] = &[
     "SessionStart",
@@ -390,6 +394,37 @@ fn claude_settings_path() -> Option<PathBuf> {
 
 fn hook_command() -> String {
     format!("{} claude hook", crate::hook_merge::hook_bin())
+}
+
+/// Strip every hook command mtyx — or its pre-rename `cmux` incarnation —
+/// ever installed from one event's entry array, and prune the groups the
+/// sweep emptied. Covers both group shapes `~/.claude/settings.json`
+/// uses:
+///
+///   * nested — `{"hooks": [{"type": "command", "command": ...}]}` (the
+///     documented form our installer writes): matching commands are
+///     removed from the inner list, and a group whose list ends up empty
+///     is dropped.
+///   * flat — `{"type": "command", "command": ...}` sitting directly in
+///     the event array (issue #165): the group *is* a single command
+///     hook, so a matching one is removed wholesale. Non-matching flat
+///     groups are left untouched.
+///
+/// Groups with neither a nested `hooks` array nor a top-level `command`
+/// (user data in some other shape) are kept, matching the pre-widening
+/// behavior of leaving alone anything with nothing of ours to strip.
+fn sweep_our_hook_entries(entries: &mut Vec<Value>, is_our_hook: &impl Fn(&str) -> bool) {
+    for group in entries.iter_mut() {
+        if let Some(list) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+            list.retain(|h| !h.get("command").and_then(Value::as_str).is_some_and(is_our_hook));
+        }
+    }
+    entries.retain(|group| {
+        if group.get("command").and_then(Value::as_str).is_some_and(is_our_hook) {
+            return false;
+        }
+        group.get("hooks").and_then(Value::as_array).map_or(true, |list| !list.is_empty())
+    });
 }
 
 fn run_install_hooks(uninstall: bool) -> i32 {
@@ -431,27 +466,34 @@ fn run_install_hooks(uninstall: bool) -> i32 {
     const HOOK_MARKER: &str = "claude hook";
     let is_our_hook = |cmd: &str| cmd.ends_with(HOOK_MARKER) || cmd.contains("cmux claude");
 
-    for event in HOOK_EVENTS {
-        if uninstall {
-            // Only touch events the user already has an entry for; don't
-            // manufacture new empty ones just to immediately remove them.
-            let Some(entries) = hooks.get_mut(*event).and_then(Value::as_array_mut) else {
-                continue;
-            };
-            for group in entries.iter_mut() {
-                if let Some(list) = group.get_mut("hooks").and_then(Value::as_array_mut) {
-                    list.retain(|h| {
-                        !h.get("command").and_then(Value::as_str).is_some_and(is_our_hook)
-                    });
-                }
-            }
-            entries.retain(|group| {
-                group.get("hooks").and_then(Value::as_array).map_or(true, |list| !list.is_empty())
-            });
-            if entries.is_empty() {
-                hooks.remove(*event);
-            }
-        } else {
+    // Issue #165: the sweep visits EVERY key under "hooks", not just the
+    // tracked events — a legacy cmux-era entry under an event we no longer
+    // (or never did) install into (e.g. PreCompact) would otherwise
+    // survive both install and uninstall. Untracked keys get strip-only
+    // treatment: legacy/ours is removed but nothing of ours is appended
+    // there, and a key left with no entries is dropped entirely.
+    let event_names: Vec<String> = hooks.keys().cloned().collect();
+    for event in &event_names {
+        // Only touch keys the user already has an entry for; don't
+        // manufacture new empty ones just to immediately prune them.
+        let Some(entries) = hooks.get_mut(event.as_str()).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        // Drop any prior installation of this hook (however it got its
+        // absolute path), so re-running install-hooks after a
+        // rebuild/rename replaces in place instead of accumulating a
+        // stale, now-broken duplicate.
+        sweep_our_hook_entries(entries, &is_our_hook);
+        if entries.is_empty() && (uninstall || !HOOK_EVENTS.contains(&event.as_str())) {
+            // On install, a tracked event's key survives even when the
+            // sweep emptied it — the pass below appends the fresh
+            // canonical entry into that (now clean) array.
+            hooks.remove(event.as_str());
+        }
+    }
+
+    if !uninstall {
+        for event in HOOK_EVENTS {
             let entries = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
             let Some(entries) = entries.as_array_mut() else {
                 eprintln!(
@@ -460,20 +502,6 @@ fn run_install_hooks(uninstall: bool) -> i32 {
                 );
                 continue;
             };
-            // Drop any prior installation of this hook (however it got its
-            // absolute path) before adding the current one, so re-running
-            // install-hooks after a rebuild/rename replaces in place instead
-            // of accumulating a stale, now-broken duplicate.
-            for group in entries.iter_mut() {
-                if let Some(list) = group.get_mut("hooks").and_then(Value::as_array_mut) {
-                    list.retain(|h| {
-                        !h.get("command").and_then(Value::as_str).is_some_and(is_our_hook)
-                    });
-                }
-            }
-            entries.retain(|group| {
-                group.get("hooks").and_then(Value::as_array).map_or(true, |list| !list.is_empty())
-            });
             entries.push(json!({ "hooks": [{ "type": "command", "command": command }] }));
         }
     }
@@ -758,6 +786,113 @@ mod tests {
         assert_eq!(stop_entries.len(), 1);
         let command = stop_entries[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(!command.contains("cmux-linux"), "cmux hook must be replaced: {command}");
+
+        std::env::remove_var("HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Walk every event key under "hooks" and collect every command
+    /// string, in both group shapes Claude Code settings use (nested
+    /// `{"hooks":[{"command":...}]}` and flat `{"command":...}` directly
+    /// in the event array). Lets a test assert "no cmux-era command
+    /// survives anywhere", not just under the events we track.
+    fn all_hook_commands(settings: &Value) -> Vec<String> {
+        let mut commands = Vec::new();
+        let Some(events) = settings.get("hooks").and_then(Value::as_object) else {
+            return commands;
+        };
+        for entries in events.values() {
+            let Some(groups) = entries.as_array() else { continue };
+            for group in groups {
+                if let Some(cmd) = group.get("command").and_then(Value::as_str) {
+                    commands.push(cmd.to_string());
+                }
+                if let Some(list) = group.get("hooks").and_then(Value::as_array) {
+                    for hook in list {
+                        if let Some(cmd) = hook.get("command").and_then(Value::as_str) {
+                            commands.push(cmd.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        commands
+    }
+
+    #[test]
+    fn install_hooks_sweeps_legacy_cmux_entries_under_all_events_and_flat_groups() {
+        // Issue #165: the sweep must reach (a) event keys we don't track
+        // (PreCompact here) and (b) flat groups carrying a top-level
+        // "command" instead of a nested "hooks" array — before the
+        // widening, a legacy `cmux claude hook` under either shape
+        // survived install AND uninstall (only the 8 tracked events were
+        // visited, and only their nested `hooks` arrays were swept).
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = temp_state_dir("install-cmux-sweep-widening");
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let fixture = r#"{"hooks":{"PreCompact":[{"hooks":[{"type":"command","command":"/home/x/Code/cmux/mux/target/release/cmux claude hook"}]}],"SessionStart":[{"type":"command","command":"/home/x/.local/bin/cmux claude hook"}],"Stop":[{"hooks":[{"type":"command","command":"echo keep me"}]}]}}"#;
+        std::fs::write(claude_dir.join("settings.json"), fixture).unwrap();
+        std::env::set_var("HOME", &dir);
+
+        let read_settings = || -> Value {
+            serde_json::from_str(
+                &std::fs::read_to_string(claude_dir.join("settings.json")).unwrap(),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(run_install_hooks(false), 0);
+
+        let settings = read_settings();
+        let commands = all_hook_commands(&settings);
+        assert!(
+            commands.iter().all(|c| !c.contains("cmux claude")),
+            "no cmux-era command may survive anywhere under hooks (untracked or flat): {commands:?}"
+        );
+        // The untracked event held ONLY a legacy entry, so its key must be
+        // gone entirely — not left behind as an empty array.
+        assert!(
+            settings["hooks"].get("PreCompact").is_none(),
+            "an untracked event left with no entries must be pruned"
+        );
+        // The flat legacy group was replaced by exactly one canonical
+        // entry (nested shape), and the user's own Stop hook survived.
+        let session_start = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(session_start.len(), 1, "flat legacy must be replaced, not appended to");
+        assert!(session_start[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("claude hook"));
+        assert!(commands.contains(&"echo keep me".to_string()));
+
+        // Double-install idempotency: the second run strips the first
+        // run's entries and re-appends identical ones, leaving the file
+        // semantically unchanged.
+        assert_eq!(run_install_hooks(false), 0, "installing twice must succeed");
+        assert_eq!(read_settings(), settings, "second install must be a semantic no-op");
+
+        // Uninstall runs the same widened sweep: re-seed the fixture and
+        // every cmux-era entry — including the one under the untracked
+        // PreCompact key and the flat SessionStart group — must go.
+        std::fs::write(claude_dir.join("settings.json"), fixture).unwrap();
+        assert_eq!(run_install_hooks(true), 0);
+
+        let settings = read_settings();
+        let commands = all_hook_commands(&settings);
+        assert!(
+            commands.iter().all(|c| !c.contains("cmux claude") && !c.ends_with("claude hook")),
+            "uninstall must remove both cmux-era and canonical entries everywhere: {commands:?}"
+        );
+        assert!(
+            settings["hooks"].get("PreCompact").is_none(),
+            "legacy entries under an untracked key must be removed by uninstall"
+        );
+        assert!(
+            settings["hooks"].get("SessionStart").is_none(),
+            "the flat-legacy-only event must be pruned by uninstall"
+        );
+        assert_eq!(commands, vec!["echo keep me".to_string()]);
 
         std::env::remove_var("HOME");
         let _ = std::fs::remove_dir_all(&dir);
