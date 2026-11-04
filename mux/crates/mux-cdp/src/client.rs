@@ -410,7 +410,7 @@ fn reader_loop(weak: Weak<Inner>, mut ws: WebSocket<TcpStream>, outbound: Receiv
         match message {
             Ok(Message::Text(text)) => handle_text(&inner, &text),
             Ok(Message::Binary(bytes)) => {
-                if let Ok(text) = String::from_utf8(bytes) {
+                if let Ok(text) = String::from_utf8(bytes.to_vec()) {
                     handle_text(&inner, &text);
                 }
             }
@@ -441,7 +441,7 @@ fn drain_outbound(
 ) -> anyhow::Result<()> {
     loop {
         match outbound.try_recv() {
-            Ok(text) => ws.send(Message::Text(text))?,
+            Ok(text) => ws.send(Message::text(text))?,
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Ok(()),
         }
     }
@@ -686,7 +686,7 @@ mod tests {
             let mut responses = 0usize;
 
             while responses < CALLS && Instant::now() < deadline {
-                ws.send(Message::Text(
+                ws.send(Message::text(
                     json!({
                         "method": "Target.targetInfoChanged",
                         "params": {
@@ -705,7 +705,7 @@ mod tests {
                     Ok(Message::Text(text)) => {
                         let request: Value = serde_json::from_str(&text).unwrap();
                         let id = request["id"].clone();
-                        ws.send(Message::Text(
+                        ws.send(Message::text(
                             json!({"id": id, "result": {"method": request["method"]}}).to_string(),
                         ))
                         .unwrap();
@@ -714,7 +714,7 @@ mod tests {
                     Ok(Message::Binary(bytes)) => {
                         let request: Value = serde_json::from_slice(&bytes).unwrap();
                         let id = request["id"].clone();
-                        ws.send(Message::Text(
+                        ws.send(Message::text(
                             json!({"id": id, "result": {"method": request["method"]}}).to_string(),
                         ))
                         .unwrap();

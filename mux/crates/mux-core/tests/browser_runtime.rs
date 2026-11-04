@@ -26,7 +26,7 @@ fn read_json(ws: &mut tungstenite::WebSocket<std::net::TcpStream>) -> Value {
 }
 
 fn write_json(ws: &mut tungstenite::WebSocket<std::net::TcpStream>, value: Value) {
-    ws.send(Message::Text(value.to_string())).unwrap();
+    ws.send(Message::text(value.to_string())).unwrap();
 }
 
 fn rpc(path: &std::path::Path, mut cmd: Value) -> Value {
