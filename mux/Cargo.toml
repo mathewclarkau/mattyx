@@ -33,7 +33,7 @@ portable-pty = "0.9"
 wasmtime = { version = "36", default-features = false, features = ["cranelift", "runtime"] }
 wasmtime-wasi = { version = "36", default-features = false, features = ["preview1"] }
 crossterm = "0.29"
-ratatui = "0.29"
+ratatui = "0.30"
 unicode-width = "0.2"
 base64 = "0.22"
 libc = "0.2"
