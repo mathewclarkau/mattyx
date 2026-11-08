@@ -123,7 +123,12 @@ use crate::{
 /// silently drops the whole `agent-state-changed` event otherwise, so a
 /// bump makes mismatched peers fail loudly at attach instead of losing
 /// state updates. 7 added the `input-ack` capability (confirmed/receipted
-/// `send`, issue #88); see the module docs.
+/// `send`, issue #88); see the module docs. The `osc7501` agent-state
+/// source (issue #176) deliberately adds NO bump: it extends the
+/// `source` vocabulary and advertises the additive `osc7501` capability
+/// key instead (peers discover it via the `identify` capabilities
+/// record; pre-#176 remote binaries silently drop `agent-state-changed`
+/// events whose `source` they cannot parse).
 pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Issue #88: hard cap on a CONFIRMED send payload (bytes of `text` plus
@@ -146,6 +151,13 @@ pub const MAX_INPUT_ACK_TIMEOUT_MS: u64 = 60_000;
 /// `capabilities` object. A daemon reporting it implements confirmed
 /// (receipted) input for `send` (see the module docs).
 pub const CAP_INPUT_ACK: &str = "input-ack";
+
+/// Issue #176: the OSC 7501 capability key in the `identify` response's
+/// `capabilities` object. A daemon reporting it scrapes OSC 7501
+/// in-band agent status (`ESC ] 7501 ; state=<state>:app=<name>`) from
+/// pane pty output and publishes it as the highest-authority
+/// `AgentStateSource` tier (wire value `osc7501`).
+pub const CAP_OSC_7501: &str = "osc7501";
 
 /// True when an `identify` response's `data` advertises the input-ACK
 /// capability (issue #88).
@@ -814,7 +826,8 @@ enum Command {
     },
     /// D1 (`mtyx agent start`): register a unique agent NAME on a
     /// freshly spawned surface, at HOOK authority. The report ladder is
-    /// Detected < Socket < Hook (see [`crate::AgentStateSource`]); a
+    /// Heuristic < Detected < Socket < Hook < Osc7501 (see
+    /// [`crate::AgentStateSource`]); a
     /// socket-source registration would lose the race against a
     /// fast-starting agent whose first hook report lands first (that
     /// report is then current and rejects the socket report, so the
@@ -1988,8 +2001,10 @@ fn handle_command(
             "protocol": PROTOCOL_VERSION,
             // Issue #88 capability record: a client wanting confirmed
             // (receipted) send gates on this before sending `confirm:true`
-            // (see require_input_ack_capability).
-            "capabilities": { CAP_INPUT_ACK: true },
+            // (see require_input_ack_capability). Issue #176: the
+            // additive `osc7501` capability names OSC 7501 in-band
+            // agent-status capture (F2: no PROTOCOL_VERSION bump).
+            "capabilities": { CAP_INPUT_ACK: true, CAP_OSC_7501: true },
             "session": mux.session_name(),
             "pid": std::process::id(),
         })),

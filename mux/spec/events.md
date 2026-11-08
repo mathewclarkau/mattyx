@@ -329,7 +329,7 @@ object{
   surface:Id,
   previous:"working"|"blocked"|"idle"|"done"|"unknown"|null,
   state:"working"|"blocked"|"idle"|"done"|"unknown",
-  source:"heuristic"|"detected"|"socket"|"hook",  // "heuristic" since protocol 8 (issue #140)
+  source:"heuristic"|"detected"|"socket"|"hook"|"osc7501",  // "heuristic" and "osc7501" since protocol 8 (issues #140, #176)
   session:string|null,
   agent:string|null,
   message:string|null,
@@ -337,7 +337,7 @@ object{
 }
 ```
 
-Meaning: The authoritative agent state for a surface changed. Hook-authority and socket reports override detection as described in `commands.md`; `heuristic` (protocol 8, issue #140's zero-config screen heuristics) is the lowest tier. `agent`/`message` are issue #75's report fields (the pane's agent name and the latest report's free-text message; `null` on older servers).
+Meaning: The authoritative agent state for a surface changed. Hook-authority and socket reports override detection as described in `commands.md`; `heuristic` (protocol 8, issue #140's zero-config screen heuristics) is the lowest tier, and `osc7501` (protocol 8, issue #176's in-band OSC 7501 watcher reading the pane's own pty output) is the highest — an active `osc7501` `working`/`blocked` report rejects every lower tier, while a terminal `osc7501` `done` report releases its authority to a newer lower-tier report (see `commands.md`'s `report-agent` and `mux/docs/protocol.md`). `agent`/`message` are issue #75's report fields (the pane's agent name and the latest report's free-text message; `null` on older servers). A remote peer whose binary predates the `osc7501` source parser silently drops these events (its parser requires a parseable `source`); the additive `capabilities["osc7501"]` flag advertises support.
 
 Example:
 

@@ -1,6 +1,6 @@
 # Command Contract
 
-This file specifies the JSON command contract for the mtyx protocol. Implemented commands match protocol v8 in `mux/crates/mux-core/src/server.rs`. Proposed commands are future protocol design (protocol 7 shipped the `identify` capabilities record and confirmed/receipted `send`, issue #88; protocol 8 added the `heuristic` agent-state source, issue #140).
+This file specifies the JSON command contract for the mtyx protocol. Implemented commands match protocol v8 in `mux/crates/mux-core/src/server.rs`. Proposed commands are future protocol design (protocol 7 shipped the `identify` capabilities record and confirmed/receipted `send`, issue #88; protocol 8 added the `heuristic` agent-state source, issue #140, and the in-band OSC 7501 `osc7501` source, issue #176).
 
 ## Notation
 
@@ -96,14 +96,14 @@ The `dead` pane variant is serialized by the v5 server only if the tree referenc
 
 Returns process and protocol metadata for the connected mux server. Clients use this command to verify that the socket endpoint is mtyx and to check feature compatibility.
 
-Since protocol 7 (issue #88) the result also carries a `capabilities` record for feature negotiation. The one defined capability is `input-ack` (confirmed/receipted `send`, see [`send`](#send)): a client wanting confirmed input must gate on `capabilities["input-ack"] == true` and refuse with a structured `legacy_host_receipt_rejected`-style error against a daemon lacking it, never silently downgrade. The bundled CLI performs this pre-flight automatically.
+Since protocol 7 (issue #88) the result also carries a `capabilities` record for feature negotiation. The defined capabilities are `input-ack` (confirmed/receipted `send`, see [`send`](#send)) and, since protocol 8 (issue #176, additive), `osc7501` (in-band OSC 7501 `agent-state-changed` events, see [`report-agent`](#report-agent)): a client wanting confirmed input must gate on `capabilities["input-ack"] == true` and refuse with a structured `legacy_host_receipt_rejected`-style error against a daemon lacking it, never silently downgrade. The bundled CLI performs this pre-flight automatically. The integer `protocol` stays 8; an older peer whose binary lacks the `osc7501` source parser silently drops those events, which is exactly why the additive capability exists.
 
 Params: none.
 
 Result:
 
 ```text
-object{app:"mtyx",version:string,protocol:uint32,capabilities:object{input-ack:bool},session:string,pid:uint32}
+object{app:"mtyx",version:string,protocol:uint32,capabilities:object{input-ack:bool,osc7501:bool},session:string,pid:uint32}
 ```
 
 Errors:
@@ -2272,7 +2272,7 @@ Example:
 | status | implemented   |
 | since  | protocol 6    |
 
-Returns known agent status records. Records may come from detection, explicit reports, or hooks — all three are implemented in this fork: `source: "detected"` comes from watching a surface's own pty output for an OSC 9 / OSC 777 / kitty desktop notification (see `mux-core/src/notify.rs`), which sets state `blocked`. Detected reports have the lowest authority: a `socket` or `hook` report always wins over a `detected` one, regardless of order (see `report-agent`'s authority rules below). Explicit hook-authority reports override detection for the same surface until another explicit report changes the state or the surface closes.
+Returns known agent status records. Records may come from detection, explicit reports, hooks, or the in-band OSC 7501 watcher — all implemented in this fork. `source: "detected"` comes from watching a surface's own pty output for an OSC 9 / OSC 777 / kitty desktop notification (see `mux-core/src/notify.rs`), which sets state `blocked`. `source: "heuristic"` (protocol 8, issue #140) is the zero-config screen classifier — the lowest tier. `source: "osc7501"` (protocol 8, issue #176) is the in-band OSC 7501 sequence parsed from the pane's own pty output — the highest tier. Authority is lowest-to-highest `heuristic` < `detected` < `socket` < `hook` < `osc7501`: a lower-tier report is rejected while a higher tier is current (see `report-agent`'s authority rules below), except that a terminal `osc7501` `done` report releases its authority to a newer lower-tier report. Explicit hook/socket reports override detection for the same surface until another explicit report changes the state or the surface closes.
 
 Params:
 
@@ -2288,7 +2288,7 @@ object{
   agents: array<object{
     surface: Id,
     state: "working"|"blocked"|"idle"|"done"|"unknown",
-    source: "detected"|"socket"|"hook",
+    source: "heuristic"|"detected"|"socket"|"hook"|"osc7501",
     session: string|null,
     agent: string|null,
     message: string|null,
@@ -2332,7 +2332,7 @@ Example:
 | status | implemented    |
 | since  | protocol 6     |
 
-Reports agent state for a surface. This is a telemetry command and must not change focus. Reports with `source:"hook"` have hook authority and override detector-derived state. Reports with `source:"socket"` override detector-derived state but are lower priority than a newer hook report (concretely: a `socket` report is rejected outright while the current report's source is `hook`, regardless of timing). `source:"heuristic"` (protocol 8, issue #140) is the lowest tier: the zero-config screen heuristics behind `detect-agent` and the daemon's background poller publish there, and it is rejected while a `detected`/`socket`/`hook` report is current — hooks always win.
+Reports agent state for a surface. This is a telemetry command and must not change focus. Reports with `source:"hook"` have hook authority and override detector-derived state. Reports with `source:"socket"` override detector-derived state but are lower priority than a newer hook report (concretely: a `socket` report is rejected outright while the current report's source is `hook`, regardless of timing). `source:"heuristic"` (protocol 8, issue #140) is the zero-config screen heuristics behind `detect-agent` and the daemon's background poller, and it is rejected while a `detected`/`socket`/`hook`/`osc7501` report is current — hooks always win. `source:"osc7501"` (protocol 8, issue #176) is the in-band OSC 7501 watcher reading the pane's own pty output; it is the highest tier and is rejected only by another `osc7501` report. An active `osc7501` report rejects every lower tier; a terminal `osc7501` `done` report stays visible but releases authority, so a subsequent lower-tier report is accepted and replaces it (with a `state_seq` bump); a fresh active `osc7501` report re-arms the highest authority. See `mux/docs/protocol.md` for the full in-band contract.
 
 Params:
 
@@ -2340,7 +2340,7 @@ Params:
 | --------- | --------- | ---------------- | ------------------------------------------------------------ |
 | `surface` | `IdRef`   | required         | Surface associated with the agent                            |
 | `state`   | `string`  | required         | `"working"`, `"blocked"`, `"idle"`, `"done"`, or `"unknown"` |
-| `source`  | `string`  | default `"socket"` | `"heuristic"` (protocol 8), `"detected"`, `"socket"`, or `"hook"` |
+| `source`  | `string`  | default `"socket"` | `"heuristic"` (protocol 8), `"detected"`, `"socket"`, `"hook"`, or `"osc7501"` (protocol 8, issue #176; normally set by the in-band PTY watcher rather than a client) |
 | `session` | `string`  | default null     | Optional upstream agent session id                           |
 | `agent`   | `string`  | default null     | Optional agent name (issue #75); preserved by later reports that omit it, used for the name-addressed verbs |
 | `message` | `string`  | default null     | Optional free-text context (issue #75); the latest applied report wins |
@@ -2365,7 +2365,7 @@ CLI mapping:
 | Item         | Value                           |
 | ------------ | ------------------------------- |
 | Verb         | `report-agent`                  |
-| Flags        | `[--surface <id>] --state working | blocked | idle | done | unknown [--source heuristic | detected | socket | hook] [--agent-session <id>] [--agent <name>] [--message <text>]` |
+| Flags        | `[--surface <id>] --state working | blocked | idle | done | unknown [--source heuristic | detected | socket | hook | osc7501] [--agent-session <id>] [--agent <name>] [--message <text>]` |
 | Plain stdout | no output                       |
 | JSON stdout  | exact result object             |
 | Exit codes   | common                          |

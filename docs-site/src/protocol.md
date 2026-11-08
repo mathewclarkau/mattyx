@@ -20,11 +20,11 @@ The client (`mtyx <verb>`) resolves the daemon socket in this order:
 
 ## identify
 
-`identify` reports the protocol version and, since protocol 7 (issue #88), a `capabilities` record for feature negotiation. The one defined capability is `input-ack`: confirmed (receipted) `send` — see [Confirmed Input](#confirmed-input-receipted-send). A client wanting confirmed input must gate on `capabilities["input-ack"] == true` and refuse (structured `legacy_host_receipt_rejected` error) against a daemon lacking it, never silently downgrade.
+`identify` reports the protocol version and, since protocol 7 (issue #88), a `capabilities` record for feature negotiation. The defined capabilities are `input-ack`: confirmed (receipted) `send` — see [Confirmed Input](#confirmed-input-receipted-send) — and, since protocol 8 (issue #176, additive), `osc7501`: in-band OSC 7501 agent status (see [In-band agent status](#in-band-agent-status-osc-7501)). A client wanting confirmed input must gate on `capabilities["input-ack"] == true` and refuse (structured `legacy_host_receipt_rejected` error) against a daemon lacking it, never silently downgrade. A client that wants OSC 7501 `agent-state-changed` events to parse can gate on `capabilities["osc7501"] == true`.
 
 ```json
 {"id":1,"cmd":"identify"}
-{"id":1,"ok":true,"data":{"app":"mtyx","version":"...","protocol":8,"capabilities":{"input-ack":true},"session":"main","pid":12345}}
+{"id":1,"ok":true,"data":{"app":"mtyx","version":"...","protocol":8,"capabilities":{"input-ack":true,"osc7501":true},"session":"main","pid":12345}}
 ```
 
 ## Reply Envelope
@@ -53,6 +53,7 @@ Responses have this shape:
 | **Confirmed Input (`mtyx send`, default `--confirm`)** | Refused with `legacy_host_receipt_rejected` on pre-v7 daemons (`capabilities["input-ack"]` absent); supported on v7 | Supported (`capabilities["input-ack"] == true`) | Supported |
 | **Unconfirmed Input (`mtyx send --no-confirm`, `write-bytes`)** | Supported | Supported | Supported |
 | **Agent Factory Verbs (`agent-register`, `agent-prompt`, `wait-agent-status`)** | Unsupported on pre-v7 daemons; supported on v7 | Supported (`agent_register_shape`, `agent_prompt_shape_and_blocked_gate`) | Supported |
+| **In-band agent status (OSC 7501, `report-agent` source `osc7501`)** | `agent-state-changed` events silently dropped (no `osc7501` source parser) | Supported (`capabilities["osc7501"] == true`, `osc7501_source_value_is_pinned_in_agent_and_workspace_payloads`) | Supported (additive capability) |
 <!-- PROTOCOL_COMPAT_MATRIX_END -->
 
 ## Command Contract
@@ -231,6 +232,7 @@ Live subscribed event lines are flat objects keyed by `"event"`:
 {"event":"tree-changed"}
 {"event":"empty"}
 {"event":"agent-state-changed","surface":1,"previous":null,"state":"working","source":"hook","session":"abc123","agent":"claude","message":null,"updated_at_ms":1710000000000,"state_seq":7}
+{"event":"agent-state-changed","surface":2,"previous":"working","state":"done","source":"osc7501","session":null,"agent":"my-agent","message":null,"updated_at_ms":1710000000000,"state_seq":9}
 {"event":"osc-notification","surface":3,"title":"","body":"Build failed"}
 {"event":"notification","surface":3,"id":12,"title":"Build failed","body":"...","timestamp_ms":1710000000000}
 ```
@@ -321,7 +323,7 @@ Each PTY tab in `list-workspaces` carries `cwd`: the shell's live OSC 7 report w
 {"id":50,"ok":true,"data":{"surface":1,"state":"working","source":"hook","session":"abc123","updated_at_ms":1710000000000}}
 ```
 
-`state` is one of `working`, `blocked`, `idle`, `done`, `unknown`. `source` is `heuristic`, `detected`, `socket`, or `hook`, lowest to highest authority: a hook report always applies; a socket report is rejected while the current source is a hook report (so an ad hoc `report-agent` call from a script can't clobber a live hook integration); a `detected` report — mux-core watching the surface's own output, currently just OSC desktop notifications, see [Desktop Notifications](#desktop-notifications) below — is rejected while the current source is `socket` or `hook`; and a `heuristic` report (protocol 8, issue #140) — the zero-config screen-marker classifier behind `detect-agent` and the daemon's background poller — is rejected while any of the other three is current. Hooks (and explicit reports generally) always win over heuristics. Every PTY tab in `list-workspaces` also carries `agent_source` (protocol 8): the applied report's tier, `null` alongside `agent_state` when nothing has reported, so frontends can render hook-grade and heuristic-grade state differently. Subscribers see accepted reports as `agent-state-changed`:
+`state` is one of `working`, `blocked`, `idle`, `done`, `unknown`. `source` is `heuristic`, `detected`, `socket`, `hook`, or `osc7501`, lowest to highest authority: a hook report always applies over `socket`/`detected`/`heuristic`; a socket report is rejected while the current source is a hook report (so an ad hoc `report-agent` call from a script can't clobber a live hook integration); a `detected` report — mux-core watching the surface's own output, currently just OSC desktop notifications, see [Desktop Notifications](#desktop-notifications) below — is rejected while the current source is `socket` or `hook`; a `heuristic` report (protocol 8, issue #140) — the zero-config screen-marker classifier behind `detect-agent` and the daemon's background poller — is rejected while any of the other tiers is current; and `osc7501` (protocol 8, issue #176) — mux-core watching the surface's own raw PTY output for the in-band OSC 7501 sequence, see [In-band agent status](#in-band-agent-status-osc-7501) — is the highest tier, rejected only by another `osc7501` report. Hooks (and explicit reports generally) always win over heuristics. Every PTY tab in `list-workspaces` also carries `agent_source` (protocol 8): the applied report's tier, `null` alongside `agent_state` when nothing has reported, so frontends can render hook-grade, in-band, and heuristic-grade state differently. Subscribers see accepted reports as `agent-state-changed`:
 
 ```json
 {"event":"agent-state-changed","surface":1,"previous":null,"state":"working","source":"hook","session":"abc123","agent":"claude","message":null,"updated_at_ms":1710000000000,"state_seq":7}
@@ -336,7 +338,22 @@ Each PTY tab in `list-workspaces` carries `cwd`: the shell's live OSC 7 report w
 {"id":51,"ok":true,"data":{"agents":[{"surface":3,"state":"blocked","source":"hook","session":"abc123","updated_at_ms":1710000000000}]}}
 ```
 
-The effective agent state used by the `send`/`agent-read` gates is: the latest explicit report (socket/hook/detected, by the authority ladder above) if any, otherwise a fresh classification of the screen contents by the built-in agent detector (`detect-agent`/`detect-agents`/`agent-pattern-*` manage the pattern table).
+The effective agent state used by the `send`/`agent-read` gates is: the latest explicit report (socket/hook/detected/osc7501, by the authority ladder above) if any, otherwise a fresh classification of the screen contents by the built-in agent detector (`detect-agent`/`detect-agents`/`agent-pattern-*` manage the pattern table).
+
+### In-band agent status (OSC 7501)
+
+Protocol 8 (issue #176, additive) adds a third agent-state source: an agent can report its own state by writing the OSC 7501 escape sequence to its PTY. mux-core scans the raw bytes of every PTY read in Rust — no hook install and no configuration — so a bare pane running a 7501-speaking agent shows state on its own:
+
+```text
+ESC ] 7501 ; state=working:app=my-agent ESC \
+ESC ] 7501 ; state=waiting BEL
+```
+
+Supported `state` values map as `working` → `working`, `waiting` → `blocked`, and `done` → `done`. Both terminators are accepted — ST (`ESC \`) and BEL — and a sequence split across PTY read boundaries is reassembled. `app=<name>` becomes the report's `agent` name; an absent `app` keeps the pane's established name, exactly like any other report that omits `agent`. Malformed payloads and unknown state names are ignored without changing pane state.
+
+`osc7501` is the highest authority tier: an active `working`/`blocked` report rejects every lower tier (`hook`, `socket`, `detected`, `heuristic`). A terminal `done` report remains observable as `done`/`osc7501`, but it releases that authority — a newer lower-tier report is then accepted, replaces the stale terminal report, and advances `state_seq`; a fresh active `osc7501` report re-arms the highest authority. Identical `osc7501` reports are **not** deduplicated: each applied report advances `state_seq` and emits `agent-state-changed`.
+
+The additive `identify` capability `capabilities["osc7501"]` advertises support; the integer `protocol` stays 8. An older remote binary lacking the `osc7501` source parser silently drops `agent-state-changed` events whose `source` is `osc7501` (its event parser requires a parseable source), which is exactly why the capability exists — a peer discovers support without a protocol bump.
 
 ## Desktop Notifications
 

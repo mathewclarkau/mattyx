@@ -2029,7 +2029,9 @@ reattaching to remote session {session_id} on {host} \
 
     /// Reports agent state for a surface (see `spec/commands.md`). Returns
     /// the report now in effect, which may be unchanged from before if a
-    /// lower-authority source tried to override a hook report.
+    /// lower-authority source tried to override a hook report or an
+    /// ACTIVE OSC 7501 report (issue #176; a terminal OSC 7501 `done`
+    /// report releases its precedence — see `Surface::set_agent_report`).
     pub fn report_agent(
         &self,
         target: SurfaceId,
@@ -4097,6 +4099,8 @@ mod tests {
 
     /// Issue #140 D1: the wire name round-trips and the declaration
     /// order keeps `Heuristic` strictly below `Detected < Socket < Hook`.
+    /// Issue #176 pins `Osc7501` LAST, strictly above `Hook`: the
+    /// highest-authority tier, wire token `osc7501`.
     #[test]
     fn agent_state_source_heuristic_round_trips_and_ranks_lowest() {
         assert_eq!(AgentStateSource::Heuristic.as_str(), "heuristic");
@@ -4104,6 +4108,148 @@ mod tests {
         assert!(AgentStateSource::Heuristic < AgentStateSource::Detected);
         assert!(AgentStateSource::Detected < AgentStateSource::Socket);
         assert!(AgentStateSource::Socket < AgentStateSource::Hook);
+        assert!(AgentStateSource::Hook < AgentStateSource::Osc7501);
+        assert_eq!(AgentStateSource::Osc7501.as_str(), "osc7501");
+        assert_eq!(AgentStateSource::parse("osc7501"), Some(AgentStateSource::Osc7501));
+    }
+
+    /// Issue #176 A3: an ACTIVE OSC 7501 report (Working/Blocked) is the
+    /// highest-authority source — it overrides hook reports, and while
+    /// it is current no lower tier may replace it.
+    #[test]
+    fn report_agent_active_osc7501_outranks_all_other_sources() {
+        let mux = test_mux();
+        mux.new_workspace(None, None).unwrap();
+        let surface = mux.with_state(|s| {
+            let pane = s.workspaces[0].screens[0].active_pane;
+            s.panes[&pane].tabs[0]
+        });
+
+        // A hook report is the current source…
+        mux.report_agent(surface, AgentState::Working, AgentStateSource::Hook, None, None, None)
+            .unwrap();
+        // …and OSC 7501 overrides it.
+        let report = mux
+            .report_agent(
+                surface,
+                AgentState::Working,
+                AgentStateSource::Osc7501,
+                None,
+                Some("test-agent".into()),
+                None,
+            )
+            .unwrap();
+        assert_eq!(report.state, AgentState::Working);
+        assert_eq!(report.source, AgentStateSource::Osc7501);
+        assert_eq!(report.agent.as_deref(), Some("test-agent"));
+
+        // While the 7501 report is ACTIVE (Working), every lower tier is
+        // rejected and the report in effect stays put.
+        for (state, source) in [
+            (AgentState::Idle, AgentStateSource::Hook),
+            (AgentState::Done, AgentStateSource::Socket),
+            (AgentState::Blocked, AgentStateSource::Detected),
+            (AgentState::Working, AgentStateSource::Heuristic),
+        ] {
+            let report = mux.report_agent(surface, state, source, None, None, None).unwrap();
+            assert_eq!(
+                report.state,
+                AgentState::Working,
+                "{source:?} must not override an active osc7501 report"
+            );
+            assert_eq!(report.source, AgentStateSource::Osc7501);
+        }
+
+        // An active Blocked report holds the line just the same.
+        mux.report_agent(surface, AgentState::Blocked, AgentStateSource::Osc7501, None, None, None)
+            .unwrap();
+        for (state, source) in [
+            (AgentState::Working, AgentStateSource::Hook),
+            (AgentState::Idle, AgentStateSource::Heuristic),
+        ] {
+            let report = mux.report_agent(surface, state, source, None, None, None).unwrap();
+            assert_eq!(report.state, AgentState::Blocked);
+            assert_eq!(report.source, AgentStateSource::Osc7501);
+        }
+    }
+
+    /// Issue #176 A3 (done-releases-authority): a terminal OSC 7501
+    /// `Done` report no longer masks a subsequently arriving lower-tier
+    /// report — the newer report applies (name preserved, state_seq
+    /// bumped, event emitted). A fresh non-done 7501 report re-arms
+    /// highest-authority precedence.
+    #[test]
+    fn report_agent_done_osc7501_releases_authority_to_lower_tiers() {
+        let mux = test_mux();
+        mux.new_workspace(None, None).unwrap();
+        let surface = mux.with_state(|s| {
+            let pane = s.workspaces[0].screens[0].active_pane;
+            s.panes[&pane].tabs[0]
+        });
+
+        // The agent runs and finishes: working -> done at OSC 7501.
+        mux.report_agent(
+            surface,
+            AgentState::Working,
+            AgentStateSource::Osc7501,
+            None,
+            Some("agent".into()),
+            None,
+        )
+        .unwrap();
+        let done = mux
+            .report_agent(surface, AgentState::Done, AgentStateSource::Osc7501, None, None, None)
+            .unwrap();
+        assert_eq!(done.state, AgentState::Done);
+        assert_eq!(done.source, AgentStateSource::Osc7501);
+        assert_eq!(done.agent.as_deref(), Some("agent"), "name survives reports that omit it");
+
+        // The stale terminal report must not outrank fresh evidence: a
+        // lower-tier socket report arriving AFTER `done` applies.
+        let events = mux.subscribe();
+        let report = mux
+            .report_agent(surface, AgentState::Working, AgentStateSource::Socket, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Working);
+        assert_eq!(report.source, AgentStateSource::Socket);
+        assert_eq!(report.agent.as_deref(), Some("agent"), "name-preservation still applies");
+        assert!(report.state_seq > done.state_seq, "an applied report bumps state_seq");
+        let fired = events.try_iter().any(|e| {
+            matches!(e, MuxEvent::AgentStateChanged { report, .. }
+                if report.source == AgentStateSource::Socket)
+        });
+        assert!(fired, "the applied lower-tier report must emit agent-state-changed");
+
+        // A fresh ACTIVE 7501 report re-arms highest authority…
+        mux.report_agent(surface, AgentState::Blocked, AgentStateSource::Osc7501, None, None, None)
+            .unwrap();
+        // …and lower tiers are rejected again.
+        let report = mux
+            .report_agent(surface, AgentState::Working, AgentStateSource::Hook, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Blocked);
+        assert_eq!(report.source, AgentStateSource::Osc7501);
+    }
+
+    /// Issue #176: the done carve-out is scoped to the OSC 7501/Done
+    /// pair only — a Done report from any other tier keeps its normal
+    /// precedence.
+    #[test]
+    fn report_agent_done_from_other_tiers_keeps_authority() {
+        let mux = test_mux();
+        mux.new_workspace(None, None).unwrap();
+        let surface = mux.with_state(|s| {
+            let pane = s.workspaces[0].screens[0].active_pane;
+            s.panes[&pane].tabs[0]
+        });
+
+        mux.report_agent(surface, AgentState::Done, AgentStateSource::Hook, None, None, None)
+            .unwrap();
+        let report = mux
+            .report_agent(surface, AgentState::Working, AgentStateSource::Socket, None, None, None)
+            .unwrap();
+        assert_eq!(report.state, AgentState::Done, "done is only carved out for the osc7501 tier");
+        assert_eq!(report.source, AgentStateSource::Hook);
     }
 
     #[test]

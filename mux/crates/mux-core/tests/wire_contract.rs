@@ -16,11 +16,22 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mux_core::platform::transport;
 use mux_core::{Mux, SurfaceOptions};
 use serde_json::{json, Value};
+
+fn wait_for<T>(mut f: impl FnMut() -> Option<T>, timeout: Duration) -> Option<T> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Some(v) = f() {
+            return Some(v);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
 
 fn unique_session(prefix: &str) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -79,12 +90,19 @@ impl Drop for WireServer {
 }
 
 fn mux_with_workspace(prefix: &str) -> WireServer {
+    mux_with_command(prefix, vec!["/bin/cat".to_string()])
+}
+
+/// Same isolated runtime + RAII session as [`mux_with_workspace`], but the
+/// seeded workspace runs an arbitrary command — used to drive real PTY
+/// output (e.g. the OSC 7501 fixture) through the reader/watcher path.
+fn mux_with_command(prefix: &str, command: Vec<String>) -> WireServer {
     isolate_runtime_dir();
     let mux = Mux::new(
         unique_session(prefix),
         SurfaceOptions {
             // A stub child so nothing depends on the user's login shell.
-            command: Some(vec!["/bin/cat".to_string()]),
+            command: Some(command),
             ..Default::default()
         },
     );
@@ -120,6 +138,72 @@ fn identify_envelope_and_data_shape() {
         capabilities["input-ack"].is_boolean(),
         "capabilities.input-ack must be a bool: {capabilities}"
     );
+    // Issue #176: additive boolean capability for in-band OSC 7501 agent
+    // status. `PROTOCOL_VERSION` stays 8; peers discover support here.
+    assert!(
+        capabilities["osc7501"].is_boolean(),
+        "capabilities.osc7501 must be a bool: {capabilities}"
+    );
+}
+
+/// Issue #176: the OSC 7501 tier is a real wire value. A pane emitting the
+/// sequence through its own PTY reports at `source: "osc7501"` in both the
+/// `list-agents` record and the `list-workspaces` per-tab `agent_source`
+/// snapshot. A direct `report-agent` is deliberately NOT used: the value
+/// under test is the one parsed out of raw PTY bytes.
+#[test]
+fn osc7501_source_value_is_pinned_in_agent_and_workspace_payloads() {
+    let server = mux_with_command(
+        "wire-osc7501",
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            // Alternate working/waiting so the record exists for the whole
+            // 10s polling budget regardless of when the RPC lands.
+            "while true; do printf '\\033]7501;state=working:app=wire-agent\\033\\\\'; \
+             sleep 1; printf '\\033]7501;state=waiting\\033\\\\'; sleep 1; done"
+                .to_string(),
+        ],
+    );
+
+    let agent = wait_for(
+        || {
+            let resp = rpc(&server.sock, json!({"id": 20, "cmd": "list-agents"}));
+            resp["data"]["agents"].as_array()?.iter().find_map(|agent| {
+                (agent["surface"].as_u64() == Some(server.surface)
+                    && agent["source"].as_str() == Some("osc7501"))
+                .then(|| agent.clone())
+            })
+        },
+        Duration::from_secs(10),
+    )
+    .expect("list-agents record must carry source osc7501");
+    assert_eq!(agent["source"], json!("osc7501"));
+    assert!(agent["state"].is_string(), "state must be a string: {agent}");
+    assert_eq!(agent["agent"], json!("wire-agent"), "app= populates the record name");
+    assert!(agent["updated_at_ms"].is_number(), "updated_at_ms must be a number: {agent}");
+    assert!(agent["state_seq"].is_number(), "state_seq must be a number: {agent}");
+
+    let source = wait_for(
+        || {
+            let resp = rpc(&server.sock, json!({"id": 21, "cmd": "list-workspaces"}));
+            for workspace in resp["data"]["workspaces"].as_array()? {
+                for screen in workspace["screens"].as_array()? {
+                    for pane in screen["panes"].as_array()? {
+                        for tab in pane["tabs"].as_array()? {
+                            if tab["surface"].as_u64() == Some(server.surface) {
+                                return tab["agent_source"].as_str().map(str::to_string);
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        },
+        Duration::from_secs(10),
+    )
+    .expect("list-workspaces agent_source must be osc7501");
+    assert_eq!(source, "osc7501");
 }
 
 #[test]

@@ -199,11 +199,18 @@ impl AgentState {
 /// report is rejected while a hook report is the current source; a
 /// detected report (from watching the surface's own output, e.g. an OSC 9
 /// notification) is rejected while either an explicit socket or hook
-/// report is current; and a heuristic report (issue #140: the zero-config
+/// report is current; a heuristic report (issue #140: the zero-config
 /// screen classifier behind `detect-agent` and the background poller) is
-/// rejected while ANY of the above is current (see `spec/commands.md`'s
-/// `report-agent` authority rules, which name the tiers lowest to
-/// highest: "heuristic", "detected", "socket", "hook").
+/// rejected while ANY of the above is current; and an OSC 7501 report
+/// (issue #176: the agent explicitly self-reporting in-band on the
+/// pane's own pty, `ESC ] 7501 ; state=<state>:app=<name>`) outranks
+/// every tier below it — declared LAST so the derived `Ord` makes it
+/// the highest authority (see `spec/commands.md`'s `report-agent`
+/// authority rules, which name the tiers lowest to highest: "heuristic",
+/// "detected", "socket", "hook", "osc7501"). One carve-out: a terminal
+/// OSC 7501 `done` report releases its precedence — see
+/// [`Surface::set_agent_report`] (issue #176's done-releases-authority
+/// rule).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AgentStateSource {
     /// Issue #140: screen-marker classification (the heuristic layer).
@@ -214,6 +221,11 @@ pub enum AgentStateSource {
     Detected,
     Socket,
     Hook,
+    /// Issue #176: OSC 7501 in-band agent status (`ESC ] 7501 ;
+    /// state=<state>:app=<name>` on the pane's pty). Declared LAST so
+    /// it is strictly the highest tier; a terminal `done` report
+    /// releases that precedence (see `Surface::set_agent_report`).
+    Osc7501,
 }
 
 impl AgentStateSource {
@@ -223,6 +235,7 @@ impl AgentStateSource {
             AgentStateSource::Detected => "detected",
             AgentStateSource::Socket => "socket",
             AgentStateSource::Hook => "hook",
+            AgentStateSource::Osc7501 => "osc7501",
         }
     }
 
@@ -232,6 +245,7 @@ impl AgentStateSource {
             "detected" => AgentStateSource::Detected,
             "socket" => AgentStateSource::Socket,
             "hook" => AgentStateSource::Hook,
+            "osc7501" => AgentStateSource::Osc7501,
             _ => return None,
         })
     }
@@ -638,6 +652,13 @@ impl Surface {
                 // notification detection for this surface rather than
                 // failing the whole pty.
                 let mut osc_watcher = crate::notify::OscWatcher::new().ok();
+                // Issue #176: OSC 7501 in-band agent status. A second,
+                // independent side-channel scanner over the same raw
+                // chunk (same discipline as the notification watcher: it
+                // can never desync the authoritative `vt_write` parse
+                // above), publishing at the highest-authority source
+                // tier via `report_surface_agent`.
+                let mut osc7501_watcher = crate::agent_osc7501::Osc7501Watcher::new();
                 loop {
                     let n = match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
@@ -668,6 +689,23 @@ impl Surface {
                         }
                         if let Some(pwd) = term.pwd() {
                             *pty.pwd.lock().unwrap() = Some(pwd);
+                        }
+                    }
+                    // Issue #176: feed the 7501 scanner before the
+                    // notification watcher so a highest-tier 7501 report
+                    // from this chunk applies first and any lower-tier
+                    // notification classification of the same chunk is
+                    // rejected by the normal authority rule.
+                    for report in osc7501_watcher.feed(&buf[..n]) {
+                        if let Some(mux) = mux.upgrade() {
+                            mux.report_surface_agent(
+                                &surface,
+                                report.state,
+                                crate::AgentStateSource::Osc7501,
+                                None,
+                                report.app,
+                                None,
+                            );
                         }
                     }
                     if let Some(watcher) = osc_watcher.as_mut() {
@@ -1007,10 +1045,20 @@ impl Surface {
 
     /// Applies a new agent-state report under the authority rules from
     /// `spec/commands.md`: a hook report always applies; a socket report
-    /// is rejected while the current source is a hook report. Returns the
-    /// report now in effect and whether this call is the one that applied
-    /// it (`false` when rejected by the authority rule, in which case the
-    /// report is the unchanged prior one), or `None` for a non-PTY surface.
+    /// is rejected while the current source is a hook report; and an
+    /// OSC 7501 report (issue #176) outranks every lower tier while its
+    /// agent is active. Returns the report now in effect and whether
+    /// this call is the one that applied it (`false` when rejected by
+    /// the authority rule, in which case the report is the unchanged
+    /// prior one), or `None` for a non-PTY surface.
+    ///
+    /// Issue #176's done-releases-authority rule: a terminal OSC 7501
+    /// report (`Osc7501` source + `Done` state) stops exercising its
+    /// top-tier precedence — a subsequently arriving lower-tier report
+    /// is then accepted like any other normal report (`state_seq` bump
+    /// and `AgentStateChanged` event included), so a stale "done" cannot
+    /// mask newer evidence once the agent has finished. A fresh
+    /// non-`Done` OSC 7501 report re-arms highest-authority precedence.
     ///
     /// Name semantics (issue #75): an incoming report that omits `agent`
     /// keeps the pane's established name (names live as long as the pane
@@ -1026,7 +1074,11 @@ impl Surface {
     ) -> Option<(AgentReport, bool)> {
         let pty = self.as_pty()?;
         let mut current = pty.agent.lock().unwrap();
-        let accept = current.as_ref().map_or(true, |existing| source >= existing.source);
+        let accept = current.as_ref().map_or(true, |existing| {
+            source >= existing.source
+                || (existing.source == AgentStateSource::Osc7501
+                    && existing.state == AgentState::Done)
+        });
         if accept {
             let agent = agent.or_else(|| current.as_ref().and_then(|r| r.agent.clone()));
             // Issue #93: every applied report advances the sequence, so a
