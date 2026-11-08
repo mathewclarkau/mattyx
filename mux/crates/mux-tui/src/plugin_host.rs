@@ -22,8 +22,8 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use wasmtime::{Config, Engine, Instance, Linker, Module, Store, Trap};
-use wasmtime_wasi::preview1::{add_to_linker_sync, WasiP1Ctx};
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
+use wasmtime_wasi::p1::{add_to_linker_sync, WasiP1Ctx};
+use wasmtime_wasi::{FsPerms, WasiCtxBuilder};
 
 use crate::plugin::{Capabilities, PluginEntry};
 
@@ -253,13 +253,13 @@ pub fn build_wasi(
         }
     }
     builder
-        .preopened_dir(plugin_data_dir, ".", DirPerms::all(), FilePerms::all())
+        .preopened_dir(plugin_data_dir, ".", FsPerms::ReadWrite)
         .map_err(|e| format!("failed to preopen plugin data dir {plugin_data_dir:?}: {e}"))?;
     if let Some(extra) = &cap.filesystem {
         for path_str in extra {
             let p = PathBuf::from(path_str);
             if p.exists() {
-                builder.preopened_dir(&p, ".", DirPerms::all(), FilePerms::all()).map_err(|e| {
+                builder.preopened_dir(&p, ".", FsPerms::ReadWrite).map_err(|e| {
                     format!("failed to preopen manifest filesystem path {p:?}: {e}")
                 })?;
             }
