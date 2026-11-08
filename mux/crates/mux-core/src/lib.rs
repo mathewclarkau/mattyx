@@ -21,6 +21,7 @@ mod surface;
 pub mod worktree;
 
 pub mod agent_detect;
+pub mod agent_osc7501;
 pub mod agent_state_classify;
 pub mod layout;
 pub mod platform;
@@ -53,6 +54,7 @@ pub fn win_terminate_pid(pid: u32) -> bool {
 /// optional `-dirty`) for a build off a tag.
 pub const VERSION: &str = env!("MTYX_VERSION");
 
+pub use agent_osc7501::{Osc7501Report, Osc7501Watcher};
 pub use browser::normalize_url;
 pub use layout::{
     directional_neighbor, layout_screen, layout_screen_with_zoom, split_for_pane_edge, split_sides, LayoutResult, Rect,
