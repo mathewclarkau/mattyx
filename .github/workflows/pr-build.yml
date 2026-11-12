@@ -15,6 +15,9 @@ on:
   # reliable manual run path via `gh workflow run`.
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     strategy:
@@ -56,7 +59,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
 
@@ -96,7 +99,7 @@ jobs:
           sudo ln -sf "$(command -v clang-18)" /usr/bin/clang
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
 
       - name: Point bindgen at LLVM (Windows)
         # windows-latest ships LLVM at C:\Program Files\LLVM with clang
@@ -152,7 +155,7 @@ jobs:
 
       - name: Setup Go
         if: runner.os != 'Windows'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: daemon/remote/go.mod
 
