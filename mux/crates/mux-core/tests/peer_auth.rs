@@ -60,15 +60,15 @@ fn rpc(socket: &Path, request: Value) -> Value {
 fn same_uid_accepted() {
     let socket = scratch_socket("same_uid");
     let us = platform::daemon_uid().expect("unix host has a uid");
-    // Issue #128: only Linux reports peer credentials. Linux must keep the
-    // check armed. Other unix hosts (macos-15 CI) use the documented
-    // filesystem-permissions fallback.
-    #[cfg(target_os = "linux")]
+    // Issue #86 / SEC-03: Linux (`SO_PEERCRED`) and macOS (`getpeereid`)
+    // report peer credentials and must keep the check armed. Other unix
+    // hosts use the documented filesystem-permissions fallback.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     assert!(
         platform::transport_supports_peer_creds(),
         "this test expects a credential-capable transport"
     );
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     assert_eq!(
         platform::peer_auth_decision(Ok(us), Some(us), platform::transport_supports_peer_creds()),
         PeerAuthDecision::Unsupported

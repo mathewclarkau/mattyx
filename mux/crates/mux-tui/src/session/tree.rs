@@ -32,8 +32,6 @@ pub struct WorkspaceView {
 #[derive(Clone)]
 pub struct ScreenView {
     pub id: ScreenId,
-    #[allow(dead_code)]
-    pub short_id: String,
     /// User-assigned name, if any (display falls back to the number).
     pub name: Option<String>,
     pub layout: Node,
@@ -86,11 +84,6 @@ pub struct TabView {
     /// cached by `detect-agent`. `None` when never detected or detected
     /// as `unknown` (no badge).
     pub agent_name: Option<String>,
-    /// Last agent message (issue #75): the `--message` free-text from
-    /// the surface's latest applied agent report. The status string
-    /// itself is derivable (`agent_state` or "unknown").
-    #[allow(dead_code)]
-    pub agent_message: Option<String>,
     pub kind: SurfaceKind,
     pub browser_source: Option<BrowserSource>,
     pub browser_frames_stalled: bool,
@@ -278,11 +271,6 @@ pub fn tree_from_state(state: &State) -> TreeView {
                         .and_then(|s| s.detected_agent())
                         .filter(|d| !d.is_unknown())
                         .map(|d| d.agent),
-                    agent_message: state
-                        .surfaces
-                        .get(sid)
-                        .and_then(|s| s.agent_report())
-                        .and_then(|r| r.message.clone()),
                     kind: state.surfaces.get(sid).map(|s| s.kind()).unwrap_or(SurfaceKind::Pty),
                     browser_source: state.surfaces.get(sid).and_then(|s| s.browser_source()),
                     browser_frames_stalled: state
@@ -314,7 +302,6 @@ pub fn tree_from_state(state: &State) -> TreeView {
                         screen.root.pane_ids(&mut pane_ids);
                         ScreenView {
                             id: screen.id,
-                            short_id: short_ids.get(&screen.id).cloned().unwrap_or_default(),
                             name: screen.name.clone(),
                             layout: screen.root.clone(),
                             active_pane: screen.active_pane,
@@ -413,10 +400,6 @@ fn parse_pane(value: &Value) -> Option<PaneView> {
                                 .get("agent_name")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
-                            agent_message: tab
-                                .get("agent_message")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string()),
                             kind: match tab.get("kind").and_then(|v| v.as_str()) {
                                 Some("browser") => SurfaceKind::Browser,
                                 _ => SurfaceKind::Pty,
@@ -442,7 +425,6 @@ fn parse_pane(value: &Value) -> Option<PaneView> {
 fn parse_screen(value: &Value) -> Option<ScreenView> {
     Some(ScreenView {
         id: value.get("id")?.as_u64()?,
-        short_id: value.get("short_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
         name: value.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
         layout: value.get("layout").and_then(parse_layout)?,
         active_pane: value.get("active_pane").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -728,9 +710,6 @@ mod tests {
         let tree = parse_tree(&data);
         let tabs = &tree.workspaces[0].screens[0].panes[0].tabs;
         assert_eq!(tabs[0].agent_state, Some(AgentState::Blocked));
-        assert_eq!(tabs[0].agent_message.as_deref(), Some("needs input"));
-        // Bare tab: no state, no message.
         assert_eq!(tabs[1].agent_state, None);
-        assert_eq!(tabs[1].agent_message, None);
     }
 }

@@ -1076,7 +1076,10 @@ fn create_dir_all_tracked(dir: &Path) -> std::io::Result<bool> {
 #[cfg(unix)]
 fn dir_owned_by_us(dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let Ok(meta) = std::fs::metadata(dir) else { return false };
+    let Ok(meta) = std::fs::symlink_metadata(dir) else { return false };
+    if meta.file_type().is_symlink() {
+        return false;
+    }
     meta.uid() == unsafe { libc::getuid() }
 }
 
@@ -1099,20 +1102,31 @@ pub fn serve(mux: Arc<Mux>, path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
         // socket itself is still chmod 0600 below and peer-authed above.
         let created = create_dir_all_tracked(dir)?;
         let default_runtime_dir = !explicit;
-        if created || default_runtime_dir || dir_owned_by_us(dir) {
+        #[cfg(unix)]
+        if default_runtime_dir && !dir_owned_by_us(dir) {
+            anyhow::bail!(
+                "runtime directory {} is not owned by this user or is a symlink; refusing to bind",
+                dir.display()
+            );
+        }
+        if created || dir_owned_by_us(dir) {
             platform::restrict_directory(dir)?;
         } else {
-            eprintln!(
-                "mtyx: warning: {dir} was not created by this process; leaving its \
-                 permissions alone (socket keeps 0600)",
-                dir = dir.display()
-            );
-            let _ = platform::restrict_directory(dir);
+            if default_runtime_dir {
+                platform::restrict_directory(dir)?;
+            } else {
+                eprintln!(
+                    "mtyx: warning: {dir} was not created by this process; leaving its \
+                     permissions alone (socket keeps 0600)",
+                    dir = dir.display()
+                );
+                let _ = platform::restrict_directory(dir);
+            }
         }
     }
     let pid_p = pid_path(&path);
-    // Refuse to clobber a live socket; remove a stale one.
-    if path.exists() || pid_p.exists() {
+    // Refuse to clobber a live socket; remove a stale one (including dangling symlinks).
+    if std::fs::symlink_metadata(&path).is_ok() || std::fs::symlink_metadata(&pid_p).is_ok() {
         if is_session_socket_live(&path) {
             anyhow::bail!(
                 "session socket {} is already in use (another instance running?)",
@@ -1129,7 +1143,18 @@ pub fn serve(mux: Arc<Mux>, path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     mux.set_socket_path(path.clone());
     platform::restrict_file(&path)?;
 
-    std::fs::write(&pid_p, format!("{}\n", std::process::id()))?;
+    let _ = std::fs::remove_file(&pid_p);
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut pid_file = opts.open(&pid_p)?;
+        writeln!(pid_file, "{}", std::process::id())?;
+    }
     platform::restrict_file(&pid_p)?;
 
     // Issue #89 shutdown-join audit: the accept thread and each per-conn
@@ -3652,5 +3677,22 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_owned_by_us_rejects_symlink() {
+        let base = std::env::temp_dir()
+            .join(format!("mtyx-srv-symlink-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real_dir = base.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        assert!(dir_owned_by_us(&real_dir));
+
+        let link_dir = base.join("link");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+        assert!(!dir_owned_by_us(&link_dir), "symlinked directory must not pass ownership check");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

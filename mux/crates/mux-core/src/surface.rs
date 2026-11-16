@@ -377,6 +377,10 @@ pub struct PtySurface {
     /// [`Surface::write_bytes_confirmed`]), not a byte-exact consumption
     /// proof.
     output_epoch: AtomicU64,
+    /// Guard + condvar paired with `output_epoch` and `dead` so confirmed sends
+    /// block in `wait_timeout` instead of spinning on a 2ms sleep loop.
+    output_lock: Mutex<()>,
+    output_cvar: Condvar,
     /// Confirmed-input FIFO state (issue #88): tickets are handed out in
     /// submission order and a confirmed send only writes while holding its
     /// turn, so concurrent confirmed sends to one surface resolve in
@@ -628,6 +632,8 @@ impl Surface {
             dead: AtomicBool::new(false),
             dirty: AtomicBool::new(false),
             output_epoch: AtomicU64::new(0),
+            output_lock: Mutex::new(()),
+            output_cvar: Condvar::new(),
             ack_gate: Mutex::new(AckGateState::default()),
             ack_turn: Condvar::new(),
             title: Mutex::new(String::new()),
@@ -691,6 +697,10 @@ impl Surface {
                             *pty.pwd.lock().unwrap() = Some(pwd);
                         }
                     }
+                    {
+                        let _g = pty.output_lock.lock().unwrap();
+                        pty.output_cvar.notify_all();
+                    }
                     // Issue #176: feed the 7501 scanner before the
                     // notification watcher so a highest-tier 7501 report
                     // from this chunk applies first and any lower-tier
@@ -745,6 +755,8 @@ impl Surface {
                 }
                 if let Some(pty) = surface.as_pty() {
                     pty.dead.store(true, Ordering::Release);
+                    let _g = pty.output_lock.lock().unwrap();
+                    pty.output_cvar.notify_all();
                 }
                 if let Some(mux) = mux.upgrade() {
                     mux.surface_exited(surface.id);
@@ -873,6 +885,7 @@ impl Surface {
                 writer.write_all(bytes)?;
                 writer.flush()?;
             }
+            let mut guard = pty.output_lock.lock().unwrap();
             loop {
                 if pty.dead.load(Ordering::Acquire) {
                     return Ok(());
@@ -886,7 +899,13 @@ impl Surface {
                         waited_ms: start.elapsed().as_millis() as u64,
                     });
                 }
-                std::thread::sleep((deadline - now).min(Duration::from_millis(2)));
+                let (next_guard, _) = pty
+                    .output_cvar
+                    .wait_timeout(guard, deadline - now)
+                    .map_err(|_| {
+                        ConfirmedSendError::Io(std::io::Error::other("output condvar poisoned"))
+                    })?;
+                guard = next_guard;
             }
         })();
 

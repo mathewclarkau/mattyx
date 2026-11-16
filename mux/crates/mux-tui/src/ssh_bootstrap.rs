@@ -45,7 +45,7 @@ pub fn run(args: &[String]) -> i32 {
                 eprintln!("mtyx: {USAGE}");
                 return 0;
             }
-            other if host.is_none() && !other.starts_with("--") => {
+            other if host.is_none() && !other.starts_with('-') => {
                 host = Some(other.to_string());
                 i += 1;
             }
@@ -154,8 +154,9 @@ fn write_stamp(stamp: &Path, version: &str) -> anyhow::Result<()> {
 }
 
 fn detect_remote_platform(host: &str) -> anyhow::Result<(String, String)> {
+    mux_core::remote_pty::validate_remote_host(host)?;
     let output = Command::new("ssh")
-        .args(["-o", "BatchMode=yes"])
+        .args(["-o", "BatchMode=yes", "--"])
         .arg(host)
         .arg("uname -s; uname -m")
         .output()?;
@@ -350,5 +351,10 @@ mod tests {
         write_stamp(&stamp, "0.17.2\r").unwrap();
         assert!(cache_is_fresh(&binary, &stamp, "0.17.2"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_rejects_leading_dash_host_argument() {
+        assert_eq!(run(&["-oProxyCommand=evil".to_string()]), 2);
     }
 }

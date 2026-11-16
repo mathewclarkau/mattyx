@@ -61,11 +61,6 @@ impl NotificationRing {
         NotificationRing { records: std::collections::VecDeque::new(), capacity: capacity.max(1) }
     }
 
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.records.len()
-    }
-
     /// Push a record, evicting the oldest once at capacity. Returns the
     /// evicted record, if any (so callers can assert pruning).
     pub fn push(&mut self, record: NotificationRecord) -> Option<NotificationRecord> {
@@ -229,7 +224,7 @@ mod tests {
                 timestamp_ms: id,
             });
         }
-        assert_eq!(ring.len(), 3, "ring must not grow past its cap");
+        assert_eq!(ring.records().count(), 3, "ring must not grow past its cap");
         let bodies: Vec<_> = ring.records().map(|r| r.body.clone()).collect();
         assert_eq!(bodies, vec!["n3", "n4", "n5"]);
         assert_eq!(ring.latest_id(), Some(5));

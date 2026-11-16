@@ -100,11 +100,6 @@ pub trait MtyxDispatcher: Send + Sync {
     fn dispatch(&self, request_json: String) -> Result<String, String>;
 }
 
-/// Backwards compatibility trait alias for `MtyxDispatcher`.
-#[allow(dead_code)]
-pub trait CmuxDispatcher: MtyxDispatcher {}
-impl<T: MtyxDispatcher + ?Sized> CmuxDispatcher for T {}
-
 /// Errors a plugin invocation can produce.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -177,46 +172,43 @@ fn validate_request_shape(
     if !token_ctx.verb_allowlist.iter().any(|v| v == &req.verb) {
         return Err(PluginError::VerbNotAllowed(req.verb.clone()));
     }
-    if token_ctx.socket_capability == SocketCapability::Read && is_mutating_verb(&req.verb) {
+    if token_ctx.socket_capability == SocketCapability::Off
+        || (token_ctx.socket_capability == SocketCapability::Read && is_mutating_verb(&req.verb))
+    {
         return Err(PluginError::WriteBlocked(req.verb.clone()));
     }
     Ok(())
 }
 
-/// Heuristic for which mtyx verbs are mutating. Conservative.
-fn is_mutating_verb(verb: &str) -> bool {
+/// Explicit allowlist of strictly read-only mtyx control-socket verbs.
+/// Default-deny: any verb not listed here is treated as mutating and
+/// blocked when `socket = "read"`.
+fn is_read_only_verb(verb: &str) -> bool {
     matches!(
         verb,
-        "set-default-colors"
-            | "rename-workspace"
-            | "rename-pane"
-            | "rename-surface"
-            | "rename-screen"
-            | "set-ratio"
-            | "close-surface"
-            | "close-pane"
-            | "zoom-pane"
-            | "close-screen"
-            | "close-workspace"
-            | "new-workspace"
-            | "new-screen"
-            | "new-tab"
-            | "run"
-            | "write-bytes"
-            | "split"
-            | "send"
-            | "browser-reload"
-            | "select-tab"
-            | "select-screen"
-            | "select-workspace"
-            | "move-tab"
-            | "move-workspace"
-            | "resize-surface"
-            | "scroll-surface"
-            | "focus-pane"
-            | "report-agent"
-            | "plugin"
+        "identify"
+            | "list-workspaces"
+            | "get-resolved-config"
+            | "read-screen"
+            | "vt-state"
+            | "list-agents"
+            | "detect-agent"
+            | "detect-agents"
+            | "agent-pattern-list"
+            | "pane-worktree-list"
+            | "agent-read"
+            | "layout-export"
+            | "layout-export-all"
+            | "subscribe"
+            | "wait-for"
+            | "wait-agent-status"
+            | "wait-ready"
     )
+}
+
+/// True for any verb outside [`is_read_only_verb`].
+fn is_mutating_verb(verb: &str) -> bool {
+    !is_read_only_verb(verb)
 }
 
 /// Build the wasmtime engine.
@@ -617,6 +609,15 @@ mod tests {
         // `socket = "read"` plugin must not slip it past the capability
         // model (and the #93 gate) by holding a read-only socket.
         assert!(is_mutating_verb("write-bytes"));
+        assert!(is_mutating_verb("rename-session"));
+        assert!(is_mutating_verb("layout-apply"));
+        assert!(is_mutating_verb("browser-navigate"));
+        assert!(is_mutating_verb("browser-insert-text"));
+        assert!(is_mutating_verb("agent-send"));
+        assert!(is_mutating_verb("agent-prompt"));
+        assert!(is_mutating_verb("pane-worktree-create"));
+        assert!(is_mutating_verb("new-remote-workspace"));
+        assert!(is_mutating_verb("unknown-future-verb"));
         assert!(!is_mutating_verb("list-workspaces"));
         assert!(!is_mutating_verb("read-screen"));
         assert!(!is_mutating_verb("identify"));
@@ -693,6 +694,25 @@ mod tests {
         };
         let err = validate_and_forward(
             r#"{"id":42,"verb":"set-default-colors","args":{}}"#,
+            42,
+            &token_ctx,
+            dispatcher,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PluginError::WriteBlocked(_)));
+    }
+
+    #[test]
+    fn validate_and_forward_blocks_all_verbs_on_off_socket() {
+        let dispatcher = Arc::new(MockDispatcher { captured: std::sync::Mutex::new(Vec::new()) });
+        let token_ctx = TokenContext {
+            plugin_name: "test".into(),
+            verb_allowlist: vec!["list-workspaces".into()],
+            socket_capability: SocketCapability::Off,
+            minted_at: Instant::now(),
+        };
+        let err = validate_and_forward(
+            r#"{"id":42,"verb":"list-workspaces","args":{}}"#,
             42,
             &token_ctx,
             dispatcher,

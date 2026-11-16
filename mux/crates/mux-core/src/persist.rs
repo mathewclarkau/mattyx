@@ -284,38 +284,37 @@ pub fn capture(state: &State) -> SessionSnapshot {
 fn capture_screen(state: &State, screen: &Screen) -> ScreenSnapshot {
     let mut pane_ids = Vec::new();
     screen.root.pane_ids(&mut pane_ids);
-    let index_of = |id: PaneId| pane_ids.iter().position(|&p| p == id).unwrap();
+    pane_ids.retain(|pid| state.panes.contains_key(pid));
+    let index_of = |id: PaneId| pane_ids.iter().position(|&p| p == id).unwrap_or(0);
 
     let panes = pane_ids
         .iter()
-        .map(|pid| {
-            let pane = &state.panes[pid];
-            PaneSnapshot {
-                name: pane.name.clone(),
-                active_tab_index: pane.active_tab,
-                tabs: pane
-                    .tabs
-                    .iter()
-                    .map(|sid| {
-                        let surface = state.surfaces.get(sid);
-                        let remote =
-                            surface.and_then(|s| s.remote_spec()).map(|spec| RemoteTabSnapshot {
-                                host: spec.host,
-                                slot: spec.slot,
-                                session_id: spec.session_id,
-                                local_binary_path: spec
-                                    .local_binary_path
-                                    .to_string_lossy()
-                                    .into_owned(),
-                            });
-                        TabSnapshot {
-                            name: surface.and_then(|s| s.name()),
-                            cwd: surface.and_then(|s| s.cwd()),
-                            remote,
-                        }
-                    })
-                    .collect(),
-            }
+        .filter_map(|pid| state.panes.get(pid))
+        .map(|pane| PaneSnapshot {
+            name: pane.name.clone(),
+            active_tab_index: pane.active_tab,
+            tabs: pane
+                .tabs
+                .iter()
+                .map(|sid| {
+                    let surface = state.surfaces.get(sid);
+                    let remote =
+                        surface.and_then(|s| s.remote_spec()).map(|spec| RemoteTabSnapshot {
+                            host: spec.host,
+                            slot: spec.slot,
+                            session_id: spec.session_id,
+                            local_binary_path: spec
+                                .local_binary_path
+                                .to_string_lossy()
+                                .into_owned(),
+                        });
+                    TabSnapshot {
+                        name: surface.and_then(|s| s.name()),
+                        cwd: surface.and_then(|s| s.cwd()),
+                        remote,
+                    }
+                })
+                .collect(),
         })
         .collect();
 
@@ -722,5 +721,56 @@ mod tests {
             }
         }
         assert!(!dir.join("session-backups").exists(), "no backups should be created for valid 0.x snapshots");
+    }
+
+    #[test]
+    fn capture_screen_tolerates_stale_active_pane_and_missing_leaf() {
+        use std::collections::HashMap;
+        use crate::model::{Pane, Workspace};
+
+        let mut panes = HashMap::new();
+        panes.insert(
+            1,
+            Pane {
+                id: 1,
+                name: Some("p1".into()),
+                tabs: vec![],
+                active_tab: 0,
+                active_at: 0,
+                worktrees: vec![],
+            },
+        );
+        let state = State {
+            workspaces: vec![Workspace {
+                id: 10,
+                name: "w".into(),
+                screens: vec![Screen {
+                    id: 20,
+                    name: None,
+                    root: Node::Split {
+                        dir: SplitDir::Right,
+                        ratio: 0.5,
+                        a: Box::new(Node::Leaf(1)),
+                        // Leaf 2 is missing from `state.panes`.
+                        b: Box::new(Node::Leaf(2)),
+                    },
+                    // Active pane 999 is not present in `root`.
+                    active_pane: 999,
+                    zoomed: None,
+                }],
+                active_screen: 0,
+                color: None,
+                icon: None,
+            }],
+            active_workspace: 0,
+            panes,
+            surfaces: HashMap::new(),
+        };
+
+        let snapshot = SessionSnapshot::capture(&state);
+        let screen = &snapshot.workspaces[0].screens[0];
+        assert_eq!(screen.active_pane_index, 0);
+        assert_eq!(screen.panes.len(), 1);
+        assert_eq!(screen.panes[0].name.as_deref(), Some("p1"));
     }
 }

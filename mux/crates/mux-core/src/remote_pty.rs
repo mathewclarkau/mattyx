@@ -86,10 +86,20 @@ fn random_token() -> String {
     format!("{:x}-{:x}-{:x}", std::process::id(), nanos, n)
 }
 
+/// Reject empty or leading-dash host strings that OpenSSH `ssh`/`scp` would
+/// parse as command-line flags (option injection).
+pub fn validate_remote_host(host: &str) -> anyhow::Result<()> {
+    if host.is_empty() || host.starts_with('-') {
+        anyhow::bail!("invalid remote host {host:?}: must not be empty or start with '-'");
+    }
+    Ok(())
+}
+
 /// Opens a `PtyPair` backed by a remote `mtyxd-remote` session. Uploads
 /// the daemon binary first if the remote copy is missing or doesn't match
 /// `spec.local_binary_path`'s hash.
 pub fn open_remote_pty(spec: &RemoteSpec, size: PtySize) -> anyhow::Result<PtyPair> {
+    validate_remote_host(&spec.host)?;
     let remote_bin = ensure_uploaded(&spec.host, &spec.local_binary_path)?;
     let conn = RemoteConn::spawn(&spec.host, &remote_bin, &spec.slot)?;
     let shared = Arc::new(RemoteShared {
@@ -118,10 +128,14 @@ const REMOTE_BIN_PATH: &str = ".cache/mattyx/mtyxd-remote";
 /// `host` unless a copy with the same SHA-256 is already there. Returns
 /// the remote path (relative to `$HOME`).
 fn ensure_uploaded(host: &str, local_binary_path: &std::path::Path) -> anyhow::Result<String> {
+    validate_remote_host(host)?;
     let local_hash = sha256_file(local_binary_path)?;
+    let quoted_bin = shell_quote(REMOTE_BIN_PATH);
     let remote_hash = ssh_output(
         host,
-        &format!("sha256sum {} 2>/dev/null | cut -d' ' -f1", shell_quote(REMOTE_BIN_PATH)),
+        &format!(
+            "(sha256sum {quoted_bin} || shasum -a 256 {quoted_bin}) 2>/dev/null | cut -d' ' -f1"
+        ),
     )
     .unwrap_or_default()
     .trim()
@@ -129,15 +143,24 @@ fn ensure_uploaded(host: &str, local_binary_path: &std::path::Path) -> anyhow::R
     if remote_hash != local_hash {
         let remote_dir = std::path::Path::new(REMOTE_BIN_PATH).parent().unwrap().to_str().unwrap();
         run_checked(
-            Command::new("ssh").arg(host).arg(format!("mkdir -p {}", shell_quote(remote_dir))),
+            Command::new("ssh")
+                .arg("--")
+                .arg(host)
+                .arg(format!("mkdir -p {}", shell_quote(remote_dir))),
             "mkdir remote cache dir",
         )?;
         run_checked(
-            Command::new("scp").arg(local_binary_path).arg(format!("{host}:{REMOTE_BIN_PATH}")),
+            Command::new("scp")
+                .arg("--")
+                .arg(local_binary_path)
+                .arg(format!("{host}:{REMOTE_BIN_PATH}")),
             "upload mtyxd-remote",
         )?;
         run_checked(
-            Command::new("ssh").arg(host).arg(format!("chmod +x {}", shell_quote(REMOTE_BIN_PATH))),
+            Command::new("ssh")
+                .arg("--")
+                .arg(host)
+                .arg(format!("chmod +x {}", shell_quote(REMOTE_BIN_PATH))),
             "chmod remote mtyxd-remote",
         )?;
     }
@@ -153,17 +176,13 @@ fn run_checked(cmd: &mut Command, what: &str) -> anyhow::Result<()> {
 }
 
 fn ssh_output(host: &str, remote_command: &str) -> anyhow::Result<String> {
-    let output = Command::new("ssh").arg(host).arg(remote_command).output()?;
+    let output = Command::new("ssh").arg("--").arg(host).arg(remote_command).output()?;
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn sha256_file(path: &std::path::Path) -> anyhow::Result<String> {
-    let output = Command::new("sha256sum").arg(path).output()?;
-    if !output.status.success() {
-        anyhow::bail!("sha256sum {} failed", path.display());
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    Ok(text.split_whitespace().next().unwrap_or_default().to_string())
+    let bytes = std::fs::read(path)?;
+    Ok(crate::platform::sha256_hex(&bytes))
 }
 
 // ---------- RPC connection ----------
@@ -181,8 +200,9 @@ struct RemoteConn {
 
 impl RemoteConn {
     fn spawn(host: &str, remote_bin: &str, slot: &str) -> anyhow::Result<Arc<Self>> {
+        validate_remote_host(host)?;
         let mut child = Command::new("ssh")
-            .args(["-o", "BatchMode=yes"])
+            .args(["-o", "BatchMode=yes", "--"])
             .arg(host)
             .arg(format!(
                 "{} serve --stdio --persistent --slot {}",
@@ -594,5 +614,29 @@ mod tests {
             remote_command_line(&cmd),
             Some("cd '/tmp/a b' 2>/dev/null; exec 'echo' 'it'\\''s fine'".to_string())
         );
+    }
+
+    #[test]
+    fn validate_remote_host_rejects_empty_and_leading_dash() {
+        assert!(validate_remote_host("").is_err());
+        assert!(validate_remote_host("-oProxyCommand=evil").is_err());
+        assert!(validate_remote_host("--help").is_err());
+        assert!(validate_remote_host("user@host").is_ok());
+        assert!(validate_remote_host("dev-box.internal").is_ok());
+    }
+
+    #[test]
+    fn sha256_file_computes_hex_digest() {
+        let dir = std::env::temp_dir()
+            .join(format!("mtyx-remote-pty-sha256-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sample.bin");
+        std::fs::write(&file, b"abc").unwrap();
+        let digest = sha256_file(&file).unwrap();
+        assert_eq!(
+            digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -4,8 +4,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
+
+/// Per-subscriber bounded queue capacity for [`Mux::subscribe`] so a stalled
+/// frontend or socket client cannot cause unbounded heap growth in [`Mux::emit`].
+pub const SUBSCRIBER_QUEUE_CAPACITY: usize = 4096;
 
 use crate::agent_detect::{AgentPattern, Detection, DetectionSettings};
 use crate::browser::{self, BrowserBootstrap, BrowserRuntime};
@@ -161,7 +165,7 @@ fn screen_shows_shell_prompt(text: &str) -> bool {
 /// The multiplexer. Shared by frontends and the control socket server.
 pub struct Mux {
     state: Mutex<State>,
-    subscribers: Mutex<Vec<Sender<MuxEvent>>>,
+    subscribers: Mutex<Vec<SyncSender<MuxEvent>>>,
     next_id: AtomicU64,
     next_active_at: AtomicU64,
     surface_options: SurfaceOptions,
@@ -310,14 +314,18 @@ impl Mux {
     }
 
     pub fn subscribe(&self) -> Receiver<MuxEvent> {
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(SUBSCRIBER_QUEUE_CAPACITY);
         self.subscribers.lock().unwrap().push(tx);
         rx
     }
 
     pub fn emit(&self, event: MuxEvent) {
         let mut subs = self.subscribers.lock().unwrap();
-        subs.retain(|tx| tx.send(event.clone()).is_ok());
+        subs.retain(|tx| match tx.try_send(event.clone()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        });
     }
 
     fn spawn_surface(
@@ -634,10 +642,19 @@ impl Mux {
         // recreate as a genuine remote reattach (via new_remote_workspace)
         // rather than a local shell - see the persist module doc for why
         // that's the only one.
-        let first_tab_remote = ws.screens[0].panes[0].tabs[0].remote.clone();
+        let first_idx = leftmost_restore_index(&ws.screens[0].layout);
+        let first_tab = ws.screens[0].panes.get(first_idx).and_then(|p| p.tabs.first());
+        let first_tab_remote = first_tab.and_then(|t| t.remote.clone());
         let first_surface = match first_tab_remote {
             Some(spec) => self.new_remote_workspace(spec, Some(ws.name.to_string()), None)?,
-            None => self.new_workspace(Some(ws.name.to_string()), None)?,
+            None => {
+                let overrides = first_tab.and_then(restore_tab_overrides);
+                self.new_workspace_with_overrides(
+                    Some(ws.name.to_string()),
+                    None,
+                    overrides.as_ref(),
+                )?
+            }
         };
         let ws_id = self.with_state(|s| s.workspaces.last().unwrap().id);
         if let Some(color) = ws.color {
@@ -654,7 +671,10 @@ impl Mux {
         self.restore_screen(&ws.screens[0], screen_id, pane_id)?;
 
         for screen in &ws.screens[1..] {
-            let surface = self.new_screen(Some(ws_id), None)?;
+            let first_idx = leftmost_restore_index(&screen.layout);
+            let first_tab = screen.panes.get(first_idx).and_then(|p| p.tabs.first());
+            let overrides = first_tab.and_then(restore_tab_overrides);
+            let surface = self.new_screen_with_overrides(Some(ws_id), None, overrides.as_ref())?;
             let (screen_id, pane_id) = self.with_state(|s| {
                 let pane_id = s.pane_of(surface.id).unwrap();
                 let (wi, si) = s.screen_of(pane_id).unwrap();
@@ -677,7 +697,7 @@ impl Mux {
         // capture (`Node::pane_ids`) and `replay_layout` walk the tree
         // "a" before "b", and `initial_pane` is `replay_layout`'s root,
         // which only ever recurses down the "a" side of itself.
-        let pane_ids = self.replay_layout(&screen.layout, initial_pane)?;
+        let pane_ids = self.replay_layout(&screen.layout, screen, initial_pane)?;
 
         for (index, pane) in screen.panes.iter().enumerate() {
             let pane_id = pane_ids[&index];
@@ -699,10 +719,9 @@ impl Mux {
                 }
                 Some(_) => {}
                 None => {
-                    // Tab 0 is always the pane's auto-spawned tab (from
-                    // new_workspace, new_screen, or split) - a live `cd`,
-                    // since none of those spawn calls take a command/cwd
-                    // override for it (see the persist module doc).
+                    // Tab 0 already received its recorded `cwd` via
+                    // `SpawnOverrides` during workspace/screen/split spawn;
+                    // only its surface name needs to be applied here.
                     let tab0_surface = self.with_state(|s| s.panes[&pane_id].tabs[0]);
                     if let Some(surface) = self.surface(tab0_surface) {
                         self.apply_tab(&surface, &pane.tabs[0]);
@@ -731,13 +750,14 @@ impl Mux {
         Ok(())
     }
 
-    /// Replays a [`crate::persist::RestoreLayout`] tree as `split()` calls
-    /// starting from `root`, which represents the whole screen (a single
+    /// Replays a [`crate::persist::RestoreLayout`] tree as `split_with_overrides()`
+    /// calls starting from `root`, which represents the whole screen (a single
     /// unsplit pane) going in. Returns every leaf's pane id, keyed by its
     /// snapshot index.
     fn replay_layout(
         self: &Arc<Self>,
         layout: &crate::persist::RestoreLayout,
+        screen: &crate::persist::RestoreScreen<'_>,
         root: PaneId,
     ) -> anyhow::Result<HashMap<usize, PaneId>> {
         match layout {
@@ -745,11 +765,18 @@ impl Mux {
             crate::persist::RestoreLayout::Split { dir, ratio, a, b } => {
                 // `split()` keeps `root` as the "a" side and puts a new
                 // pane on the "b" side - see `Node::split_leaf`.
-                let new_surface = self.split(root, *dir, None)?;
+                let new_index = leftmost_restore_index(b);
+                let overrides = screen
+                    .panes
+                    .get(new_index)
+                    .and_then(|p| p.tabs.first())
+                    .and_then(restore_tab_overrides);
+                let new_surface =
+                    self.split_with_overrides(root, *dir, None, overrides.as_ref(), None)?;
                 let new_pane = self.with_state(|s| s.pane_of(new_surface.id).unwrap());
                 self.set_ratio(root, *dir, *ratio);
-                let mut map = self.replay_layout(a, root)?;
-                map.extend(self.replay_layout(b, new_pane)?);
+                let mut map = self.replay_layout(a, screen, root)?;
+                map.extend(self.replay_layout(b, screen, new_pane)?);
                 Ok(map)
             }
         }
@@ -999,17 +1026,11 @@ reattaching to remote session {session_id} on {host} \
         }
     }
 
-    /// Applies a restored tab's name and cwd to an already-spawned
-    /// surface (see the module doc on why this is a live `cd`, not a
-    /// spawn-time option).
+    /// Applies a restored tab's name to an already-spawned surface
+    /// (its `cwd` is applied at spawn time via [`SpawnOverrides`]).
     fn apply_tab(&self, surface: &Arc<Surface>, tab: &crate::persist::RestoreTab<'_>) {
         if let Some(name) = tab.name {
             self.rename_surface(surface.id, name.to_string());
-        }
-        if let Some(cwd) = tab.cwd {
-            let _ = surface.write_bytes(
-                format!("cd {} && clear\n", crate::persist::shell_quote(cwd)).as_bytes(),
-            );
         }
     }
 
@@ -2980,6 +3001,21 @@ fn leftmost_layout_index(node: &crate::layout_doc::LayoutNode) -> usize {
         crate::layout_doc::LayoutNode::Leaf { pane } => *pane,
         crate::layout_doc::LayoutNode::Split { a, .. } => leftmost_layout_index(a),
     }
+}
+
+fn leftmost_restore_index(node: &crate::persist::RestoreLayout) -> usize {
+    match node {
+        crate::persist::RestoreLayout::Leaf(index) => *index,
+        crate::persist::RestoreLayout::Split { a, .. } => leftmost_restore_index(a),
+    }
+}
+
+fn restore_tab_overrides(tab: &crate::persist::RestoreTab<'_>) -> Option<SpawnOverrides> {
+    tab.cwd.map(|cwd| SpawnOverrides {
+        command: None,
+        extra_env: Vec::new(),
+        cwd: Some(cwd.to_string()),
+    })
 }
 
 /// Every pane id in a workspace (all screens, in tree order).
@@ -4980,5 +5016,97 @@ mod tests {
         assert_eq!(pane2, pane1);
         assert_eq!(screen2, screen1);
         assert_eq!(ws2, ws1);
+    }
+
+    #[test]
+    fn subscribe_bounded_queue_does_not_block_or_drop_slow_subscriber() {
+        let mux = test_mux();
+        let slow_rx = mux.subscribe();
+        let fast_rx = mux.subscribe();
+
+        for i in 0..(SUBSCRIBER_QUEUE_CAPACITY + 32) {
+            mux.emit(MuxEvent::Status(format!("ev-{i}")));
+        }
+
+        // Fast subscriber still receives new events even though slow_rx is full.
+        let mut received = 0;
+        while fast_rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, SUBSCRIBER_QUEUE_CAPACITY);
+
+        // Slow subscriber retains the bounded capacity without disconnecting.
+        let mut slow_received = 0;
+        while slow_rx.try_recv().is_ok() {
+            slow_received += 1;
+        }
+        assert_eq!(slow_received, SUBSCRIBER_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn restore_workspace_sets_tab0_cwd_at_spawn_time() {
+        let dir = std::env::temp_dir()
+            .join(format!("mtyx-restore-cwd-test-{}", std::process::id()));
+        let dir0 = dir.join("pane0");
+        let dir1 = dir.join("pane1");
+        std::fs::create_dir_all(&dir0).unwrap();
+        std::fs::create_dir_all(&dir1).unwrap();
+        let dir0_str = dir0.to_string_lossy().into_owned();
+        let dir1_str = dir1.to_string_lossy().into_owned();
+
+        let mux = test_mux();
+        let ws = crate::persist::RestoreWorkspace {
+            name: "restored",
+            active_screen: 0,
+            color: None,
+            icon: None,
+            screens: vec![crate::persist::RestoreScreen {
+                name: None,
+                active_pane_index: 0,
+                layout: crate::persist::RestoreLayout::Split {
+                    dir: SplitDir::Right,
+                    ratio: 0.5,
+                    a: Box::new(crate::persist::RestoreLayout::Leaf(0)),
+                    b: Box::new(crate::persist::RestoreLayout::Leaf(1)),
+                },
+                panes: vec![
+                    crate::persist::RestorePane {
+                        name: None,
+                        active_tab_index: 0,
+                        tabs: vec![crate::persist::RestoreTab {
+                            name: Some("t0"),
+                            cwd: Some(&dir0_str),
+                            remote: None,
+                        }],
+                    },
+                    crate::persist::RestorePane {
+                        name: None,
+                        active_tab_index: 0,
+                        tabs: vec![crate::persist::RestoreTab {
+                            name: Some("t1"),
+                            cwd: Some(&dir1_str),
+                            remote: None,
+                        }],
+                    },
+                ],
+            }],
+        };
+
+        mux.restore_workspace(&ws).expect("restore_workspace should succeed");
+        let cwds = mux.with_state(|s| {
+            let mut ids = Vec::new();
+            s.workspaces[0].screens[0].root.pane_ids(&mut ids);
+            ids.iter()
+                .map(|pid| {
+                    let sid = s.panes[pid].tabs[0];
+                    s.surfaces[&sid].cwd()
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(cwds[0].as_deref(), Some(dir0_str.as_str()));
+        assert_eq!(cwds[1].as_deref(), Some(dir1_str.as_str()));
+
+        mux.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

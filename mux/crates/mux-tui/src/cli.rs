@@ -1293,11 +1293,6 @@ fn build_screen(flags: &FlagMap) -> Result<Value, UsageError> {
     Ok(json!({ "screen": flags.required_u64("screen")? }))
 }
 
-#[allow(dead_code)]
-fn build_workspace(flags: &FlagMap) -> Result<Value, UsageError> {
-    Ok(json!({ "workspace": flags.required_u64("workspace")? }))
-}
-
 /// Issue #100: `--group` closes the workspace's worktree-child
 /// workspaces too; without it they survive and the response reports
 /// them. May be passed bare (`--group`) or with a value

@@ -314,8 +314,15 @@ func writeShimIfChanged(path string, content string) error {
 }
 
 func ensureClaudeNodeOptionsRestoreModule() (string, error) {
-	dir := filepath.Join(os.TempDir(), "mtyx-claude-node-options")
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(home, ".mattyxterm", "node-options")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
 		return "", err
 	}
 	restoreModulePath := filepath.Join(dir, "restore-node-options.cjs")
