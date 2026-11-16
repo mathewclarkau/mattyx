@@ -31,7 +31,43 @@ pub fn set_child_subreaper() -> bool {
     }
 }
 
+/// Whether `pid` is a zombie on Linux — exited, but not yet reaped.
+///
+/// A zombie's PID still exists in the process table, so a `kill(pid, 0)`
+/// probe succeeds and a naive liveness check reports a dead process as
+/// running. mtyx registers itself as a child subreaper (see
+/// [`set_child_subreaper`]), so orphaned descendants can sit in this state
+/// until something reaps them; the CI test `shutdown_kills_background_grandchild_sleep`
+/// failed on a leg where the "leftover" was exactly such a zombie.
+#[cfg(target_os = "linux")]
+pub fn is_zombie(pid: u32) -> bool {
+    // /proc/<pid>/stat: "<pid> (<comm>) <state> ..." — `comm` may contain
+    // spaces and parentheses, so the state is the first field after the
+    // LAST ')'.
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    match stat.rfind(')') {
+        Some(i) => stat[i + 1..]
+            .split_whitespace()
+            .next()
+            .is_some_and(|state| state == "Z"),
+        None => false,
+    }
+}
+
+/// Non-Linux: macOS reaps through launchd and exposes no `/proc` to
+/// inspect, so there is nothing to distinguish here.
+#[cfg(not(target_os = "linux"))]
+pub fn is_zombie(_pid: u32) -> bool {
+    false
+}
+
 /// Whether `pid` is currently alive (same semantics as server::is_process_alive).
+///
+/// A zombie counts as NOT alive: it has exited, it is merely waiting to be
+/// reaped, and treating it as running would make the reaper wait on a
+/// process that will never disappear.
 ///
 /// Windows: `OpenProcess` + `GetExitCodeProcess` probe (see `win.rs`);
 /// access-denied counts as alive, mirroring the unix EPERM convention.
@@ -43,7 +79,7 @@ pub fn is_alive(pid: u32) -> bool {
     {
         let res = unsafe { libc::kill(pid as libc::pid_t, 0) };
         if res == 0 {
-            true
+            !is_zombie(pid)
         } else {
             std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
         }
@@ -455,4 +491,5 @@ mod tests {
         let _ = child.wait();
         reap_zombies();
     }
+
 }
