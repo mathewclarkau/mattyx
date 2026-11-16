@@ -59,6 +59,10 @@ struct HookPayload {
     title: Option<String>,
 }
 
+fn is_valid_session_id(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 fn run_hook() -> i32 {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
@@ -70,14 +74,15 @@ fn run_hook() -> i32 {
         }
     };
     let event = payload.hook_event_name.as_deref();
+    let valid_session_id = payload.session_id.as_deref().filter(|id| is_valid_session_id(id));
 
-    if let Some(session_id) = &payload.session_id {
+    if let Some(session_id) = valid_session_id {
         record_session(session_id, payload.cwd.as_deref(), event);
     }
 
     if let (Some(state), Some(surface)) = (agent_state_for_event(&payload), surface_id()) {
         let mut params = json!({ "surface": surface, "state": state, "source": "hook" });
-        if let Some(session_id) = &payload.session_id {
+        if let Some(session_id) = valid_session_id {
             params["session"] = json!(session_id);
         }
         // Best-effort: a dead socket or unknown surface must not fail the hook.
@@ -342,8 +347,14 @@ fn run_resume(session_id: Option<&str>) -> i32 {
         eprintln!("mtyx: no recorded session matching {session_id:?}");
         return 1;
     };
+    if !is_valid_session_id(&record.session_id) {
+        eprintln!("mtyx: recorded session id {:?} contains invalid characters", record.session_id);
+        return 1;
+    }
 
-    let mut new_tab_params = json!({});
+    let mut new_tab_params = json!({
+        "command": ["claude", "--resume", &record.session_id]
+    });
     if let Some(cwd) = &record.cwd {
         new_tab_params["cwd"] = json!(cwd);
     }
@@ -356,12 +367,6 @@ fn run_resume(session_id: Option<&str>) -> i32 {
         return 1;
     };
 
-    let resume_command = format!("claude --resume {}\n", record.session_id);
-    let send_params = json!({ "surface": surface, "text": resume_command });
-    if send_request("send", send_params).is_none() {
-        eprintln!("mtyx: created pane {surface} but failed to launch claude --resume");
-        return 1;
-    }
     println!("{surface}");
     0
 }
@@ -896,5 +901,14 @@ mod tests {
 
         std::env::remove_var("HOME");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_id_validation_rejects_shell_metacharacters() {
+        assert!(is_valid_session_id("abc-123_XYZ"));
+        assert!(!is_valid_session_id(""));
+        assert!(!is_valid_session_id("id; rm -rf /"));
+        assert!(!is_valid_session_id("id\necho pwned"));
+        assert!(!is_valid_session_id("$(whoami)"));
     }
 }

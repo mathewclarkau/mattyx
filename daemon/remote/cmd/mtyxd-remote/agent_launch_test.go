@@ -33,3 +33,25 @@ func TestOmoEnsurePluginInvalidJSONErrorDoesNotExposeUserPath(t *testing.T) {
 		t.Fatalf("error = %q, want generic invalid opencode.json message", msg)
 	}
 }
+
+func TestEnsureClaudeNodeOptionsRestoreModuleUsesPrivateUserDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	got, err := ensureClaudeNodeOptionsRestoreModule()
+	if err != nil {
+		t.Fatalf("ensureClaudeNodeOptionsRestoreModule failed: %v", err)
+	}
+	want := filepath.Join(home, ".mattyxterm", "node-options", "restore-node-options.cjs")
+	if got != want {
+		t.Fatalf("restore module path = %q, want %q", got, want)
+	}
+
+	dirInfo, err := os.Stat(filepath.Dir(got))
+	if err != nil {
+		t.Fatalf("stat restore module dir: %v", err)
+	}
+	if perm := dirInfo.Mode().Perm(); perm != 0700 {
+		t.Fatalf("restore module dir mode = %04o, want 0700", perm)
+	}
+}
