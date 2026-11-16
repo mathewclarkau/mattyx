@@ -767,7 +767,7 @@ mod tests {
             surfaces: HashMap::new(),
         };
 
-        let snapshot = SessionSnapshot::capture(&state);
+        let snapshot = capture(&state);
         let screen = &snapshot.workspaces[0].screens[0];
         assert_eq!(screen.active_pane_index, 0);
         assert_eq!(screen.panes.len(), 1);
